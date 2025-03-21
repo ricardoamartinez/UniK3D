@@ -65,12 +65,20 @@
         "mini": 1.0,
         "num_frames": 1,
         "sampling": {
-            "KITTI": 1.0
         },
         "train_datasets": [
-            "KITTI"
         ],
         "val_datasets": [
+            "d2D3DS",
+            "ADT",
+            "DiodeIndoor",
+            "DiodeIndoor_F",
+            "ETH3D",
+            "ETH3D_F",
+            "IBims",
+            "IBims_F",
+            "KITTI360",
+            "NYUv2Depth",
             "KITTI"
         ],
         "data_root": "datasets",

@@ -1,28 +1,31 @@
-
-[![Demo](https://img.shields.io/badge/HuggingFace-Demo-yellow?logo=huggingface)](https://huggingface.co/spaces/lpiccinelli/UniK3D-demo)
-<!-- [![arXiv](https://img.shields.io/badge/arXiv-2502.20110-blue?logo=arxiv&color=%23B31B1B)](https://arxiv.org/abs/2502.20110) -->
-[![ProjectPage](https://img.shields.io/badge/Project_Page-UniK3D-blue)](https://lpiccinelli-eth.github.io/pub/unik3d/)
-
-
+<div align="center">
 
 # UniK3D: Universal Camera Monocular 3D Estimation
 
+<a href="https://arxiv.org/abs/2502.20110"><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
+<a href='https://lpiccinelli-eth.github.io/pub/unik3d'><img src='https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white' alt='Project Page'></a>
+<a href='https://huggingface.co/spaces/lpiccinelli/UniK3D-demo'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Live_Demo-blue'></a>
 
-<div style="display: flex; align-items: center;">
-  <img src="assets/docs/unik3d-teaser.png" style="height: 300px; margin-right: 10px;" alt="Banner 1">
-  <!-- <img src="assets/docs/unik3d-banner.png" style="height: 250px;" alt="Banner 2"> -->
 </div>
 
-<!-- > [**UniK3D: Universal Camera Monocular 3D Estimation**](https://arxiv.org/abs/2403.18913),   -->
-> **UniK3D: Universal Camera Monocular 3D Estimation**,
+<div>
+  <img src="assets/docs/compose.png"  width="100%" alt="Banner 2" align="center">
+</div>
+
+<div>
+  <p></p>
+</div>
+
+> [**UniK3D: Universal Camera Monocular 3D Estimation**](https://lpiccinelli-eth.github.io/pub/unik3d),
 > Luigi Piccinelli, Christos Sakaridis, Mattia Segu, Yung-Hsu Yang, Siyuan Li, Wim Abbeloos, Luc Van Gool, 
-> CVPR 2025,  
+> CVPR 2025,
 <!-- > *Paper at [arXiv 2403.18913](https://arxiv.org/pdf/2403.18913.pdf)*   -->
 
 
 ## News and ToDo
 
-- [ ] Rays to parameters optimization
+- [ ] Rays to parameters optimization.
+- [ ] Release all evaluation dataset on HuggingFace (nuScenes and ScanNet++ missing).
 - [x] `21.03.2025`: Gradio demo and [Huggingface Demo](https://huggingface.co/spaces/lpiccinelli/UniK3D-demo).
 - [x] `20.03.2025`: Training and inference code released.
 - [x] `19.03.2025`: Models released.
@@ -31,24 +34,16 @@
 
 ## Visualization
 
-### Intro
-<p align="left">
-  <img src="assets/docs/intro.gif" alt="animated"  />
+<p align="center">
+  <img src="assets/docs/intro.gif" alt="animated"/>
 </p>
 
 ### Single 360 Image
-<p align="left">
-  <img src="assets/docs/venice.gif" alt="animated" />
+<p align="center">
+  <img src="assets/docs/venice.gif" alt="animated"/>
 </p>
 
-More in UniK3D [Project Page](https://lpiccinelli-eth.github.io/pub/unik3d/).
-
-
-## Installation-free Demo
-
-Plase visit our [HugginFace Space](https://huggingface.co/spaces/lpiccinelli/UniK3D-demo) for an installation-free test on your images!
-Its 3D pointcloud can be used for single-image calibration.
-You can use a local Gradio demo if the HuggingFace is too slow (CPU-based) by running `python ./gradio_demo.py`.
+***Check more results in our [website](https://lpiccinelli-eth.github.io/pub/unik3d/)!***
 
 
 ## Installation
@@ -89,6 +84,12 @@ python ./scripts/demo.py
 ```
 If everything runs correctly, `demo.py` should print: `RMSE on 3D clouds for ScanNet sample: 21.9cm`.
 `demo.py` allows you also to save output information, e.g. rays, depth and 3D pointcloud as `.ply` file.
+
+
+## Gradio Demo
+
+- Plase visit our [HugginFace Space](https://huggingface.co/spaces/lpiccinelli/UniK3D-demo) for an installation-free test on your images!
+- You can use a local Gradio demo if the HuggingFace is too slow (CPU-based) by running `python ./gradio_demo.py` after installation.
 
 
 ## Get Started
@@ -153,6 +154,38 @@ data = {"image": rgb, "rays": rays}
 predictions = model(data, {})
 ```
 
+## Infer
+
+To run locally, you can use the script `./scripts/infer.py` via the following command:
+
+```bash
+# Save the output maps and ply
+python ./scripts/infer.py --input IMAGE_PATH --output OUTPUT_FOLDER --config-file configs/eval/vitl.json --camera-path CAMERA_JSON --save --save-ply
+```
+
+```
+Usage: scripts/infer.py [OPTIONS]
+
+Options:
+  --input PATH                Path to input image.
+  --output PATH               Path to output directory.
+  --config-file PATH          Path to config file. Please check ./configs/eval.
+  --camera-path PATH          (Optional) Path to camera parameters json file. See assets/demo
+                              for a few examples. The file needs a 'name' field with
+                              the camera model from unik3d/utils/camera.py and a
+                              'params' field with the camera parameters as in the
+                              corresponding class docstring.
+  --resolution-level INTEGER  Resolution level in [0,10). Higher values means it will
+                              resize to larger resolution which increases details but
+                              decreases speed. Lower values lead to opposite.
+  --save                      Save outputs as (colorized) png.
+  --save-ply                  Save pointcloud as ply.
+```
+
+See also [`./scripts/infer.py`](./scripts/infer.py)
+
+
+
 ## Model Zoo
 
 The available models are the following:
@@ -201,10 +234,12 @@ You can look into function `UniK3D` in [hubconf.py](hubconf.py) to see how to in
 
 ## Training
 
-Please [visit the training README](scripts/README.md) for more information.
+Please visit the [docs/train](docs/train.md) for more information.
 
 
 ## Results
+
+Please visit the [docs/eval](docs/eval.md) for more information about running evaluation..
 
 ### Metric 3D Estimation
 The metrics is F1 over metric 3D pointcloud (higher is better) on zero-shot evaluation. 

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 
 from unik3d.layers import (MLP, AttentionBlock, AttentionLayer, GradChoker,
                            PositionEmbeddingSine, ResUpsampleBil)
@@ -439,8 +439,10 @@ class Decoder(nn.Module):
         # should clean also nans
         if self.training:
             rays = rays_pred
-        else:
+        elif self.camera_gt:
             rays = rays_gt if rays_gt is not None else rays_pred
+        else:
+            rays = rays_pred
         rays = rearrange(rays, "b c h w -> b (h w) c")
 
         return intrinsics, rays
@@ -560,3 +562,4 @@ class Decoder(nn.Module):
             ),
             requires_grad=False,
         )
+        self.camera_gt = True
