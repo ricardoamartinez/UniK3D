@@ -2,7 +2,7 @@
 
 # UniK3D: Universal Camera Monocular 3D Estimation
 
-<a href="https://arxiv.org/abs/2502.20110"><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
+<a href="https://arxiv.org/abs/2503.16591"><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
 <a href='https://lpiccinelli-eth.github.io/pub/unik3d'><img src='https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white' alt='Project Page'></a>
 <a href='https://huggingface.co/spaces/lpiccinelli/UniK3D-demo'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Live_Demo-blue'></a>
 
@@ -17,9 +17,9 @@
 </div>
 
 > [**UniK3D: Universal Camera Monocular 3D Estimation**](https://lpiccinelli-eth.github.io/pub/unik3d),
-> Luigi Piccinelli, Christos Sakaridis, Mattia Segu, Yung-Hsu Yang, Siyuan Li, Wim Abbeloos, Luc Van Gool, 
+> Luigi Piccinelli, Christos Sakaridis, Mattia Segu, Yung-Hsu Yang, Siyuan Li, Wim Abbeloos, Luc Van Gool,
 > CVPR 2025,
-<!-- > *Paper at [arXiv 2403.18913](https://arxiv.org/pdf/2403.18913.pdf)*   -->
+> *Paper at [arXiv 2503.16591](https://arxiv.org/pdf/2503.16591.pdf)*
 
 
 ## News and ToDo
