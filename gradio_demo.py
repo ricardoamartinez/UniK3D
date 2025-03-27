@@ -6,10 +6,12 @@ Licensed under the CC-BY NC 4.0 license (http://creativecommons.org/licenses/by-
 import gc
 import os
 import shutil
+import tempfile
 import time
 from datetime import datetime
 from math import pi
 
+import cv2  # Add OpenCV import
 import gradio as gr
 import numpy as np
 import torch
@@ -177,7 +179,7 @@ def handle_uploads(input_image):
     gc.collect()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    tmpdir = os.environ.get("TMPDIR", "/tmp")
+    tmpdir = tempfile.gettempdir()  # Use tempfile module to get system temp dir
     target_dir = os.path.join(tmpdir, f"input_images_{timestamp}")
 
     if os.path.exists(target_dir):
@@ -190,6 +192,104 @@ def handle_uploads(input_image):
 
     print(f"Files uploaded.")
     return target_dir, image_paths
+
+
+def process_video(video_path, model_name, camera_name, params, efficiency, mask_black_bg, mask_far_points, progress=gr.Progress()):
+    """Processes a video file, extracts frames, runs UniK3D, and saves GLB files."""
+    print(f"Processing video: {video_path}")
+    start_time_video = time.time()
+
+    # Create output directory within the project
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    project_base_dir = "." # Current working directory
+    base_output_dir = os.path.join(project_base_dir, "video_outputs", f"video_output_{timestamp}")
+    frames_dir = os.path.join(base_output_dir, "frames")
+    glb_dir = os.path.join(base_output_dir, "glb_files")
+    os.makedirs(frames_dir, exist_ok=True) # Creates ./video_outputs/video_output_.../frames
+    os.makedirs(glb_dir, exist_ok=True)
+
+    print(f"Outputting frames to: {frames_dir}")
+    print(f"Outputting GLB files to: {glb_dir}")
+
+    # --- Video Processing ---
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("Error opening video file")
+        return None, "Error opening video file."
+
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"Total frames: {frame_count}")
+
+    # --- Model Instantiation (once) ---
+    print("Instantiating model...")
+    model = instantiate_model(model_name)
+    device = next(model.parameters()).device
+    model.resolution_level = min(efficiency, 9.0) # Set efficiency once
+
+    processed_frames = 0
+    errors = []
+
+    for i in progress.tqdm(range(frame_count), desc="Processing video frames"):
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Warning: Could not read frame {i}. Skipping.")
+            errors.append(f"Frame {i}: Read error")
+            continue
+
+        frame_filename = f"frame_{i:05d}.png"
+        frame_path = os.path.join(frames_dir, frame_filename)
+        glb_filename = f"frame_{i:05d}.glb"
+        glb_path = os.path.join(glb_dir, glb_filename)
+
+        try:
+            # Save frame
+            cv2.imwrite(frame_path, frame)
+
+            # Prepare frame for model
+            # Convert BGR (OpenCV default) to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).unsqueeze(0).float().to(device)
+            H, W = image_tensor.shape[-2:]
+            current_params = params + [H, W] # Add H, W for this frame
+            camera = instantiate_camera(camera_name, params=current_params, device=device)
+
+            # Run inference
+            with torch.no_grad():
+                outputs = model.infer(image_tensor, camera=camera, normalize=True)
+                outputs["image"] = image_tensor # Add image tensor for glb conversion
+
+            # Convert to GLB
+            glbscene = predictions_to_glb(
+                outputs,
+                mask_black_bg=mask_black_bg,
+                mask_far_points=mask_far_points,
+            )
+            glbscene.export(file_obj=glb_path)
+
+            processed_frames += 1
+            del outputs, image_tensor, camera, glbscene # Memory management
+            gc.collect()
+
+        except Exception as e:
+            print(f"Error processing frame {i}: {e}")
+            errors.append(f"Frame {i}: {e}")
+            # Optionally continue to next frame or stop
+
+    cap.release()
+    end_time_video = time.time()
+    total_time = end_time_video - start_time_video
+    print(f"Finished processing video. Processed {processed_frames}/{frame_count} frames in {total_time:.2f} seconds.")
+
+    log_msg = f"Video processing complete. Processed {processed_frames}/{frame_count} frames. Output in {glb_dir}."
+    if errors:
+        log_msg += f" Encountered {len(errors)} errors."
+        print("Errors encountered:")
+        for err in errors:
+            print(f"- {err}")
+
+    # Return the directory containing GLB files (or maybe a zip?)
+    # For now, just return the directory path and log message
+    return glb_dir, log_msg
 
 
 def update_gallery_on_upload(input_images):
@@ -332,6 +432,15 @@ def update_visualization(target_dir, mask_black_bg, mask_far_points, is_example)
     return glbfile, "Updating Visualization"
 
 
+# Wrapper function to bundle parameters for video processing
+def run_video_processing_wrapper(input_video, model_name, camera_name,
+                                 fx, fy, cx, cy, k1, k2, k3, k4, k5, k6, t1, t2, hfov,
+                                 efficiency, mask_black_bg, mask_far_points, progress=gr.Progress(), _js=None): # Add _js=None
+    params = [fx, fy, cx, cy, k1, k2, k3, k4, k5, k6, t1, t2, hfov]
+    # Call the actual processing function with bundled params
+    return process_video(input_video, model_name, camera_name, params, efficiency, mask_black_bg, mask_far_points, progress)
+
+
 if __name__ == "__main__":
     theme = gr.themes.Citrus()
     theme.set(
@@ -453,7 +562,8 @@ if __name__ == "__main__":
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_image = gr.Image(label="Upload Images")
+                input_image = gr.Image(label="Upload Image")
+                input_video = gr.Video(label="Upload Video") # Add video input
                 gr.Markdown("**3D Estimation**")
                 with gr.Row():
                     log_output = gr.Markdown(
@@ -468,15 +578,19 @@ if __name__ == "__main__":
                 reconstruction_output = gr.Model3D(
                     height=520, zoom_speed=0.5, pan_speed=0.5
                 )
+                video_output_dir_box = gr.Textbox(label="Video Output Folder", interactive=False) # Add output box for video results
                 with gr.Row():
-                    submit_btn = gr.Button("Run UniK3D", scale=1, variant="primary")
+                    submit_btn = gr.Button("Run on Image", scale=1, variant="primary") # Rename image button
+                    submit_video_btn = gr.Button("Run on Video", scale=1, variant="primary") # Add video button
                     clear_btn = gr.ClearButton(
                         [
                             input_image,
+                            input_video, # Add video input
                             reconstruction_output,
                             log_output,
                             target_dir_output,
                             reconstruction_npy,
+                            video_output_dir_box, # Add video output box
                         ],
                         scale=1,
                     )
@@ -784,6 +898,22 @@ if __name__ == "__main__":
         ).then(
             fn=lambda: "False", inputs=[], outputs=[is_example]
         )
+
+        # --- Video Button Click Handler ---
+        submit_video_btn.click(
+            fn=run_video_processing_wrapper, # Use the wrapper function
+            inputs=[
+                input_video,
+                model_size,
+                camera_model,
+                # Pass camera params (note: these are collected before process_video)
+                fx, fy, cx, cy, k1, k2, k3, k4, k5, k6, t1, t2, hfov,
+                # Pass other options
+                efficiency, mask_black_bg, mask_far_points
+            ],
+            outputs=[video_output_dir_box, log_output] # Output dir path and log
+        )
+        # ---------------------------------
 
         mask_black_bg.change(
             update_visualization,
