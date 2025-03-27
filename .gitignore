@@ -10,10 +10,16 @@ __*.png
 __*.jpg
 __*.webp
 ___*.py
-**/___*.py
+/**/___*.py
 
 # ignore pcds
 *.ply
 
 # ignore data
 /data
+
+# Virtual environment
+.venv/
+
+# Output directories
+video_outputs/

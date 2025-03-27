@@ -26,6 +26,7 @@
 
 - [ ] Rays to parameters optimization.
 - [ ] Release all evaluation dataset on HuggingFace (nuScenes and ScanNet++ missing).
+- [x] `27.03.2025`: Added GLB sequence player (`play_3d_video.py`) with FPS controls. Updated demo scripts.
 - [x] `21.03.2025`: Gradio demo and [Huggingface Demo](https://huggingface.co/spaces/lpiccinelli/UniK3D-demo).
 - [x] `20.03.2025`: Training and inference code released.
 - [x] `19.03.2025`: Models released.
@@ -50,7 +51,7 @@
 
 Requirements are not in principle hard requirements, but there might be some differences (not tested):
 - Linux
-- Python 3.10+ 
+- Python 3.10+
 - CUDA 11.8+
 
 Install the environment needed to run UniK3D with:
@@ -72,7 +73,7 @@ CC="cc -mavx2" pip install -U --force-reinstall pillow-simd
 cd ./unik3d/ops/knn;bash compile.sh;cd ../../../
 ```
 
-If you use conda, you should change the following: 
+If you use conda, you should change the following:
 ```shell
 python -m venv $VENV_DIR/$NAME -> conda create -n $NAME python=3.11
 source $VENV_DIR/$NAME/bin/activate -> conda activate $NAME
@@ -90,6 +91,29 @@ If everything runs correctly, `demo.py` should print: `RMSE on 3D clouds for Sca
 
 - Plase visit our [HugginFace Space](https://huggingface.co/spaces/lpiccinelli/UniK3D-demo) for an installation-free test on your images!
 - You can use a local Gradio demo if the HuggingFace is too slow (CPU-based) by running `python ./gradio_demo.py` after installation.
+
+
+## GLB Sequence Player
+
+A script `play_3d_video.py` is included to play sequences of GLB files containing point clouds. It loads the specified number of frames into VRAM for potentially smoother playback compared to loading each frame dynamically.
+
+**Usage:**
+```bash
+python play_3d_video.py <path_to_glb_directory> [-n <num_frames>]
+```
+- `<path_to_glb_directory>`: (Required) Path to the directory containing the `.glb` file sequence.
+- `-n <num_frames>`: (Optional) Number of frames to load upfront into VRAM. Defaults to -1 (load all). Loading a large number of frames may exceed available VRAM.
+
+**Controls:**
+- **WASD:** Move camera forward/backward/left/right relative to view direction.
+- **Q/E:** Move camera vertically up/down along the world axis.
+- **Shift:** Hold to move faster.
+- **Mouse Drag (Left Button):** Look around (changes camera pitch and yaw).
+- **Mouse Scroll:** Zoom in/out (moves camera along its forward direction).
+- **Space:** Play/Pause the animation.
+- **L:** Toggle looping of the animation.
+- **Left/Right Arrow:** Step one frame backward/forward (pauses playback).
+- **ESC:** Close the player window.
 
 
 ## Get Started
@@ -142,13 +166,13 @@ camera = eval(name)(params=params)
 predictions = model.infer(rgb, camera)
 ```
 
-To use the forward method for your custom training, you should:  
-1) Take care of the dataloading:  
-  a) ImageNet-normalization  
-  b) Long-edge based resizing (and padding) with input shape provided in `image_shape` under configs  
-  c) `BxCxHxW` format  
-  d) If any intriniscs given, adapt them accordingly to your resizing  
-2) Format the input data structure as:  
+To use the forward method for your custom training, you should:
+1) Take care of the dataloading:
+  a) ImageNet-normalization
+  b) Long-edge based resizing (and padding) with input shape provided in `image_shape` under configs
+  c) `BxCxHxW` format
+  d) If any intriniscs given, adapt them accordingly to your resizing
+2) Format the input data structure as:
 ```python
 data = {"image": rgb, "rays": rays}
 predictions = model(data, {})
@@ -242,7 +266,7 @@ Please visit the [docs/train](docs/train.md) for more information.
 Please visit the [docs/eval](docs/eval.md) for more information about running evaluation..
 
 ### Metric 3D Estimation
-The metrics is F1 over metric 3D pointcloud (higher is better) on zero-shot evaluation. 
+The metrics is F1 over metric 3D pointcloud (higher is better) on zero-shot evaluation.
 
 | Model | SmallFoV | SmallFoV+Distort | LargeFoV | Panoramic |
 | :-: | :-: | :-: | :-: | :-: |
