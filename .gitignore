@@ -23,3 +23,6 @@ ___*.py
 
 # Output directories
 video_outputs/
+
+# Ignore specific test/utility scripts
+minimal_vlist_test.py
