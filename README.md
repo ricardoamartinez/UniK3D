@@ -116,6 +116,44 @@ python play_3d_video.py <path_to_glb_directory> [-n <num_frames>]
 - **ESC:** Close the player window.
 
 
+## Live SLAM Viewer (Experimental)
+
+An experimental script `live_slam_viewer.py` is included to run UniK3D inference directly from a connected camera (default index 0) and visualize the resulting point cloud in real-time using Pyglet.
+
+**Features:**
+- Live camera capture via OpenCV.
+- Runs UniK3D inference on captured frames in a separate thread.
+- Displays status updates (model loading, inference steps) in the viewer window.
+- Renders the 3D point cloud using Pyglet.
+- Colors points based on the input camera frame.
+- Point size scales based on distance from the capturing camera (origin) to compensate for perspective.
+
+**Dependencies:**
+In addition to the main project dependencies, this script requires:
+- `pyglet`: For the 3D viewer window and OpenGL rendering.
+- `opencv-python`: For camera capture.
+
+Ensure these are installed in your environment (e.g., `pip install pyglet opencv-python`).
+
+**Usage:**
+```bash
+python live_slam_viewer.py [--model <model_name>] [--interval <N>]
+```
+- `--model <model_name>`: (Optional) Name of the UniK3D model to use (e.g., `unik3d-vits`, `unik3d-vitb`, `unik3d-vitl`). Defaults to `unik3d-vitl`.
+- `--interval <N>`: (Optional) Run inference every N frames. Defaults to 10. Lower values increase processing load but provide more frequent updates.
+
+**Controls:**
+(Same as GLB Sequence Player)
+- **WASD:** Move camera forward/backward/left/right relative to view direction.
+- **Q/E:** Move camera vertically up/down along the world axis.
+- **Shift:** Hold to move faster.
+- **Mouse Drag (Left Button):** Look around (changes camera pitch and yaw). Requires clicking in the window first.
+- **Mouse Scroll:** Zoom in/out (moves camera along its forward direction).
+- **ESC:** Close the viewer window.
+
+**Note:** Performance heavily depends on the chosen model and whether a GPU (CUDA) is available and correctly configured. Running large models on CPU will be very slow. Point size scaling parameters might need tuning within the script's vertex shader source code for optimal results.
+
+
 ## Get Started
 
 After installing the dependencies, you can load the pre-trained models easily from [Hugging Face](https://huggingface.co/lpiccinelli) as follows:
