@@ -38,13 +38,13 @@ vertex_source = """#version 150 core
         // 1. Calculate distance from origin (capturing camera)
         float originDist = length(vertices);
 
-        // 2. Calculate pixel size directly based on origin distance.
-        //    Adjust scalingFactor (e.g., 5.0) and min/max pixels (e.g., 1.0, 25.0) as needed.
-        float scalingFactor = 5.0; // Increased scaling factor
+        // 2. Calculate pixel size directly proportional to origin distance.
+        //    Adjust scalingFactor (e.g., 2.0) and min/max pixels (e.g., 1.0, 20.0) as needed.
+        float scalingFactor = 2.0; // Moderate scaling factor
         float pointSizePixels = scalingFactor * originDist;
 
         // 3. Set final point size (clamped)
-        gl_PointSize = max(1.0, min(25.0, pointSizePixels)); // Increased max clamp
+        gl_PointSize = max(1.0, min(20.0, pointSizePixels)); // Moderate max clamp
         // --- End Point Size Calculation ---
     }
 """
