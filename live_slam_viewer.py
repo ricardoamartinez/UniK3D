@@ -85,14 +85,26 @@ fragment_source = """#version 150 core
         // Convert modified HSV back to RGB
         vec3 saturatedRgb = hsv2rgb(hsv);
 
-        // Output the final saturated color
-        final_color = vec4(saturatedRgb, 1.0);
+        // --- Approximate Sharpening via Contrast Boost ---
+        // Convert saturated RGB back to HSV
+        vec3 hsv_sharp = rgb2hsv(saturatedRgb);
+        // Define contrast factor (e.g., 1.1 means 10% boost)
+        float contrastFactor = 1.1;
+        // Push Value away from 0.5
+        hsv_sharp.z = clamp(0.5 + (hsv_sharp.z - 0.5) * contrastFactor, 0.0, 1.0);
+        // Convert final HSV back to RGB
+        vec3 finalRgb = hsv2rgb(hsv_sharp);
+        // --- End Sharpening ---
+
+        // Output the final sharpened color
+        final_color = vec4(finalRgb, 1.0);
     }
 """
 
 # --- Inference Thread Function ---
 # (Keep inference thread function as is)
-def inference_thread_func(data_queue, exit_event, model_name, inference_interval):
+def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
+                          enable_depth_smoothing_arg, enable_point_smoothing_arg): # Added args
     """Loads model, captures camera, runs inference, puts results in queue."""
     print("Inference thread started.")
     data_queue.put(("status", "Inference thread started...")) # Status update
@@ -125,6 +137,20 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         frame_count = 0
         last_inference_time = time.time()
 
+        # --- Temporal Smoothing Init ---
+        smoothed_depth_map = None
+        smoothed_points_xyz = None # For smoothing final points
+        # Flags to enable/disable smoothing (can be controlled by args)
+        enable_depth_smoothing = False # Default: OFF
+        enable_point_smoothing = False  # Default: OFF
+        # Adaptive alpha parameters (only used if enable_depth_smoothing is True)
+        min_alpha_depth = 0.1
+        max_alpha_depth = 0.8
+        depth_diff_threshold = 0.1
+        # Constant alpha for points (only used if enable_point_smoothing is True)
+        alpha_points = 0.2
+        # -----------------------------
+
         # Removed debug print
         while not exit_event.is_set():
             # Removed debug prints
@@ -154,6 +180,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     data_queue.put(("status", f"Preprocessing frame {frame_count}...")) # Status update
                     # Convert BGR (OpenCV) to RGB
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_h = rgb_frame.shape[0] # Get frame height
                     # Convert to torch tensor (HWC -> CHW) and move to device
                     # Assuming UniK3D handles normalization internally based on README example
                     frame_tensor = torch.from_numpy(rgb_frame).permute(2, 0, 1).float().to(device)
@@ -167,11 +194,70 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         # Removed debug print
                         # Removed key logging print(f"DEBUG: Prediction keys: {predictions.keys()}")
 
-                    # --- Extract Point Cloud ---
-                    data_queue.put(("status", f"Extracting points from frame {frame_count}...")) # Status update
-                    points_xyz = predictions["points"] # Shape might be (B, N, 3) or similar
+                    # --- Smooth Depth Map (EMA) ---
+                    if 'depth' in predictions and 'rays' in predictions:
+                        current_depth_map = predictions['depth'].squeeze() # Remove batch dim if present (H, W)
+                        if smoothed_depth_map is None:
+                            smoothed_depth_map = current_depth_map.clone()
+                        else:
+                            # Ensure shapes match before EMA
+                            if smoothed_depth_map.shape == current_depth_map.shape:
+                                if enable_depth_smoothing:
+                                    # --- Calculate Adaptive Alpha ---
+                                    depth_diff = torch.abs(current_depth_map - smoothed_depth_map).mean()
+                                    change_factor = torch.clamp(depth_diff / depth_diff_threshold, 0.0, 1.0)
+                                    adaptive_alpha_depth = min_alpha_depth + (max_alpha_depth - min_alpha_depth) * change_factor
+                                    # --- Apply EMA with Adaptive Alpha ---
+                                    smoothed_depth_map = adaptive_alpha_depth * current_depth_map + (1.0 - adaptive_alpha_depth) * smoothed_depth_map
+                                else:
+                                    # If smoothing disabled, just use the current map
+                                    smoothed_depth_map = current_depth_map
+                            else:
+                                print("Warning: Depth map shape changed, resetting smoothing.")
+                                smoothed_depth_map = current_depth_map.clone()
+
+                        # --- Recalculate Points from Smoothed Depth ---
+                        # Assuming rays shape is (B, H, W, 3) or (C, H, W) after squeeze
+                        rays = predictions['rays'].squeeze()
+                        # Permute rays from (C, H, W) to (H, W, C) if necessary
+                        if rays.shape[0] == 3 and rays.ndim == 3:
+                            rays = rays.permute(1, 2, 0)
+                        depth_to_multiply = smoothed_depth_map.unsqueeze(-1)
+                        # Removed shape debug prints
+                        # Ensure depth map has channel dim for broadcasting: (H, W) -> (H, W, 1)
+                        points_xyz = rays * depth_to_multiply
+                        data_queue.put(("status", f"Smoothed depth, recalculated points for frame {frame_count}..."))
+                    else:
+                        # Fallback if depth or rays are missing
+                        data_queue.put(("status", f"Extracting points directly for frame {frame_count}..."))
+                        points_xyz = predictions["points"] # Use original points
+
+                    # --- Original Point Extraction (Now part of fallback) ---
+                    # points_xyz = predictions["points"] # Shape might be (B, N, 3) or similar
+
+                    # --- Apply EMA Smoothing to Points ---
+                    if points_xyz is not None:
+                        if smoothed_points_xyz is None:
+                            smoothed_points_xyz = points_xyz.clone()
+                        else:
+                            # Ensure shapes match before EMA
+                            if smoothed_points_xyz.shape == points_xyz.shape:
+                                if enable_point_smoothing:
+                                    smoothed_points_xyz = alpha_points * points_xyz + (1.0 - alpha_points) * smoothed_points_xyz # Use alpha_points
+                                else:
+                                    # If smoothing disabled, just use the current points
+                                    smoothed_points_xyz = points_xyz
+                            else:
+                                print("Warning: Points tensor shape changed, resetting smoothing.")
+                                smoothed_points_xyz = points_xyz.clone()
+                        # Use the smoothed points for further processing
+                        points_xyz_to_process = smoothed_points_xyz
+                    else:
+                        points_xyz_to_process = None # Handle case where points were None initially
+                    # --- End Point Smoothing ---
+
                     # Removed debug print
-                    if points_xyz is None or points_xyz.numel() == 0:
+                    if points_xyz_to_process is None or points_xyz_to_process.numel() == 0: # Check the processed points
                         # Removed debug print
                         # Put None to signal empty frame? Or just skip? Let's skip for now.
                         continue
@@ -179,7 +265,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
                     # Ensure it's on CPU and NumPy for pyglet
                     # Removed shape debug prints
-                    points_xyz_np = points_xyz.squeeze().cpu().numpy() # Remove batch dim if present
+                    # Use the (potentially smoothed) points_xyz_to_process
+                    points_xyz_np = points_xyz_to_process.squeeze().cpu().numpy() # Remove batch dim if present
                     # Removed debug print
 
                     # --- Reshape based on observed (C, H, W) format ---
@@ -193,8 +280,11 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                 points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
                         elif points_xyz_np.ndim == 2 and points_xyz_np.shape[1] == 3: # Handle expected (N, 3) case
                              num_vertices = points_xyz_np.shape[0]
+                        elif points_xyz_np.ndim == 3 and points_xyz_np.shape[2] == 3: # Handle (H, W, 3) case
+                             num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
+                             points_xyz_np = points_xyz_np.reshape(num_vertices, 3) # Reshape to (N, 3)
                         else:
-                            print(f"Warning: Unexpected points_xyz_np shape: {points_xyz_np.shape}")
+                            print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np.shape}")
                         # Removed debug print
                     except Exception as e_reshape:
                             print(f"Error reshaping points_xyz_np: {e_reshape}")
@@ -255,7 +345,12 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         # Put data into queue for the viewer
                         # Removed debug print
                         if not data_queue.full():
-                                data_queue.put((vertices_flat, colors_flat, num_vertices))
+                                # Calculate depth diff again here for queueing, or store it from adaptive alpha calc
+                                depth_diff_value = 0.0 # Default if smoothing disabled or first frame
+                                if enable_depth_smoothing and smoothed_depth_map is not None and current_depth_map is not None and smoothed_depth_map.shape == current_depth_map.shape:
+                                     depth_diff_value = torch.abs(current_depth_map - smoothed_depth_map).mean().item() # Get scalar value
+                                # Removed frame_h definition here as it's defined earlier
+                                data_queue.put((vertices_flat, colors_flat, num_vertices, frame_h, depth_diff_value)) # Add frame_h and depth_diff_value
                                 # Removed debug print
                         else:
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.") # Modified warning
@@ -286,13 +381,17 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
 # --- Viewer Class ---
 class LiveViewerWindow(pyglet.window.Window):
-    def __init__(self, model_name, inference_interval=10, *args, **kwargs): # Removed max_points
+    def __init__(self, model_name, inference_interval=1, # Changed default interval
+                 disable_depth_smoothing=False, disable_point_smoothing=False, # Added args
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.vertex_list = None # Initialize as None
         self.frame_count_display = 0 # For UI
+        self.last_depth_diff = 0.0 # Store last depth difference for display
 
         # --- Status Display ---
+        self.ui_batch = pyglet.graphics.Batch() # Create a batch for UI elements
         self.status_message = "Initializing..."
         self.status_label = pyglet.text.Label(
             self.status_message,
@@ -300,8 +399,10 @@ class LiveViewerWindow(pyglet.window.Window):
             font_size=12,
             x=10, y=10, # Position at bottom-left
             anchor_x='left', anchor_y='bottom',
-            color=(255, 255, 255, 200) # White with some transparency
+            color=(255, 255, 255, 200), # White with some transparency
+            batch=self.ui_batch # Assign label to the batch
         )
+        # Removed self.fps_display = pyglet.clock.ClockDisplay()
         # --------------------
 
         # --- Threading related ---
@@ -386,20 +487,26 @@ class LiveViewerWindow(pyglet.window.Window):
         pyglet.clock.schedule_interval(self.update, 1.0 / 60.0) # Update viewer frequently
         pyglet.clock.schedule_interval(self.update_camera, 1.0 / 60.0) # Update camera
 
-        # Start the inference thread
-        self.start_inference_thread(model_name, inference_interval)
+        # Start the inference thread, passing smoothing flags
+        self.start_inference_thread(model_name, inference_interval,
+                                    disable_depth_smoothing, disable_point_smoothing)
 
         # Set up OpenGL state
         gl.glClearColor(0.1, 0.1, 0.1, 1.0)
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
 
-    def start_inference_thread(self, model_name, inference_interval):
+    def start_inference_thread(self, model_name, inference_interval,
+                               disable_depth_smoothing, disable_point_smoothing): # Added args
         if self.inference_thread is None or not self.inference_thread.is_alive():
             self._exit_event.clear()
+            # Pass smoothing flags to the thread function
+            # Note: We pass the *enable* flags, so negate the disable flags from args
+            thread_args = (self.data_queue, self._exit_event, model_name, inference_interval,
+                           not disable_depth_smoothing, not disable_point_smoothing)
             self.inference_thread = threading.Thread(
                 target=inference_thread_func,
-                args=(self.data_queue, self._exit_event, model_name, inference_interval),
+                args=thread_args,
                 daemon=True)
             self.inference_thread.start()
 
@@ -432,7 +539,10 @@ class LiveViewerWindow(pyglet.window.Window):
                 else:
                     # --- Process actual vertex data ---
                     try:
-                        vertices_data, colors_data, _ = latest_data # Unpack, ignore count from queue
+                        # Unpack data including image height and depth diff, ignore queue count
+                        vertices_data, colors_data, _, frame_h, depth_diff = latest_data
+                        self.current_image_height = frame_h # Store image height
+                        self.last_depth_diff = depth_diff # Store depth difference
 
                         # Calculate actual number of vertices based on received data length
                         actual_num_vertices = 0
@@ -533,9 +643,22 @@ class LiveViewerWindow(pyglet.window.Window):
 
         self.shader_program.stop()
 
-        # --- Draw Status Label ---
-        # Draw the label directly without a batch
-        self.status_label.draw()
+        # --- Draw Status Label & FPS ---
+        # Disable depth test for 2D UI rendering
+        gl.glDisable(gl.GL_DEPTH_TEST)
+
+        # Calculate motion metric (0=still, 1=max change based on threshold)
+        motion_metric = min(self.last_depth_diff / 0.1, 1.0) # Assuming 0.1 threshold implies max motion
+
+        # Update label text (Remove FPS, add Motion)
+        status_text = f"Motion: {motion_metric:.2f} | {self.status_message}"
+        self.status_label.text = status_text
+
+        # Draw the UI batch (which contains the label)
+        self.ui_batch.draw()
+
+        # Re-enable depth test for next frame's 3D rendering
+        gl.glEnable(gl.GL_DEPTH_TEST)
         # -------------------------
 
 
@@ -572,7 +695,9 @@ class LiveViewerWindow(pyglet.window.Window):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Live SLAM viewer using UniK3D.")
     parser.add_argument("--model", type=str, default="unik3d-vitl", help="Name of the UniK3D model to use (e.g., unik3d-vits, unik3d-vitb, unik3d-vitl)")
-    parser.add_argument("--interval", type=int, default=1, help="Run inference every N frames.")
+    parser.add_argument("--interval", type=int, default=1, help="Run inference every N frames (default: 1).")
+    parser.add_argument("--disable-depth-smoothing", action="store_true", help="Disable temporal smoothing on depth map.")
+    parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points.")
     args = parser.parse_args()
 
     gl.glEnable(gl.GL_BLEND)
