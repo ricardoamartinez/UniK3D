@@ -28,6 +28,8 @@ vertex_source = """#version 150 core
 
     uniform mat4 projection;
     uniform mat4 view;
+    uniform float inputScaleFactor; // Added uniform for dynamic input scale
+    uniform float pointSizeBoost;   // Added uniform for dynamic point size boost
     // Removed viewportHeight uniform
 
     void main() {
@@ -40,11 +42,17 @@ vertex_source = """#version 150 core
 
         // 2. Calculate pixel size directly proportional to origin distance.
         //    Adjust scalingFactor (e.g., 3.0) and min/max pixels (e.g., 1.0, 30.0) as needed.
-        float scalingFactor = 3.0; // Adjusted scaling factor
-        float pointSizePixels = scalingFactor * originDist;
+        float baseScalingFactor = 1.0; // Reduced overall point size multiplier
+        // Adjust point size based on distance AND inversely by input scale factor
+        // Ensure inputScaleFactor is not zero to avoid division by zero
+        float effectiveScaleFactor = max(0.1, inputScaleFactor); // Prevent division by zero or negative scale
+        float pointSizePixels = (baseScalingFactor * originDist) / effectiveScaleFactor;
 
         // 3. Set final point size (clamped)
-        gl_PointSize = max(1.0, min(30.0, pointSizePixels)); // Adjusted max clamp
+        // Clamp the calculated size first
+        float clampedSize = max(1.0, min(30.0, pointSizePixels));
+        // Increase the clamped size by the dynamic boost factor
+        gl_PointSize = clampedSize * pointSizeBoost;
         // --- End Point Size Calculation ---
     }
 """
@@ -104,8 +112,8 @@ fragment_source = """#version 150 core
 # --- Inference Thread Function ---
 # (Keep inference thread function as is)
 def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
-                          enable_point_smoothing_arg): # Removed depth smoothing arg
-    """Loads model, captures camera, runs inference, puts results in queue."""
+                          enable_point_smoothing_arg, scale_factor_ref): # Added scale_factor_ref
+    """Loads model, captures camera, runs inference (with dynamic scaling), puts results in queue."""
     print("Inference thread started.")
     data_queue.put(("status", "Inference thread started...")) # Status update
     try:
@@ -150,6 +158,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         smoothed_mean_depth = None
         min_alpha_scale = 0.0 # Freeze scale when still
         max_alpha_scale = 1.0 # Instant scale update when moving
+        prev_scale_factor = None # Track previous scale factor for smoothing reset
         # -----------------------------
 
         # Removed debug print
@@ -163,6 +172,15 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 time.sleep(0.1)
                 continue
 
+            # --- Dynamically Scale Frame ---
+            current_scale = scale_factor_ref[0] # Read current scale from shared reference
+            if current_scale > 0.1: # Only resize if scale is reasonably positive
+                new_width = int(frame.shape[1] * current_scale)
+                new_height = int(frame.shape[0] * current_scale)
+                # Use INTER_AREA for shrinking, INTER_LINEAR for enlarging for better quality
+                interpolation = cv2.INTER_AREA if current_scale < 1.0 else cv2.INTER_LINEAR
+                frame = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
+            # --- End Scale Frame ---
             # (Motion calculation moved to after depth prediction)
             # Removed debug print
 
@@ -172,6 +190,17 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             # --- Run Inference periodically ---
             # Removed debug print
             if frame_count % inference_interval == 0:
+                # --- Check for Scale Change and Reset Smoothing ---
+                current_scale = scale_factor_ref[0] # Read current scale factor
+                if prev_scale_factor is not None and abs(current_scale - prev_scale_factor) > 1e-3: # Check if scale changed significantly
+                    print(f"Scale factor changed ({prev_scale_factor:.2f} -> {current_scale:.2f}). Resetting smoothing state.")
+                    smoothed_points_xyz = None
+                    prev_depth_map = None
+                    # Also reset smoothed mean depth to avoid sudden jumps
+                    smoothed_mean_depth = None
+                prev_scale_factor = current_scale # Update previous scale factor for next check
+                # --- End Smoothing Reset Logic ---
+
                 # Removed debug print
                 current_time = time.time()
                 # Keep the user-facing print below
@@ -236,7 +265,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         scaled_depth_map = current_depth_map # Default to current if no smoothing needed
                         current_mean_depth = current_depth_map.mean().item()
                         # Calculate adaptive alpha for scale using non-linear mapping (exponent 1.5) on unmodulated global motion
-                        motion_factor_scale = global_motion_unmodulated ** 1.5 # Use exponent 1.5
+                        motion_factor_scale = global_motion_unmodulated ** 2.0 # Increased exponent for sharper drop-off
                         adaptive_alpha_scale = min_alpha_scale + (max_alpha_scale - min_alpha_scale) * motion_factor_scale
 
                         if smoothed_mean_depth is None:
@@ -284,11 +313,11 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                     if points_xyz.ndim == 3 and points_xyz.shape[:2] == per_pixel_depth_motion_map.shape:
                                         # --- Calculate Per-Point Adaptive Alpha Map with distance-dependent min_alpha and non-linear mapping ---
                                         # Calculate distance-dependent minimum alpha (0.1 near, 0.0 far)
-                                        effective_min_alpha_points = 0.0 + (0.1 * (1.0 - normalized_depth)) # Base min_alpha + bonus for closeness
-                                        # Use original per_pixel_depth_motion for mapping, apply exponent 1.5
-                                        motion_factor_points = per_pixel_depth_motion ** 1.5
-                                        # Interpolate between distance-dependent min and global max
-                                        adaptive_alpha_points_map = effective_min_alpha_points + (max_alpha_points - effective_min_alpha_points) * motion_factor_points
+                                        # Removed distance-dependent minimum alpha calculation
+                                        # Use original per_pixel_depth_motion for mapping, apply exponent 2.0
+                                        motion_factor_points = per_pixel_depth_motion ** 2.0 # Increased exponent for sharper drop-off
+                                        # Interpolate between global min (0.0) and global max (1.0)
+                                        adaptive_alpha_points_map = min_alpha_points + (max_alpha_points - min_alpha_points) * motion_factor_points
                                         # Unsqueeze for broadcasting: (H, W) -> (H, W, 1)
                                         adaptive_alpha_points_map = adaptive_alpha_points_map.unsqueeze(-1)
                                         # --- Apply EMA with Per-Point Adaptive Alpha ---
@@ -436,6 +465,9 @@ class LiveViewerWindow(pyglet.window.Window):
 
         self.vertex_list = None # Initialize as None
         self.frame_count_display = 0 # For UI
+        self.current_point_count = 0 # For UI
+        self.current_scale_factor = 0.9 # Initial scale factor (Default 0.9x)
+        self.point_size_boost = 2.5 # Initial point size boost factor (Default 2.5x)
         # self.last_depth_diff = 0.0 # Removed depth diff storage
         # --- FPS / Latency Tracking ---
         self.last_update_time = time.time()
@@ -446,14 +478,45 @@ class LiveViewerWindow(pyglet.window.Window):
         # --- Status Display ---
         self.ui_batch = pyglet.graphics.Batch() # Create a batch for UI elements
         self.status_message = "Initializing..."
+        # Status Label (moved up slightly)
         self.status_label = pyglet.text.Label(
             self.status_message,
             font_name='Arial',
             font_size=12,
-            x=10, y=10, # Position at bottom-left
+            x=10, y=30, # Position slightly higher bottom-left
             anchor_x='left', anchor_y='bottom',
             color=(255, 255, 255, 200), # White with some transparency
             batch=self.ui_batch # Assign label to the batch
+        )
+        # Point Count Label (bottom-left)
+        self.point_count_label = pyglet.text.Label(
+            f"Points: {self.current_point_count}",
+            font_name='Arial',
+            font_size=12,
+            x=10, y=10, # Position at bottom-left
+            anchor_x='left', anchor_y='bottom',
+            color=(255, 255, 255, 200),
+            batch=self.ui_batch
+        )
+        # Scale Factor Label (top-right)
+        self.scale_factor_label = pyglet.text.Label(
+            f"Scale: {self.current_scale_factor:.2f}x",
+            font_name='Arial',
+            font_size=12,
+            x=self.width - 10, y=self.height - 10, # Position near top-right
+            anchor_x='right', anchor_y='top',
+            color=(255, 255, 255, 200),
+            batch=self.ui_batch
+        )
+        # Point Size Boost Label (below scale factor)
+        self.point_boost_label = pyglet.text.Label(
+            f"Pt Boost: {self.point_size_boost:.2f}x",
+            font_name='Arial',
+            font_size=12,
+            x=self.width - 10, y=self.height - 30, # Position below scale label
+            anchor_x='right', anchor_y='top',
+            color=(255, 255, 255, 200),
+            batch=self.ui_batch
         )
         # Removed FPSDisplay initialization
         # --------------------
@@ -561,8 +624,10 @@ class LiveViewerWindow(pyglet.window.Window):
             self._exit_event.clear()
             # Pass point smoothing flag to the thread function
             # Note: We pass the *enable* flag, so negate the disable flag from args
+            # Create a mutable reference (list) for the scale factor and store it
+            self.scale_factor_ref = [self.current_scale_factor]
             thread_args = (self.data_queue, self._exit_event, model_name, inference_interval,
-                           not disable_point_smoothing) # Pass only point smoothing enable flag
+                           not disable_point_smoothing, self.scale_factor_ref) # Add scale factor ref to args
             self.inference_thread = threading.Thread(
                 target=inference_thread_func,
                 args=thread_args,
@@ -617,7 +682,9 @@ class LiveViewerWindow(pyglet.window.Window):
                         if vertices_data is not None:
                             # vertices_data is flattened, length is num_vertices * 3
                             actual_num_vertices = len(vertices_data) // 3
-
+                            # Update point count state and label
+                            self.current_point_count = actual_num_vertices
+                            self.point_count_label.text = f"Points: {self.current_point_count}"
                         # Removed Debug Print for Point Range
 
                         if vertices_data is not None and colors_data is not None and actual_num_vertices > 0:
@@ -700,7 +767,11 @@ class LiveViewerWindow(pyglet.window.Window):
         # Removed passing viewportHeight uniform
         # Pass viewport size for geometry shader calculations
         self.shader_program['viewportSize'] = (float(self.width), float(self.height))
-
+        # Pass the current input scale factor to the shader
+        self.shader_program['inputScaleFactor'] = float(self.current_scale_factor)
+        # Pass the current point size boost factor to the shader
+        self.shader_program['pointSizeBoost'] = float(self.point_size_boost)
+        self.shader_program['inputScaleFactor'] = float(self.current_scale_factor)
         # --- Draw VertexList directly ---
         # print("DEBUG: on_draw called") # Optional: Uncomment if needed to confirm on_draw frequency
         if self.vertex_list:
@@ -754,7 +825,33 @@ class LiveViewerWindow(pyglet.window.Window):
         forward = Vec3(math.sin(rot_y) * math.cos(rot_x), -math.sin(rot_x), -math.cos(rot_y) * math.cos(rot_x)).normalize()
         self.camera_position += forward * scroll_y * zoom_speed
     def on_key_press(self, symbol, modifiers):
-        if symbol == pyglet.window.key.ESCAPE: self.set_exclusive_mouse(False); self.close()
+        if symbol == pyglet.window.key.ESCAPE:
+            self.set_exclusive_mouse(False)
+            self.close()
+        elif symbol == pyglet.window.key.UP:
+            # Increase scale factor
+            self.current_scale_factor += 0.1
+            if hasattr(self, 'scale_factor_ref'): # Check if ref exists (thread started)
+                self.scale_factor_ref[0] = self.current_scale_factor
+            self.scale_factor_label.text = f"Scale: {self.current_scale_factor:.2f}x"
+            print(f"Scale factor increased to: {self.current_scale_factor:.2f}")
+        elif symbol == pyglet.window.key.DOWN:
+            # Decrease scale factor, with a minimum limit
+            self.current_scale_factor = max(0.1, self.current_scale_factor - 0.1) # Min scale 0.1
+            if hasattr(self, 'scale_factor_ref'): # Check if ref exists
+                self.scale_factor_ref[0] = self.current_scale_factor
+            self.scale_factor_label.text = f"Scale: {self.current_scale_factor:.2f}x"
+            print(f"Scale factor decreased to: {self.current_scale_factor:.2f}")
+        elif symbol == pyglet.window.key.RIGHT:
+            # Increase point size boost
+            self.point_size_boost += 0.1
+            self.point_boost_label.text = f"Pt Boost: {self.point_size_boost:.2f}x"
+            print(f"Point boost increased to: {self.point_size_boost:.2f}")
+        elif symbol == pyglet.window.key.LEFT:
+            # Decrease point size boost, with a minimum limit
+            self.point_size_boost = max(0.1, self.point_size_boost - 0.1) # Min boost 0.1
+            self.point_boost_label.text = f"Pt Boost: {self.point_size_boost:.2f}x"
+            print(f"Point boost decreased to: {self.point_size_boost:.2f}")
         # Add other key presses if needed (like pause, loop toggle - less relevant for live view)
 
     def on_close(self):
