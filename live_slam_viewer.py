@@ -154,6 +154,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         # Removed debug print
         while not exit_event.is_set():
             # Removed debug prints
+            t_capture = time.time() # Timestamp frame capture
             ret, frame = cap.read()
             # Removed debug print
             if not ret:
@@ -191,30 +192,41 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     data_queue.put(("status", f"Running inference on frame {frame_count}...")) # Status update
                     with torch.no_grad():
                         predictions = model.infer(frame_tensor) # No camera intrinsics for now
-                        # Removed debug print
+                        # Removed debug print for prediction keys
                         # Removed key logging print(f"DEBUG: Prediction keys: {predictions.keys()}")
 
                     # --- Smooth Depth Map (EMA) ---
+                    depth_diff_for_queue = 0.0 # Initialize for this frame cycle
                     if 'depth' in predictions and 'rays' in predictions:
                         current_depth_map = predictions['depth'].squeeze() # Remove batch dim if present (H, W)
                         if smoothed_depth_map is None:
                             smoothed_depth_map = current_depth_map.clone()
+                            # depth_diff_for_queue remains 0.0 for the first frame
                         else:
                             # Ensure shapes match before EMA
                             if smoothed_depth_map.shape == current_depth_map.shape:
                                 if enable_depth_smoothing:
-                                    # --- Calculate Adaptive Alpha ---
+                                    # --- Calculate difference BEFORE smoothing ---
                                     depth_diff = torch.abs(current_depth_map - smoothed_depth_map).mean()
+                                    depth_diff_for_queue = depth_diff.item() # Store scalar value for queueing
+                                    # --- Calculate Adaptive Alpha ---
                                     change_factor = torch.clamp(depth_diff / depth_diff_threshold, 0.0, 1.0)
                                     adaptive_alpha_depth = min_alpha_depth + (max_alpha_depth - min_alpha_depth) * change_factor
+                                    # --- More Debug Prints ---
+                                    print(f"DEBUG Motion: enable_depth_smoothing={enable_depth_smoothing_arg}") # Check arg passed to thread
+                                    print(f"DEBUG Motion: current_depth mean={current_depth_map.mean().item():.4f}")
+                                    print(f"DEBUG Motion: prev_smoothed mean={smoothed_depth_map.mean().item():.4f}")
+                                    print(f"DEBUG Motion: depth_diff_for_queue={depth_diff_for_queue:.4f}")
                                     # --- Apply EMA with Adaptive Alpha ---
                                     smoothed_depth_map = adaptive_alpha_depth * current_depth_map + (1.0 - adaptive_alpha_depth) * smoothed_depth_map
                                 else:
                                     # If smoothing disabled, just use the current map
                                     smoothed_depth_map = current_depth_map
+                                    # depth_diff_for_queue remains 0.0
                             else:
                                 print("Warning: Depth map shape changed, resetting smoothing.")
                                 smoothed_depth_map = current_depth_map.clone()
+                                depth_diff_for_queue = 0.0 # Explicitly reset diff on shape change
 
                         # --- Recalculate Points from Smoothed Depth ---
                         # Assuming rays shape is (B, H, W, 3) or (C, H, W) after squeeze
@@ -345,12 +357,11 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         # Put data into queue for the viewer
                         # Removed debug print
                         if not data_queue.full():
-                                # Calculate depth diff again here for queueing, or store it from adaptive alpha calc
-                                depth_diff_value = 0.0 # Default if smoothing disabled or first frame
-                                if enable_depth_smoothing and smoothed_depth_map is not None and current_depth_map is not None and smoothed_depth_map.shape == current_depth_map.shape:
-                                     depth_diff_value = torch.abs(current_depth_map - smoothed_depth_map).mean().item() # Get scalar value
-                                # Removed frame_h definition here as it's defined earlier
-                                data_queue.put((vertices_flat, colors_flat, num_vertices, frame_h, depth_diff_value)) # Add frame_h and depth_diff_value
+                                # Use the depth_diff_for_queue calculated earlier
+                                # Ensure depth_diff_for_queue is defined even if smoothing block was skipped
+                                current_diff = depth_diff_for_queue if 'depth_diff_for_queue' in locals() else 0.0
+                                # Add t_capture to the queued tuple
+                                data_queue.put((vertices_flat, colors_flat, num_vertices, frame_h, current_diff, t_capture))
                                 # Removed debug print
                         else:
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.") # Modified warning
@@ -389,6 +400,11 @@ class LiveViewerWindow(pyglet.window.Window):
         self.vertex_list = None # Initialize as None
         self.frame_count_display = 0 # For UI
         self.last_depth_diff = 0.0 # Store last depth difference for display
+        # --- FPS / Latency Tracking ---
+        self.last_update_time = time.time()
+        self.point_cloud_fps = 0.0
+        self.last_capture_timestamp = None
+        # -----------------------------
 
         # --- Status Display ---
         self.ui_batch = pyglet.graphics.Batch() # Create a batch for UI elements
@@ -402,7 +418,7 @@ class LiveViewerWindow(pyglet.window.Window):
             color=(255, 255, 255, 200), # White with some transparency
             batch=self.ui_batch # Assign label to the batch
         )
-        # Removed self.fps_display = pyglet.clock.ClockDisplay()
+        # Removed FPSDisplay initialization
         # --------------------
 
         # --- Threading related ---
@@ -417,6 +433,12 @@ class LiveViewerWindow(pyglet.window.Window):
         self.world_up_vector = Vec3(0, 1, 0)
         self.move_speed = 2.0 # Slower speed for potentially smaller scenes
         self.fast_move_speed = 6.0
+        # Track previous state for motion detection
+        # Manually copy Vec3 components as .copy() doesn't exist
+        self.prev_camera_position = Vec3(self.camera_position.x, self.camera_position.y, self.camera_position.z)
+        self.prev_camera_rotation_x = self.camera_rotation_x
+        self.prev_camera_rotation_y = self.camera_rotation_y
+        self.camera_motion_confidence = 0.0 # Initialize motion confidence
         # --------------------
 
         # --- Input Handlers ---
@@ -539,10 +561,19 @@ class LiveViewerWindow(pyglet.window.Window):
                 else:
                     # --- Process actual vertex data ---
                     try:
-                        # Unpack data including image height and depth diff, ignore queue count
-                        vertices_data, colors_data, _, frame_h, depth_diff = latest_data
+                        # Unpack data including image height, depth diff, and capture time
+                        vertices_data, colors_data, _, frame_h, depth_diff, t_capture = latest_data
                         self.current_image_height = frame_h # Store image height
                         self.last_depth_diff = depth_diff # Store depth difference
+                        self.last_capture_timestamp = t_capture # Store capture time
+
+                        # --- Calculate Point Cloud FPS ---
+                        current_time = time.time()
+                        time_delta = current_time - self.last_update_time
+                        if time_delta > 1e-6: # Avoid division by zero
+                            self.point_cloud_fps = 1.0 / time_delta
+                        self.last_update_time = current_time
+                        # -----------------------------
 
                         # Calculate actual number of vertices based on received data length
                         actual_num_vertices = 0
@@ -593,6 +624,9 @@ class LiveViewerWindow(pyglet.window.Window):
 
     def update_camera(self, dt):
         """Scheduled function to handle camera movement based on key states."""
+
+        # Removed viewer camera motion confidence calculation
+
         speed = self.fast_move_speed if self.keys[key.LSHIFT] or self.keys[key.RSHIFT] else self.move_speed
         move_amount = speed * dt
         rot_y = -math.radians(self.camera_rotation_y)
@@ -607,6 +641,8 @@ class LiveViewerWindow(pyglet.window.Window):
         if self.keys[key.D]: self.camera_position -= right * move_amount # Swapped A/D
         if self.keys[key.E]: self.camera_position += up * move_amount
         if self.keys[key.Q]: self.camera_position -= up * move_amount
+
+        # Removed update for previous viewer camera state
 
     def get_camera_matrices(self):
         rot_y = -math.radians(self.camera_rotation_y)
@@ -647,15 +683,18 @@ class LiveViewerWindow(pyglet.window.Window):
         # Disable depth test for 2D UI rendering
         gl.glDisable(gl.GL_DEPTH_TEST)
 
-        # Calculate motion metric (0=still, 1=max change based on threshold)
-        motion_metric = min(self.last_depth_diff / 0.1, 1.0) # Assuming 0.1 threshold implies max motion
+        # Calculate scene change metric (0=still, 1=max change based on threshold)
+        scene_change_metric = min(self.last_depth_diff / 0.1, 1.0) # Assuming 0.1 threshold implies max motion
+        latency_ms = (time.time() - self.last_capture_timestamp) * 1000 if self.last_capture_timestamp else 0
 
-        # Update label text (Remove FPS, add Motion)
-        status_text = f"Motion: {motion_metric:.2f} | {self.status_message}"
+        # Update label text (Show PointCloud FPS, Latency, Scene Change, and Status)
+        status_text = f"PointCloud FPS: {self.point_cloud_fps:.1f} | Latency: {latency_ms:.0f}ms | SceneChange: {scene_change_metric:.2f} | {self.status_message}"
         self.status_label.text = status_text
 
         # Draw the UI batch (which contains the label)
         self.ui_batch.draw()
+
+        # Removed FPS display draw call
 
         # Re-enable depth test for next frame's 3D rendering
         gl.glEnable(gl.GL_DEPTH_TEST)
@@ -663,7 +702,9 @@ class LiveViewerWindow(pyglet.window.Window):
 
 
     # --- Input Handlers (Simplified for brevity, same as before) ---
-    def on_resize(self, width, height): gl.glViewport(0, 0, max(1, width), max(1, height))
+    def on_resize(self, width, height):
+        gl.glViewport(0, 0, max(1, width), max(1, height))
+        # Removed FPS display update
     def on_mouse_press(self, x, y, button, modifiers):
         if button == pyglet.window.mouse.LEFT: self.set_exclusive_mouse(True); self.mouse_down = True
     def on_mouse_release(self, x, y, button, modifiers):
@@ -696,13 +737,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Live SLAM viewer using UniK3D.")
     parser.add_argument("--model", type=str, default="unik3d-vitl", help="Name of the UniK3D model to use (e.g., unik3d-vits, unik3d-vitb, unik3d-vitl)")
     parser.add_argument("--interval", type=int, default=1, help="Run inference every N frames (default: 1).")
-    parser.add_argument("--disable-depth-smoothing", action="store_true", help="Disable temporal smoothing on depth map.")
-    parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points.")
+    parser.add_argument("--enable-depth-smoothing", action="store_true", help="Enable temporal smoothing on depth map (default: disabled).") # Changed flag
+    parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points (default: enabled).") # Clarified default
     args = parser.parse_args()
 
     gl.glEnable(gl.GL_BLEND)
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-    window = LiveViewerWindow(model_name=args.model, inference_interval=args.interval, width=1024, height=768, caption='Live UniK3D SLAM Viewer', resizable=True)
+    # Pass smoothing flags from args to window constructor
+    window = LiveViewerWindow(model_name=args.model, inference_interval=args.interval,
+                              disable_depth_smoothing=not args.enable_depth_smoothing, # Pass the opposite of enable flag
+                              disable_point_smoothing=args.disable_point_smoothing,
+                              width=1024, height=768, caption='Live UniK3D SLAM Viewer', resizable=True)
     try:
         pyglet.app.run()
     except Exception as e:
