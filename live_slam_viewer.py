@@ -104,7 +104,7 @@ fragment_source = """#version 150 core
 # --- Inference Thread Function ---
 # (Keep inference thread function as is)
 def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
-                          enable_depth_smoothing_arg, enable_point_smoothing_arg): # Added args
+                          enable_point_smoothing_arg): # Removed depth smoothing arg
     """Loads model, captures camera, runs inference, puts results in queue."""
     print("Inference thread started.")
     data_queue.put(("status", "Inference thread started...")) # Status update
@@ -137,18 +137,19 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         frame_count = 0
         last_inference_time = time.time()
 
-        # --- Temporal Smoothing Init ---
-        smoothed_depth_map = None
+        # --- Temporal Smoothing & Motion Init ---
         smoothed_points_xyz = None # For smoothing final points
         # Flags to enable/disable smoothing (can be controlled by args)
-        enable_depth_smoothing = False # Default: OFF
-        enable_point_smoothing = False  # Default: OFF
-        # Adaptive alpha parameters (only used if enable_depth_smoothing is True)
-        min_alpha_depth = 0.1
-        max_alpha_depth = 0.8
-        depth_diff_threshold = 0.1
-        # Constant alpha for points (only used if enable_point_smoothing is True)
-        alpha_points = 0.2
+        enable_point_smoothing = enable_point_smoothing_arg # Use arg passed to thread
+        # Adaptive alpha for points (only used if enable_point_smoothing is True)
+        min_alpha_points = 0.0  # Freeze points when still
+        max_alpha_points = 1.0  # No smoothing when moving
+        depth_motion_threshold = 0.1 # Restore threshold, will use non-linear mapping
+        prev_depth_map = None # Store previous depth map for difference calculation
+        # Global scale smoothing parameters
+        smoothed_mean_depth = None
+        min_alpha_scale = 0.0 # Freeze scale when still
+        max_alpha_scale = 1.0 # Instant scale update when moving
         # -----------------------------
 
         # Removed debug print
@@ -161,6 +162,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 print("Error: Failed to capture frame.")
                 time.sleep(0.1)
                 continue
+
+            # (Motion calculation moved to after depth prediction)
             # Removed debug print
 
             frame_count += 1
@@ -195,54 +198,76 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         # Removed debug print for prediction keys
                         # Removed key logging print(f"DEBUG: Prediction keys: {predictions.keys()}")
 
-                    # --- Smooth Depth Map (EMA) ---
-                    depth_diff_for_queue = 0.0 # Initialize for this frame cycle
-                    if 'depth' in predictions and 'rays' in predictions:
-                        current_depth_map = predictions['depth'].squeeze() # Remove batch dim if present (H, W)
-                        if smoothed_depth_map is None:
-                            smoothed_depth_map = current_depth_map.clone()
-                            # depth_diff_for_queue remains 0.0 for the first frame
-                        else:
-                            # Ensure shapes match before EMA
-                            if smoothed_depth_map.shape == current_depth_map.shape:
-                                if enable_depth_smoothing:
-                                    # --- Calculate difference BEFORE smoothing ---
-                                    depth_diff = torch.abs(current_depth_map - smoothed_depth_map).mean()
-                                    depth_diff_for_queue = depth_diff.item() # Store scalar value for queueing
-                                    # --- Calculate Adaptive Alpha ---
-                                    change_factor = torch.clamp(depth_diff / depth_diff_threshold, 0.0, 1.0)
-                                    adaptive_alpha_depth = min_alpha_depth + (max_alpha_depth - min_alpha_depth) * change_factor
-                                    # --- More Debug Prints ---
-                                    print(f"DEBUG Motion: enable_depth_smoothing={enable_depth_smoothing_arg}") # Check arg passed to thread
-                                    print(f"DEBUG Motion: current_depth mean={current_depth_map.mean().item():.4f}")
-                                    print(f"DEBUG Motion: prev_smoothed mean={smoothed_depth_map.mean().item():.4f}")
-                                    print(f"DEBUG Motion: depth_diff_for_queue={depth_diff_for_queue:.4f}")
-                                    # --- Apply EMA with Adaptive Alpha ---
-                                    smoothed_depth_map = adaptive_alpha_depth * current_depth_map + (1.0 - adaptive_alpha_depth) * smoothed_depth_map
-                                else:
-                                    # If smoothing disabled, just use the current map
-                                    smoothed_depth_map = current_depth_map
-                                    # depth_diff_for_queue remains 0.0
-                            else:
-                                print("Warning: Depth map shape changed, resetting smoothing.")
-                                smoothed_depth_map = current_depth_map.clone()
-                                depth_diff_for_queue = 0.0 # Explicitly reset diff on shape change
+                    # --- Get Points (Depth calculation removed) ---
+                    if 'rays' in predictions and 'depth' in predictions:
+                        # We still need depth and rays to calculate initial points_xyz
+                        # but we won't use the depth difference for motion anymore.
+                        current_depth_map = predictions['depth'].squeeze() # (H, W)
 
-                        # --- Recalculate Points from Smoothed Depth ---
-                        # Assuming rays shape is (B, H, W, 3) or (C, H, W) after squeeze
+                        # --- Calculate Per-Pixel Depth Motion Map ---
+                        per_pixel_depth_motion_map = None # Initialize for this frame
+                        if prev_depth_map is not None:
+                            if current_depth_map.shape == prev_depth_map.shape:
+                                depth_diff = torch.abs(current_depth_map - prev_depth_map)
+                                # Scale difference to 0-1 motion value per pixel
+                                per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0) # Normalized 0-1
+
+                                # --- Modulate motion by distance ---
+                                # Normalize depth (0 near, 1 far, clamped at 10 units)
+                                normalized_depth = torch.clamp(current_depth_map / 10.0, 0.0, 1.0)
+                                # Reduce motion sensitivity for farther points
+                                distance_modulated_motion = per_pixel_depth_motion * (1.0 - normalized_depth)
+                                per_pixel_depth_motion_map = distance_modulated_motion # Use modulated motion map
+                                # --- End distance modulation ---
+                            # else: map remains None if shape changes
+
+                        # --- End Per-Pixel Depth Motion Map --- (per_pixel_depth_motion_map now holds distance_modulated_motion)
+
+                        # Store prev_depth_map *after* using current_depth_map for modulation calc
+                        prev_depth_map = current_depth_map.clone()
+
+                        # --- Apply Global Scale Smoothing (Adaptive) ---
+                        # Calculate global motion based on the *original* per-pixel motion map
+                        # before distance modulation for a more stable global metric.
+                        global_motion_unmodulated = 0.0
+                        if per_pixel_depth_motion is not None: # Use original motion before modulation
+                            global_motion_unmodulated = per_pixel_depth_motion.mean().item()
+
+                        scaled_depth_map = current_depth_map # Default to current if no smoothing needed
+                        current_mean_depth = current_depth_map.mean().item()
+                        # Calculate adaptive alpha for scale using non-linear mapping (exponent 1.5) on unmodulated global motion
+                        motion_factor_scale = global_motion_unmodulated ** 1.5 # Use exponent 1.5
+                        adaptive_alpha_scale = min_alpha_scale + (max_alpha_scale - min_alpha_scale) * motion_factor_scale
+
+                        if smoothed_mean_depth is None:
+                            smoothed_mean_depth = current_mean_depth
+                        else:
+                            # Apply EMA to the mean depth
+                            smoothed_mean_depth = adaptive_alpha_scale * current_mean_depth + (1.0 - adaptive_alpha_scale) * smoothed_mean_depth
+
+                        # Calculate and apply scale correction factor
+                        if current_mean_depth > 1e-6: # Avoid division by zero
+                            scale_factor = smoothed_mean_depth / current_mean_depth
+                            scaled_depth_map = current_depth_map * scale_factor
+                        # --- End Global Scale Smoothing ---
+
+                        # --- Calculate Points from Scaled Depth ---
                         rays = predictions['rays'].squeeze()
-                        # Permute rays from (C, H, W) to (H, W, C) if necessary
-                        if rays.shape[0] == 3 and rays.ndim == 3:
-                            rays = rays.permute(1, 2, 0)
-                        depth_to_multiply = smoothed_depth_map.unsqueeze(-1)
-                        # Removed shape debug prints
-                        # Ensure depth map has channel dim for broadcasting: (H, W) -> (H, W, 1)
-                        points_xyz = rays * depth_to_multiply
-                        data_queue.put(("status", f"Smoothed depth, recalculated points for frame {frame_count}..."))
-                    else:
-                        # Fallback if depth or rays are missing
-                        data_queue.put(("status", f"Extracting points directly for frame {frame_count}..."))
+                        if rays.shape[0] == 3 and rays.ndim == 3: # Permute if (C, H, W)
+                            rays = rays.permute(1, 2, 0) # (H, W, 3)
+                        # Use the globally scaled depth map
+                        depth_to_multiply = scaled_depth_map.unsqueeze(-1) # (H, W, 1)
+                        points_xyz = rays * depth_to_multiply # (H, W, 3)
+                        # --- End Point Calculation ---
+                        data_queue.put(("status", f"Calculated points for frame {frame_count}..."))
+                    elif "points" in predictions:
+                        # Fallback if depth or rays are missing but points are present
+                        data_queue.put(("status", f"Using direct points for frame {frame_count}..."))
                         points_xyz = predictions["points"] # Use original points
+                    else:
+                        # If neither depth/rays nor points are available
+                        points_xyz = None
+                        data_queue.put(("warning", f"No points/depth found for frame {frame_count}"))
 
                     # --- Original Point Extraction (Now part of fallback) ---
                     # points_xyz = predictions["points"] # Shape might be (B, N, 3) or similar
@@ -254,10 +279,25 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         else:
                             # Ensure shapes match before EMA
                             if smoothed_points_xyz.shape == points_xyz.shape:
-                                if enable_point_smoothing:
-                                    smoothed_points_xyz = alpha_points * points_xyz + (1.0 - alpha_points) * smoothed_points_xyz # Use alpha_points
+                                if enable_point_smoothing and per_pixel_depth_motion_map is not None:
+                                    # Check if points_xyz has compatible shape (H, W, 3)
+                                    if points_xyz.ndim == 3 and points_xyz.shape[:2] == per_pixel_depth_motion_map.shape:
+                                        # --- Calculate Per-Point Adaptive Alpha Map with distance-dependent min_alpha and non-linear mapping ---
+                                        # Calculate distance-dependent minimum alpha (0.1 near, 0.0 far)
+                                        effective_min_alpha_points = 0.0 + (0.1 * (1.0 - normalized_depth)) # Base min_alpha + bonus for closeness
+                                        # Use original per_pixel_depth_motion for mapping, apply exponent 1.5
+                                        motion_factor_points = per_pixel_depth_motion ** 1.5
+                                        # Interpolate between distance-dependent min and global max
+                                        adaptive_alpha_points_map = effective_min_alpha_points + (max_alpha_points - effective_min_alpha_points) * motion_factor_points
+                                        # Unsqueeze for broadcasting: (H, W) -> (H, W, 1)
+                                        adaptive_alpha_points_map = adaptive_alpha_points_map.unsqueeze(-1)
+                                        # --- Apply EMA with Per-Point Adaptive Alpha ---
+                                        smoothed_points_xyz = adaptive_alpha_points_map * points_xyz + (1.0 - adaptive_alpha_points_map) * smoothed_points_xyz
+                                    else:
+                                        # Fallback if shapes don't match: use current points
+                                        smoothed_points_xyz = points_xyz
                                 else:
-                                    # If smoothing disabled, just use the current points
+                                    # If smoothing disabled or no motion map, use current points
                                     smoothed_points_xyz = points_xyz
                             else:
                                 print("Warning: Points tensor shape changed, resetting smoothing.")
@@ -357,11 +397,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         # Put data into queue for the viewer
                         # Removed debug print
                         if not data_queue.full():
-                                # Use the depth_diff_for_queue calculated earlier
-                                # Ensure depth_diff_for_queue is defined even if smoothing block was skipped
-                                current_diff = depth_diff_for_queue if 'depth_diff_for_queue' in locals() else 0.0
-                                # Add t_capture to the queued tuple
-                                data_queue.put((vertices_flat, colors_flat, num_vertices, frame_h, current_diff, t_capture))
+                                # No longer passing motion confidence
+                                data_queue.put((vertices_flat, colors_flat, num_vertices, frame_h, t_capture))
                                 # Removed debug print
                         else:
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.") # Modified warning
@@ -393,13 +430,13 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 # --- Viewer Class ---
 class LiveViewerWindow(pyglet.window.Window):
     def __init__(self, model_name, inference_interval=1, # Changed default interval
-                 disable_depth_smoothing=False, disable_point_smoothing=False, # Added args
+                 disable_point_smoothing=False, # Removed depth smoothing arg
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.vertex_list = None # Initialize as None
         self.frame_count_display = 0 # For UI
-        self.last_depth_diff = 0.0 # Store last depth difference for display
+        # self.last_depth_diff = 0.0 # Removed depth diff storage
         # --- FPS / Latency Tracking ---
         self.last_update_time = time.time()
         self.point_cloud_fps = 0.0
@@ -509,9 +546,9 @@ class LiveViewerWindow(pyglet.window.Window):
         pyglet.clock.schedule_interval(self.update, 1.0 / 60.0) # Update viewer frequently
         pyglet.clock.schedule_interval(self.update_camera, 1.0 / 60.0) # Update camera
 
-        # Start the inference thread, passing smoothing flags
+        # Start the inference thread, passing point smoothing flag
         self.start_inference_thread(model_name, inference_interval,
-                                    disable_depth_smoothing, disable_point_smoothing)
+                                    disable_point_smoothing)
 
         # Set up OpenGL state
         gl.glClearColor(0.1, 0.1, 0.1, 1.0)
@@ -519,13 +556,13 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
 
     def start_inference_thread(self, model_name, inference_interval,
-                               disable_depth_smoothing, disable_point_smoothing): # Added args
+                               disable_point_smoothing): # Removed depth smoothing arg
         if self.inference_thread is None or not self.inference_thread.is_alive():
             self._exit_event.clear()
-            # Pass smoothing flags to the thread function
-            # Note: We pass the *enable* flags, so negate the disable flags from args
+            # Pass point smoothing flag to the thread function
+            # Note: We pass the *enable* flag, so negate the disable flag from args
             thread_args = (self.data_queue, self._exit_event, model_name, inference_interval,
-                           not disable_depth_smoothing, not disable_point_smoothing)
+                           not disable_point_smoothing) # Pass only point smoothing enable flag
             self.inference_thread = threading.Thread(
                 target=inference_thread_func,
                 args=thread_args,
@@ -561,10 +598,10 @@ class LiveViewerWindow(pyglet.window.Window):
                 else:
                     # --- Process actual vertex data ---
                     try:
-                        # Unpack data including image height, depth diff, and capture time
-                        vertices_data, colors_data, _, frame_h, depth_diff, t_capture = latest_data
+                        # Unpack data (motion confidence removed)
+                        vertices_data, colors_data, _, frame_h, t_capture = latest_data
                         self.current_image_height = frame_h # Store image height
-                        self.last_depth_diff = depth_diff # Store depth difference
+                        # self.camera_motion_confidence = motion_confidence # Removed
                         self.last_capture_timestamp = t_capture # Store capture time
 
                         # --- Calculate Point Cloud FPS ---
@@ -683,12 +720,11 @@ class LiveViewerWindow(pyglet.window.Window):
         # Disable depth test for 2D UI rendering
         gl.glDisable(gl.GL_DEPTH_TEST)
 
-        # Calculate scene change metric (0=still, 1=max change based on threshold)
-        scene_change_metric = min(self.last_depth_diff / 0.1, 1.0) # Assuming 0.1 threshold implies max motion
+        # Calculate latency
         latency_ms = (time.time() - self.last_capture_timestamp) * 1000 if self.last_capture_timestamp else 0
 
-        # Update label text (Show PointCloud FPS, Latency, Scene Change, and Status)
-        status_text = f"PointCloud FPS: {self.point_cloud_fps:.1f} | Latency: {latency_ms:.0f}ms | SceneChange: {scene_change_metric:.2f} | {self.status_message}"
+        # Update label text (Motion Confidence removed)
+        status_text = f"PointCloud FPS: {self.point_cloud_fps:.1f} | Latency: {latency_ms:.0f}ms | {self.status_message}"
         self.status_label.text = status_text
 
         # Draw the UI batch (which contains the label)
@@ -737,7 +773,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Live SLAM viewer using UniK3D.")
     parser.add_argument("--model", type=str, default="unik3d-vitl", help="Name of the UniK3D model to use (e.g., unik3d-vits, unik3d-vitb, unik3d-vitl)")
     parser.add_argument("--interval", type=int, default=1, help="Run inference every N frames (default: 1).")
-    parser.add_argument("--enable-depth-smoothing", action="store_true", help="Enable temporal smoothing on depth map (default: disabled).") # Changed flag
+    # Removed --enable-depth-smoothing argument
     parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points (default: enabled).") # Clarified default
     args = parser.parse_args()
 
@@ -745,7 +781,7 @@ if __name__ == '__main__':
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
     # Pass smoothing flags from args to window constructor
     window = LiveViewerWindow(model_name=args.model, inference_interval=args.interval,
-                              disable_depth_smoothing=not args.enable_depth_smoothing, # Pass the opposite of enable flag
+                              # Removed depth smoothing argument
                               disable_point_smoothing=args.disable_point_smoothing,
                               width=1024, height=768, caption='Live UniK3D SLAM Viewer', resizable=True)
     try:
