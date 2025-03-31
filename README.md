@@ -87,6 +87,56 @@ If everything runs correctly, `demo.py` should print: `RMSE on 3D clouds for Sca
 `demo.py` allows you also to save output information, e.g. rays, depth and 3D pointcloud as `.ply` file.
 
 
+## Docker Usage (Experimental)
+
+This project includes a `Dockerfile` to build an image containing the necessary dependencies to run the `live_slam_viewer.py` script. This is primarily intended for Linux hosts with NVIDIA GPUs and requires the NVIDIA Container Toolkit.
+
+**Prerequisites:**
+
+*   Docker installed.
+*   NVIDIA Container Toolkit installed (for GPU acceleration).
+*   An X server running on the host (for displaying the GUI).
+
+**Build the Image:**
+
+```bash
+docker build -t unik3d-live .
+```
+
+**Run the Container (Linux Example):**
+
+Running GUI applications from Docker requires forwarding the display and accessing devices. The following command is an example for a Linux host:
+
+```bash
+# Allow connections from the container to your X server (run on host)
+xhost +local:docker
+
+# Run the container
+docker run -it --rm \
+    --gpus all \
+    --device=/dev/video0:/dev/video0 \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    unik3d-live
+```
+
+**Explanation:**
+
+*   `xhost +local:docker`: Temporarily allows containers to connect to the host's X server. You might need to adjust permissions depending on your setup.
+*   `docker run -it --rm`: Runs the container interactively and removes it on exit.
+*   `--gpus all`: Makes NVIDIA GPUs available inside the container (requires NVIDIA Container Toolkit).
+*   `--device=/dev/video0:/dev/video0`: Maps the host's default camera (usually `/dev/video0`) into the container. Adjust if your camera uses a different path.
+*   `-e DISPLAY=$DISPLAY`: Passes the host's display environment variable to the container.
+*   `-v /tmp/.X11-unix:/tmp/.X11-unix`: Mounts the X server socket into the container.
+*   `unik3d-live`: The name of the image built previously.
+
+**Notes:**
+
+*   **macOS/Windows:** Running GUI applications with hardware access (GPU, camera) from Docker on macOS or Windows is more complex and may require different configurations (e.g., using XQuartz on macOS, VcXsrv on Windows, and potentially different device mapping). The provided commands are specific to Linux.
+*   **Camera Index:** The `live_slam_viewer.py` script currently uses camera index 0. If your desired camera is different, you might need to modify the script or the `--device` mapping.
+*   **Security:** Be mindful of the security implications when granting access to your X server (`xhost`).
+
+
 ## Gradio Demo
 
 - Plase visit our [HugginFace Space](https://huggingface.co/spaces/lpiccinelli/UniK3D-demo) for an installation-free test on your images!

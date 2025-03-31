@@ -1,0 +1,30 @@
+# Git files
+.git
+.gitignore
+
+# Python virtual environment
+.venv
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+
+# Output files (if any)
+video_outputs/
+*.log
+*.h5
+*.npy
+
+# OS specific files
+.DS_Store
+Thumbs.db
