@@ -39,12 +39,12 @@ vertex_source = """#version 150 core
         float originDist = length(vertices);
 
         // 2. Calculate pixel size directly proportional to origin distance.
-        //    Adjust scalingFactor (e.g., 2.0) and min/max pixels (e.g., 1.0, 20.0) as needed.
-        float scalingFactor = 2.0; // Moderate scaling factor
+        //    Adjust scalingFactor (e.g., 3.0) and min/max pixels (e.g., 1.0, 30.0) as needed.
+        float scalingFactor = 3.0; // Adjusted scaling factor
         float pointSizePixels = scalingFactor * originDist;
 
         // 3. Set final point size (clamped)
-        gl_PointSize = max(1.0, min(20.0, pointSizePixels)); // Moderate max clamp
+        gl_PointSize = max(1.0, min(30.0, pointSizePixels)); // Adjusted max clamp
         // --- End Point Size Calculation ---
     }
 """
@@ -572,7 +572,7 @@ class LiveViewerWindow(pyglet.window.Window):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Live SLAM viewer using UniK3D.")
     parser.add_argument("--model", type=str, default="unik3d-vitl", help="Name of the UniK3D model to use (e.g., unik3d-vits, unik3d-vitb, unik3d-vitl)")
-    parser.add_argument("--interval", type=int, default=10, help="Run inference every N frames.")
+    parser.add_argument("--interval", type=int, default=1, help="Run inference every N frames.")
     args = parser.parse_args()
 
     gl.glEnable(gl.GL_BLEND)
