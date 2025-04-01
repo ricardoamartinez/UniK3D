@@ -28,16 +28,26 @@ DEFAULT_SETTINGS = {
     "saturation": 1.5,
     "brightness": 1.0,
     "contrast": 1.1,
-    "sharpness": 1.1, # Simple contrast boost for sharpening
+    "sharpness": 1.1,
     "point_size_boost": 2.5,
     "input_scale_factor": 0.9,
-    "enable_point_smoothing": True, # Default smoothing state
+    "enable_point_smoothing": True,
+    "min_alpha_points": 0.0,
+    "max_alpha_points": 1.0,
+    "enable_edge_aware_smoothing": True,
+    "depth_edge_threshold1": 50.0,
+    "depth_edge_threshold2": 150.0,
+    "rgb_edge_threshold1": 50.0,
+    "rgb_edge_threshold2": 150.0,
+    "edge_smoothing_influence": 0.7,
+    "gradient_influence_scale": 1.0, # How much depth gradient scales edge influence
     "show_camera_feed": False,
     "show_depth_map": False,
+    "show_edge_map": False,
+    "show_smoothing_map": False,
 }
 
 # Simple shaders (Using 'vertices' instead of 'position')
-# Expects vec3 floats for both vertices and colors
 vertex_source = """#version 150 core
     in vec3 vertices;
     in vec3 colors; // Expects normalized floats (0.0-1.0)
@@ -106,8 +116,6 @@ fragment_source = """#version 150 core
         processed_color = hsv2rgb(hsv);
 
         // --- Simple Sharpening via Contrast Boost ---
-        // Apply sharpness factor similar to contrast but maybe on original/less processed color?
-        // For simplicity, applying another contrast boost using the sharpness factor
         vec3 hsv_sharp = rgb2hsv(processed_color);
         hsv_sharp.z = clamp(0.5 + (hsv_sharp.z - 0.5) * sharpness, 0.0, 1.0);
         processed_color = hsv2rgb(hsv_sharp);
@@ -208,50 +216,42 @@ texture_fragment_source = """#version 150 core
 
 # --- Inference Thread Function ---
 def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
-                          enable_point_smoothing_arg, scale_factor_ref): # Added scale_factor_ref
-    """Loads model, captures camera, runs inference (with dynamic scaling), puts results in queue."""
+                          scale_factor_ref, edge_params_ref):
+    """Loads model, captures camera, runs inference, puts results in queue."""
     print("Inference thread started.")
-    data_queue.put(("status", "Inference thread started...")) # Status update
+    data_queue.put(("status", "Inference thread started..."))
     try:
         # --- Load Model ---
         print(f"Loading UniK3D model: {model_name}...")
-        data_queue.put(("status", f"Loading model: {model_name}...")) # Status update
+        data_queue.put(("status", f"Loading model: {model_name}..."))
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
         model = UniK3D.from_pretrained(f"lpiccinelli/{model_name}")
         model = model.to(device)
-        model.eval() # Set to evaluation mode
+        model.eval()
         print("Model loaded.")
-        data_queue.put(("status", "Model loaded.")) # Status update
+        data_queue.put(("status", "Model loaded."))
 
         # --- Initialize Camera ---
         print("Initializing camera...")
-        data_queue.put(("status", "Initializing camera...")) # Status update
-        cap = cv2.VideoCapture(0) # Use default camera
+        data_queue.put(("status", "Initializing camera..."))
+        cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("Error: Could not open camera.")
             data_queue.put(("error", "Could not open camera."))
             return
         print("Camera initialized.")
-        data_queue.put(("status", "Camera initialized.")) # Status update
+        data_queue.put(("status", "Camera initialized."))
 
         frame_count = 0
         last_inference_time = time.time()
 
         # --- Temporal Smoothing & Motion Init ---
-        smoothed_points_xyz = None # For smoothing final points
-        # Flags to enable/disable smoothing (can be controlled by args)
-        # enable_point_smoothing = enable_point_smoothing_arg # Use arg passed to thread (Now controlled by ImGui)
-        # Adaptive alpha for points (only used if enable_point_smoothing is True)
-        min_alpha_points = 0.0  # Freeze points when still
-        max_alpha_points = 1.0  # No smoothing when moving
-        depth_motion_threshold = 0.1 # Define threshold for motion detection
-        prev_depth_map = None # Store previous depth map for difference calculation
-        # Global scale smoothing parameters
+        smoothed_points_xyz = None
+        depth_motion_threshold = 0.1
+        prev_depth_map = None
         smoothed_mean_depth = None
-        min_alpha_scale = 0.0 # Freeze scale when still
-        max_alpha_scale = 1.0 # Instant scale update when moving
-        prev_scale_factor = None # Track previous scale factor for smoothing reset
+        prev_scale_factor = None
         # -----------------------------
 
         while not exit_event.is_set():
@@ -300,15 +300,56 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
                     points_xyz = None
                     scaled_depth_map_for_queue = None
+                    edge_map_viz = None
+                    smoothing_map_viz = None
 
                     if 'rays' in predictions and 'depth' in predictions:
                         current_depth_map = predictions['depth'].squeeze()
+
+                        # --- Edge Detection on Depth & RGB ---
+                        combined_edge_map = None
+                        depth_gradient_map = None
+                        if current_depth_map is not None:
+                            try:
+                                depth_thresh1 = edge_params_ref["depth_threshold1"]
+                                depth_thresh2 = edge_params_ref["depth_threshold2"]
+                                rgb_thresh1 = edge_params_ref["rgb_threshold1"]
+                                rgb_thresh2 = edge_params_ref["rgb_threshold2"]
+
+                                depth_np_u8 = (torch.clamp(current_depth_map / 10.0, 0.0, 1.0) * 255).byte().cpu().numpy()
+
+                                # Depth Edges (Canny)
+                                depth_edge_map = cv2.Canny(depth_np_u8, depth_thresh1, depth_thresh2)
+
+                                # Depth Gradient (Sobel)
+                                grad_x = cv2.Sobel(depth_np_u8, cv2.CV_64F, 1, 0, ksize=3)
+                                grad_y = cv2.Sobel(depth_np_u8, cv2.CV_64F, 0, 1, ksize=3)
+                                depth_gradient_map = cv2.magnitude(grad_x, grad_y)
+                                # Normalize gradient map 0-1 for influence calculation
+                                if np.max(depth_gradient_map) > 1e-6:
+                                    depth_gradient_map = depth_gradient_map / np.max(depth_gradient_map)
+
+                                # RGB Edges (Canny)
+                                gray_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
+                                rgb_edge_map = cv2.Canny(gray_frame, rgb_thresh1, rgb_thresh2)
+
+                                # Combine Edges
+                                combined_edge_map = cv2.bitwise_or(depth_edge_map, rgb_edge_map)
+
+                                # Create RGB visualization for queue
+                                edge_map_viz = cv2.cvtColor(combined_edge_map, cv2.COLOR_GRAY2RGB)
+                            except Exception as e_edge:
+                                print(f"Error during edge detection: {e_edge}")
+                                combined_edge_map = None
+                                edge_map_viz = None
+                                depth_gradient_map = None
+                        # ---------------------------------
 
                         per_pixel_depth_motion_map = None
                         per_pixel_depth_motion = None
                         if prev_depth_map is not None and current_depth_map.shape == prev_depth_map.shape:
                             depth_diff = torch.abs(current_depth_map - prev_depth_map)
-                            per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0) # Use defined threshold
+                            per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0)
                             normalized_depth = torch.clamp(current_depth_map / 10.0, 0.0, 1.0)
                             distance_modulated_motion = per_pixel_depth_motion * (1.0 - normalized_depth)
                             per_pixel_depth_motion_map = distance_modulated_motion
@@ -321,6 +362,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
                         scaled_depth_map = current_depth_map
                         current_mean_depth = current_depth_map.mean().item()
+                        min_alpha_scale = edge_params_ref.get("min_alpha_scale", 0.0) # Default if not set
+                        max_alpha_scale = edge_params_ref.get("max_alpha_scale", 1.0) # Default if not set
                         motion_factor_scale = global_motion_unmodulated ** 2.0
                         adaptive_alpha_scale = min_alpha_scale + (max_alpha_scale - min_alpha_scale) * motion_factor_scale
 
@@ -353,19 +396,77 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                             smoothed_points_xyz = points_xyz.clone()
                         else:
                             if smoothed_points_xyz.shape == points_xyz.shape:
-                                # Check enable_point_smoothing state from main thread via ImGui control
-                                # This requires passing the state or using a shared mechanism.
-                                # For now, using the initial argument passed to the thread.
-                                if enable_point_smoothing_arg and per_pixel_depth_motion_map is not None:
+                                # --- Edge-Aware Smoothing ---
+                                enable_point_smoothing = edge_params_ref["enable_point_smoothing"]
+                                enable_edge_aware = edge_params_ref["enable_edge_aware"]
+                                edge_influence = edge_params_ref["influence"]
+                                min_alpha_points = edge_params_ref["min_alpha_points"]
+                                max_alpha_points = edge_params_ref["max_alpha_points"]
+                                grad_influence_scale = edge_params_ref["gradient_influence_scale"]
+
+                                final_alpha_map = None # Initialize
+
+                                if enable_point_smoothing and per_pixel_depth_motion_map is not None:
                                     if points_xyz.ndim == 3 and points_xyz.shape[:2] == per_pixel_depth_motion_map.shape:
-                                        motion_factor_points = per_pixel_depth_motion ** 2.0
-                                        adaptive_alpha_points_map = min_alpha_points + (max_alpha_points - min_alpha_points) * motion_factor_points
-                                        adaptive_alpha_points_map = adaptive_alpha_points_map.unsqueeze(-1)
-                                        smoothed_points_xyz = adaptive_alpha_points_map * points_xyz + (1.0 - adaptive_alpha_points_map) * smoothed_points_xyz
+                                        motion_factor_points = 0.0
+                                        if per_pixel_depth_motion is not None:
+                                             motion_factor_points = per_pixel_depth_motion ** 2.0
+
+                                        base_alpha_map = min_alpha_points + (max_alpha_points - min_alpha_points) * motion_factor_points
+
+                                        # Modulate alpha by combined edge map and gradient
+                                        if enable_edge_aware and combined_edge_map is not None and combined_edge_map.shape == base_alpha_map.shape:
+                                            edge_mask_tensor = torch.from_numpy(combined_edge_map / 255.0).float().to(device) # Normalize 0-1
+
+                                            # Calculate local influence based on gradient
+                                            local_influence = edge_influence # Default to global influence
+                                            if depth_gradient_map is not None and depth_gradient_map.shape == base_alpha_map.shape:
+                                                gradient_tensor = torch.from_numpy(depth_gradient_map).float().to(device)
+                                                # Scale global influence by normalized gradient magnitude
+                                                local_influence = edge_influence * torch.clamp(gradient_tensor * grad_influence_scale, 0.0, 1.0)
+
+                                            # Increase alpha (reduce smoothing) near edges, modulated by gradient
+                                            final_alpha_map = torch.lerp(base_alpha_map, torch.ones_like(base_alpha_map), edge_mask_tensor * local_influence)
+                                        else:
+                                            final_alpha_map = base_alpha_map # Use base alpha if disabled or edge map invalid
+
+                                        final_alpha_map_unsqueezed = final_alpha_map.unsqueeze(-1)
+                                        smoothed_points_xyz = final_alpha_map_unsqueezed * points_xyz + (1.0 - final_alpha_map_unsqueezed) * smoothed_points_xyz
                                     else:
                                         smoothed_points_xyz = points_xyz
+                                        final_alpha_map = torch.ones_like(points_xyz[:,:,0]) if points_xyz.ndim == 3 else torch.ones(points_xyz.shape[0], device=device)
                                 else:
                                     smoothed_points_xyz = points_xyz
+                                    # Create alpha map visualization even if smoothing is off
+                                    if points_xyz.ndim == 3:
+                                        final_alpha_map = torch.ones_like(points_xyz[:,:,0])
+                                    elif points_xyz.ndim == 2:
+                                         final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
+
+                                # --- End Edge-Aware Smoothing ---
+
+                                # --- Create Smoothing Map Visualization ---
+                                if final_alpha_map is not None:
+                                    try:
+                                        # Ensure final_alpha_map has 2 dimensions for visualization
+                                        if final_alpha_map.ndim == 1: # Handle case where points_xyz was (N,3)
+                                            # Cannot directly visualize 1D alpha map as 2D image easily
+                                            # Create a placeholder or skip visualization
+                                            h, w = frame_h, frame_w # Use frame dimensions as fallback
+                                            smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
+                                            print("Warning: Cannot visualize 1D smoothing alpha map.")
+                                        else:
+                                            smoothing_map_vis_np = (final_alpha_map.cpu().numpy() * 255).astype(np.uint8)
+                                            smoothing_map_viz = cv2.cvtColor(smoothing_map_vis_np, cv2.COLOR_GRAY2RGB)
+                                    except Exception as e_smooth_viz:
+                                        print(f"Error creating smoothing map viz: {e_smooth_viz}")
+                                        smoothing_map_viz = None
+                                else:
+                                     # Create black image if no alpha map generated
+                                     h, w = frame_h, frame_w
+                                     smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
+
+
                             else:
                                 print("Warning: Points tensor shape changed, resetting smoothing.")
                                 smoothed_points_xyz = points_xyz.clone()
@@ -398,20 +499,26 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     colors_np = None
                     if num_vertices > 0:
                         try:
-                            colors_np = rgb_frame.reshape(frame_h * frame_w, 3)
-                            subsample_rate = 1
-                            if subsample_rate > 1:
-                                points_xyz_np = points_xyz_np[::subsample_rate]
-                                colors_np = colors_np[::subsample_rate]
-                            num_vertices = points_xyz_np.shape[0]
+                            # Ensure rgb_frame has dimensions before reshape
+                            if rgb_frame is not None and rgb_frame.ndim == 3:
+                                colors_np = rgb_frame.reshape(frame_h * frame_w, 3)
+                                subsample_rate = 1
+                                if subsample_rate > 1:
+                                    points_xyz_np = points_xyz_np[::subsample_rate]
+                                    colors_np = colors_np[::subsample_rate]
+                                num_vertices = points_xyz_np.shape[0]
 
-                            if colors_np.dtype == np.uint8:
-                                colors_np = colors_np.astype(np.float32) / 255.0
-                            elif colors_np.dtype == np.float32:
-                                colors_np = np.clip(colors_np, 0.0, 1.0)
+                                if colors_np.dtype == np.uint8:
+                                    colors_np = colors_np.astype(np.float32) / 255.0
+                                elif colors_np.dtype == np.float32:
+                                    colors_np = np.clip(colors_np, 0.0, 1.0)
+                                else:
+                                    print(f"Warning: Unexpected color dtype {colors_np.dtype}, using white.")
+                                    colors_np = None
                             else:
-                                print(f"Warning: Unexpected color dtype {colors_np.dtype}, using white.")
+                                print("Warning: rgb_frame invalid for color extraction.")
                                 colors_np = None
+
                         except Exception as e_color_subsample:
                             print(f"Error processing/subsampling colors: {e_color_subsample}")
                             colors_np = None
@@ -432,6 +539,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                 data_queue.put((vertices_flat, colors_flat, num_vertices,
                                                 rgb_frame, # Pass the raw frame (numpy uint8)
                                                 scaled_depth_map_for_queue, # Pass the depth tensor
+                                                edge_map_viz, # Pass edge map visualization
+                                                smoothing_map_viz, # Pass smoothing map visualization
                                                 t_capture))
                         else:
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
@@ -465,7 +574,7 @@ class LiveViewerWindow(pyglet.window.Window):
         # Store args before calling super
         self._model_name = model_name
         self._inference_interval = inference_interval
-        # Store the initial smoothing preference
+        # Store the initial smoothing preference (used when starting thread)
         self._initial_disable_point_smoothing = disable_point_smoothing
 
         super().__init__(*args, **kwargs)
@@ -486,29 +595,41 @@ class LiveViewerWindow(pyglet.window.Window):
         self.sharpness = None
         self.point_size_boost = None
         self.input_scale_factor = None
-        self.enable_point_smoothing = None # Initialized in load_settings
+        self.enable_point_smoothing = None
+        self.min_alpha_points = None
+        self.max_alpha_points = None
+        self.enable_edge_aware_smoothing = None
+        self.depth_edge_threshold1 = None
+        self.depth_edge_threshold2 = None
+        self.rgb_edge_threshold1 = None
+        self.rgb_edge_threshold2 = None
+        self.edge_smoothing_influence = None
+        self.gradient_influence_scale = None # New control
         self.show_camera_feed = None
         self.show_depth_map = None
+        self.show_edge_map = None
+        self.show_smoothing_map = None
         self.scale_factor_ref = None # Initialized in load_settings
+        self.edge_params_ref = {} # Dictionary to pass edge params to thread
 
         # --- Debug View State ---
         self.latest_rgb_frame = None
         self.latest_depth_map_viz = None
+        self.latest_edge_map = None
+        self.latest_smoothing_map = None
         self.camera_texture = None
         self.depth_texture = None
+        self.edge_texture = None
+        self.smoothing_texture = None
         self.debug_textures_initialized = False
 
-        # Load initial settings (this initializes control variables and scale_factor_ref)
+        # Load initial settings (this initializes control variables and refs)
         self.load_settings()
-        # Set initial smoothing state based on loaded/default settings
-        # Note: This doesn't change the running thread dynamically yet
-        # self._disable_point_smoothing = not self.enable_point_smoothing # This was incorrect logic
-
 
         # --- Status Display ---
-        self.ui_batch = pyglet.graphics.Batch() # Still used? Maybe remove later
+        self.ui_batch = pyglet.graphics.Batch()
         self.status_message = "Initializing..."
-        # Pyglet labels removed as ImGui handles display
+        # Pyglet labels removed
 
         # --- Camera Setup ---
         self.camera_position = Vec3(0, 0, 5)
@@ -600,9 +721,8 @@ class LiveViewerWindow(pyglet.window.Window):
         self.inference_thread = None
 
         # Start the inference thread
-        # self.scale_factor_ref is initialized in load_settings
-        self.start_inference_thread(self._model_name, self._inference_interval,
-                                    not self.enable_point_smoothing) # Pass correct initial state
+        # self.scale_factor_ref and self.edge_params_ref initialized in load_settings
+        self.start_inference_thread(self._model_name, self._inference_interval) # Removed smoothing arg
 
         # Set up OpenGL state
         gl.glClearColor(0.1, 0.1, 0.1, 1.0)
@@ -632,14 +752,21 @@ class LiveViewerWindow(pyglet.window.Window):
         # Delete existing textures if they exist
         if hasattr(self, 'camera_texture') and self.camera_texture:
             try: gl.glDeleteTextures(1, self.camera_texture)
-            except: pass # Ignore if already deleted or invalid
+            except: pass
         if hasattr(self, 'depth_texture') and self.depth_texture:
             try: gl.glDeleteTextures(1, self.depth_texture)
             except: pass
+        if hasattr(self, 'edge_texture') and self.edge_texture:
+            try: gl.glDeleteTextures(1, self.edge_texture)
+            except: pass
+        if hasattr(self, 'smoothing_texture') and self.smoothing_texture:
+            try: gl.glDeleteTextures(1, self.smoothing_texture)
+            except: pass
 
-        # Create Camera Texture (using window size initially)
+        # Create textures (using window size initially, will resize in update)
         width = max(1, self.width)
         height = max(1, self.height)
+
         self.camera_texture = gl.GLuint()
         gl.glGenTextures(1, self.camera_texture)
         gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
@@ -647,7 +774,6 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
 
-        # Create Depth Texture (using window size initially)
         self.depth_texture = gl.GLuint()
         gl.glGenTextures(1, self.depth_texture)
         gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
@@ -655,30 +781,59 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
 
+        self.edge_texture = gl.GLuint()
+        gl.glGenTextures(1, self.edge_texture)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.edge_texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+
+        self.smoothing_texture = gl.GLuint()
+        gl.glGenTextures(1, self.smoothing_texture)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.smoothing_texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+
+
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
         self.debug_textures_initialized = True
         print("DEBUG: Debug textures created/recreated.")
 
 
-    def start_inference_thread(self, model_name, inference_interval,
-                               disable_point_smoothing):
-        # Ensure scale_factor_ref is initialized before starting thread
+    def start_inference_thread(self, model_name, inference_interval): # Removed disable_point_smoothing_initial
+        # Ensure refs are initialized before starting thread
         if not hasattr(self, 'scale_factor_ref') or self.scale_factor_ref is None:
-             # Initialize from loaded/default settings
              self.scale_factor_ref = [self.input_scale_factor]
+        if not hasattr(self, 'edge_params_ref') or not self.edge_params_ref:
+             self.update_edge_params_ref() # Initialize edge params ref
 
         if self.inference_thread is None or not self.inference_thread.is_alive():
             self._exit_event.clear()
-            # Pass the *initial* smoothing state from args/defaults
-            enable_smoothing_arg = not disable_point_smoothing
             self.inference_thread = threading.Thread(
                 target=inference_thread_func,
                 args=(self._data_queue, self._exit_event, model_name, inference_interval,
-                      enable_smoothing_arg, self.scale_factor_ref), # Pass initial smoothing state
+                      # enable_point_smoothing_arg removed
+                      self.scale_factor_ref,
+                      self.edge_params_ref), # Pass edge params dict
                 daemon=True
             )
             self.inference_thread.start()
             print("DEBUG: Inference thread started via start_inference_thread.")
+
+    def update_edge_params_ref(self):
+        """Updates the dictionary passed to the inference thread."""
+        self.edge_params_ref["enable_point_smoothing"] = self.enable_point_smoothing
+        self.edge_params_ref["min_alpha_points"] = self.min_alpha_points
+        self.edge_params_ref["max_alpha_points"] = self.max_alpha_points
+        self.edge_params_ref["enable_edge_aware"] = self.enable_edge_aware_smoothing
+        self.edge_params_ref["depth_threshold1"] = int(self.depth_edge_threshold1)
+        self.edge_params_ref["depth_threshold2"] = int(self.depth_edge_threshold2)
+        self.edge_params_ref["rgb_threshold1"] = int(self.rgb_edge_threshold1)
+        self.edge_params_ref["rgb_threshold2"] = int(self.rgb_edge_threshold2)
+        self.edge_params_ref["influence"] = self.edge_smoothing_influence
+        self.edge_params_ref["gradient_influence_scale"] = self.gradient_influence_scale
+
 
     def update(self, dt):
         """Scheduled function to process data from the inference thread."""
@@ -695,24 +850,24 @@ class LiveViewerWindow(pyglet.window.Window):
                 else:
                     # --- Process actual vertex and image data ---
                     try:
-                        # Unpack new data format
+                        # Unpack new data format including edge and smoothing maps
                         vertices_data, colors_data, num_vertices_actual, \
-                        rgb_frame_np, depth_map_tensor, t_capture = latest_data
+                        rgb_frame_np, depth_map_tensor, edge_map_viz_np, \
+                        smoothing_map_viz_np, t_capture = latest_data
 
                         self.last_capture_timestamp = t_capture
 
                         # --- Update Debug Views ---
-                        self.latest_rgb_frame = rgb_frame_np # Store uint8 numpy frame
+                        self.latest_rgb_frame = rgb_frame_np
+                        self.latest_edge_map = edge_map_viz_np
+                        self.latest_smoothing_map = smoothing_map_viz_np # Store smoothing map viz
 
                         if depth_map_tensor is not None:
                             try:
                                 depth_np = depth_map_tensor.cpu().numpy()
-                                # Normalize depth for visualization (e.g., 0-10 meters)
                                 depth_normalized = np.clip(depth_np / 10.0, 0.0, 1.0)
                                 depth_vis = (depth_normalized * 255).astype(np.uint8)
-                                # Apply colormap (e.g., VIRIDIS or JET)
                                 depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-                                # Ensure it's contiguous
                                 self.latest_depth_map_viz = np.ascontiguousarray(depth_vis_colored)
                             except Exception as e_depth_viz:
                                 print(f"Error processing depth map for viz: {e_depth_viz}")
@@ -726,8 +881,6 @@ class LiveViewerWindow(pyglet.window.Window):
                                 try:
                                     h, w, _ = self.latest_rgb_frame.shape
                                     gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
-                                    # Check if texture needs resizing (using glGetTexLevelParameteriv requires GL context)
-                                    # Simpler: just use glTexImage2D which handles resize internally
                                     gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_rgb_frame.ctypes.data)
                                 except Exception as e_tex_cam:
                                     print(f"Error updating camera texture: {e_tex_cam}")
@@ -740,6 +893,23 @@ class LiveViewerWindow(pyglet.window.Window):
                                     gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, self.latest_depth_map_viz.ctypes.data) # OpenCV uses BGR
                                 except Exception as e_tex_depth:
                                      print(f"Error updating depth texture: {e_tex_depth}")
+
+                            if self.latest_edge_map is not None and self.edge_texture is not None:
+                                try:
+                                    h, w, _ = self.latest_edge_map.shape
+                                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.edge_texture)
+                                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_edge_map.ctypes.data) # Edge map viz is RGB
+                                except Exception as e_tex_edge:
+                                     print(f"Error updating edge texture: {e_tex_edge}")
+
+                            if self.latest_smoothing_map is not None and self.smoothing_texture is not None:
+                                try:
+                                    h, w, _ = self.latest_smoothing_map.shape
+                                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.smoothing_texture)
+                                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_smoothing_map.ctypes.data) # Smoothing map viz is RGB
+                                except Exception as e_tex_smooth:
+                                     print(f"Error updating smoothing texture: {e_tex_smooth}")
+
 
                             gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
 
@@ -784,10 +954,8 @@ class LiveViewerWindow(pyglet.window.Window):
 
     def update_camera(self, dt):
         """Scheduled function to handle camera movement based on key states."""
-        # Check if ImGui wants keyboard focus before processing camera movement
         io = imgui.get_io()
-        if io.want_capture_keyboard:
-            return
+        if io.want_capture_keyboard: return
 
         speed = self.fast_move_speed if self.keys[key.LSHIFT] or self.keys[key.RSHIFT] else self.move_speed
         move_amount = speed * dt
@@ -817,10 +985,11 @@ class LiveViewerWindow(pyglet.window.Window):
         """Resets settings to default values."""
         print("DEBUG: Resetting settings to default.")
         for key, value in DEFAULT_SETTINGS.items():
-            # Use setattr to handle potential future additions easily
             setattr(self, key, value)
         # Always create/update the scale factor reference list
         self.scale_factor_ref = [self.input_scale_factor]
+        # Update edge params ref dictionary
+        self.update_edge_params_ref()
 
 
     def save_settings(self, filename="viewer_settings.json"):
@@ -847,7 +1016,7 @@ class LiveViewerWindow(pyglet.window.Window):
                     loaded_settings = json.load(f)
                 # Update attributes from loaded file, keeping defaults if key missing
                 for key in DEFAULT_SETTINGS:
-                    setattr(self, key, loaded_settings.get(key, getattr(self, key))) # Use current (default) if missing
+                    setattr(self, key, loaded_settings.get(key, getattr(self, key)))
                 print(f"DEBUG: Settings loaded from {filename}")
             else:
                 print(f"DEBUG: Settings file {filename} not found, using defaults.")
@@ -858,8 +1027,9 @@ class LiveViewerWindow(pyglet.window.Window):
             for key, value in DEFAULT_SETTINGS.items():
                 setattr(self, key, value)
 
-        # Ensure scale factor reference list is updated/created *after* loading/defaults
+        # Ensure scale factor and edge params reference dicts are updated/created *after* loading/defaults
         self.scale_factor_ref = [self.input_scale_factor]
+        self.update_edge_params_ref() # Initialize edge params ref
 
 
     def on_draw(self):
@@ -920,7 +1090,6 @@ class LiveViewerWindow(pyglet.window.Window):
         if self.show_camera_feed and self.camera_texture and self.latest_rgb_frame is not None:
             imgui.set_next_window_size(320, 240, imgui.ONCE)
             imgui.begin("Camera Feed")
-            # Use texture ID directly with imgui.image
             imgui.image(self.camera_texture, self.latest_rgb_frame.shape[1], self.latest_rgb_frame.shape[0])
             imgui.end()
 
@@ -929,12 +1098,24 @@ class LiveViewerWindow(pyglet.window.Window):
             imgui.begin("Depth Map")
             imgui.image(self.depth_texture, self.latest_depth_map_viz.shape[1], self.latest_depth_map_viz.shape[0])
             imgui.end()
+
+        if self.show_edge_map and self.edge_texture and self.latest_edge_map is not None:
+            imgui.set_next_window_size(320, 240, imgui.ONCE)
+            imgui.begin("Edge Map")
+            imgui.image(self.edge_texture, self.latest_edge_map.shape[1], self.latest_edge_map.shape[0])
+            imgui.end()
+
+        if self.show_smoothing_map and self.smoothing_texture and self.latest_smoothing_map is not None:
+             imgui.set_next_window_size(320, 240, imgui.ONCE)
+             imgui.begin("Smoothing Alpha Map")
+             imgui.image(self.smoothing_texture, self.latest_smoothing_map.shape[1], self.latest_smoothing_map.shape[0])
+             imgui.end()
         # --- End Debug Views ---
 
 
         # --- Controls Panel ---
         imgui.set_next_window_position(self.width - 310, 10, imgui.ONCE) # Position bottom-rightish once
-        imgui.set_next_window_size(300, 500, imgui.ONCE) # Adjusted size
+        imgui.set_next_window_size(300, 650, imgui.ONCE) # Increased height
         imgui.begin("Controls", True) # True = closable window
 
         # --- Presets ---
@@ -987,18 +1168,61 @@ class LiveViewerWindow(pyglet.window.Window):
             if imgui.button("Reset##Sharpness"): self.sharpness = DEFAULT_SETTINGS["sharpness"]
 
         # --- Smoothing Section ---
-        if imgui.collapsing_header("Smoothing")[0]:
-             # Note: This checkbox only reflects the initial state passed to the thread.
-             # Changing it here won't dynamically change the running thread's behavior.
-             # We use the loaded/default value for display.
-             _, self.enable_point_smoothing = imgui.checkbox("Enable Point Smoothing", self.enable_point_smoothing)
-             imgui.text_disabled("(Restart required to change)")
+        if imgui.collapsing_header("Smoothing", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+             changed_smooth, self.enable_point_smoothing = imgui.checkbox("Enable Point Smoothing", self.enable_point_smoothing)
+             if changed_smooth: self.update_edge_params_ref() # Update ref dict
+
+             imgui.indent()
+             changed_min_alpha, self.min_alpha_points = imgui.slider_float("Min Alpha", self.min_alpha_points, 0.0, 1.0)
+             if changed_min_alpha: self.update_edge_params_ref()
+             changed_max_alpha, self.max_alpha_points = imgui.slider_float("Max Alpha", self.max_alpha_points, 0.0, 1.0)
+             if changed_max_alpha: self.update_edge_params_ref()
+             if imgui.button("Reset##SmoothAlpha"):
+                 self.min_alpha_points = DEFAULT_SETTINGS["min_alpha_points"]
+                 self.max_alpha_points = DEFAULT_SETTINGS["max_alpha_points"]
+                 self.update_edge_params_ref()
+             imgui.unindent()
+
+             imgui.separator()
+             changed_edge_smooth, self.enable_edge_aware_smoothing = imgui.checkbox("Enable Edge-Aware Smoothing", self.enable_edge_aware_smoothing)
+             if changed_edge_smooth: self.update_edge_params_ref()
+
+             if self.enable_edge_aware_smoothing:
+                 imgui.indent()
+                 changed_d_thresh1, self.depth_edge_threshold1 = imgui.slider_float("Depth Thresh 1", self.depth_edge_threshold1, 1.0, 255.0)
+                 if changed_d_thresh1: self.update_edge_params_ref()
+                 changed_d_thresh2, self.depth_edge_threshold2 = imgui.slider_float("Depth Thresh 2", self.depth_edge_threshold2, 1.0, 255.0)
+                 if changed_d_thresh2: self.update_edge_params_ref()
+
+                 changed_rgb_thresh1, self.rgb_edge_threshold1 = imgui.slider_float("RGB Thresh 1", self.rgb_edge_threshold1, 1.0, 255.0)
+                 if changed_rgb_thresh1: self.update_edge_params_ref()
+                 changed_rgb_thresh2, self.rgb_edge_threshold2 = imgui.slider_float("RGB Thresh 2", self.rgb_edge_threshold2, 1.0, 255.0)
+                 if changed_rgb_thresh2: self.update_edge_params_ref()
+
+                 changed_edge_inf, self.edge_smoothing_influence = imgui.slider_float("Edge Influence", self.edge_smoothing_influence, 0.0, 1.0)
+                 if changed_edge_inf: self.update_edge_params_ref()
+
+                 changed_grad_inf, self.gradient_influence_scale = imgui.slider_float("Gradient Scale", self.gradient_influence_scale, 0.0, 5.0)
+                 if changed_grad_inf: self.update_edge_params_ref()
+
+
+                 if imgui.button("Reset##EdgeParams"):
+                     self.depth_edge_threshold1 = DEFAULT_SETTINGS["depth_edge_threshold1"]
+                     self.depth_edge_threshold2 = DEFAULT_SETTINGS["depth_edge_threshold2"]
+                     self.rgb_edge_threshold1 = DEFAULT_SETTINGS["rgb_edge_threshold1"]
+                     self.rgb_edge_threshold2 = DEFAULT_SETTINGS["rgb_edge_threshold2"]
+                     self.edge_smoothing_influence = DEFAULT_SETTINGS["edge_smoothing_influence"]
+                     self.gradient_influence_scale = DEFAULT_SETTINGS["gradient_influence_scale"]
+                     self.update_edge_params_ref()
+                 imgui.unindent()
 
 
         # --- Debug Views Section ---
         if imgui.collapsing_header("Debug Views")[0]:
             _, self.show_camera_feed = imgui.checkbox("Show Camera Feed", self.show_camera_feed)
             _, self.show_depth_map = imgui.checkbox("Show Depth Map", self.show_depth_map)
+            _, self.show_edge_map = imgui.checkbox("Show Edge Map", self.show_edge_map)
+            _, self.show_smoothing_map = imgui.checkbox("Show Smoothing Map", self.show_smoothing_map)
 
 
         # --- Info Section ---
@@ -1079,6 +1303,12 @@ class LiveViewerWindow(pyglet.window.Window):
         if hasattr(self, 'depth_texture') and self.depth_texture:
              try: gl.glDeleteTextures(1, self.depth_texture)
              except: pass
+        if hasattr(self, 'edge_texture') and self.edge_texture:
+             try: gl.glDeleteTextures(1, self.edge_texture)
+             except: pass
+        if hasattr(self, 'smoothing_texture') and self.smoothing_texture:
+             try: gl.glDeleteTextures(1, self.smoothing_texture)
+             except: pass
         # --- ImGui Cleanup ---
         if hasattr(self, 'imgui_renderer') and self.imgui_renderer:
             self.imgui_renderer.shutdown()
@@ -1090,12 +1320,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Live SLAM viewer using UniK3D.")
     parser.add_argument("--model", type=str, default="unik3d-vitl", help="Name of the UniK3D model to use (e.g., unik3d-vits, unik3d-vitb, unik3d-vitl)")
     parser.add_argument("--interval", type=int, default=1, help="Run inference every N frames (default: 1).")
-    parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points (default: enabled).")
+    # Argument --disable-point-smoothing is now effectively ignored, control is via settings/ImGui
+    # parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points (default: enabled).")
     args = parser.parse_args()
 
     # Pass smoothing flags to window constructor (using default GL config)
     window = LiveViewerWindow(model_name=args.model, inference_interval=args.interval,
-                              disable_point_smoothing=args.disable_point_smoothing,
+                              disable_point_smoothing=False, # Pass False, initial state loaded from settings
                               width=1024, height=768, caption='Live UniK3D SLAM Viewer', resizable=True)
     try:
         pyglet.app.run()
