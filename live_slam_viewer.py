@@ -31,6 +31,9 @@ DEFAULT_SETTINGS = {
     "sharpness": 1.1, # Simple contrast boost for sharpening
     "point_size_boost": 2.5,
     "input_scale_factor": 0.9,
+    "enable_point_smoothing": True, # Default smoothing state
+    "show_camera_feed": False,
+    "show_depth_map": False,
 }
 
 # Simple shaders (Using 'vertices' instead of 'position')
@@ -204,7 +207,6 @@ texture_fragment_source = """#version 150 core
 """
 
 # --- Inference Thread Function ---
-# (Keep inference thread function as is)
 def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
                           enable_point_smoothing_arg, scale_factor_ref): # Added scale_factor_ref
     """Loads model, captures camera, runs inference (with dynamic scaling), puts results in queue."""
@@ -225,28 +227,25 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         # --- Initialize Camera ---
         print("Initializing camera...")
         data_queue.put(("status", "Initializing camera...")) # Status update
-        # Reverted CAP_DSHOW change
         cap = cv2.VideoCapture(0) # Use default camera
         if not cap.isOpened():
             print("Error: Could not open camera.")
             data_queue.put(("error", "Could not open camera."))
-            print("DEBUG inference: cap.isOpened() failed, returning from thread.") # Debug print
             return
         print("Camera initialized.")
         data_queue.put(("status", "Camera initialized.")) # Status update
 
-        # --- Start of main loop logic (Corrected Indentation) ---
         frame_count = 0
         last_inference_time = time.time()
 
         # --- Temporal Smoothing & Motion Init ---
         smoothed_points_xyz = None # For smoothing final points
         # Flags to enable/disable smoothing (can be controlled by args)
-        enable_point_smoothing = enable_point_smoothing_arg # Use arg passed to thread
+        # enable_point_smoothing = enable_point_smoothing_arg # Use arg passed to thread (Now controlled by ImGui)
         # Adaptive alpha for points (only used if enable_point_smoothing is True)
         min_alpha_points = 0.0  # Freeze points when still
         max_alpha_points = 1.0  # No smoothing when moving
-        depth_motion_threshold = 0.1 # Restore threshold, will use non-linear mapping
+        depth_motion_threshold = 0.1 # Define threshold for motion detection
         prev_depth_map = None # Store previous depth map for difference calculation
         # Global scale smoothing parameters
         smoothed_mean_depth = None
@@ -255,329 +254,228 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         prev_scale_factor = None # Track previous scale factor for smoothing reset
         # -----------------------------
 
-        # Removed debug print
         while not exit_event.is_set():
-            # Removed debug prints
-            t_capture = time.time() # Timestamp frame capture
+            t_capture = time.time()
             ret, frame = cap.read()
-            # Removed debug print
             if not ret:
                 print("Error: Failed to capture frame.")
                 time.sleep(0.1)
                 continue
 
             # --- Dynamically Scale Frame ---
-            # Read current scale from shared reference (controlled by ImGui now)
             current_scale = scale_factor_ref[0]
-            if current_scale > 0.1: # Only resize if scale is reasonably positive
+            if current_scale > 0.1:
                 new_width = int(frame.shape[1] * current_scale)
                 new_height = int(frame.shape[0] * current_scale)
-                # Use INTER_AREA for shrinking, INTER_LINEAR for enlarging for better quality
                 interpolation = cv2.INTER_AREA if current_scale < 1.0 else cv2.INTER_LINEAR
-                frame = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
-            # --- End Scale Frame ---
-            # (Motion calculation moved to after depth prediction)
-            # Removed debug print
+                scaled_frame = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
+            else:
+                scaled_frame = frame
 
             frame_count += 1
-            # Removed debug print
 
-            # --- Run Inference periodically ---
-            # Removed debug print
             if frame_count % inference_interval == 0:
-                # --- Check for Scale Change and Reset Smoothing ---
-                current_scale = scale_factor_ref[0] # Read current scale factor
-                if prev_scale_factor is not None and abs(current_scale - prev_scale_factor) > 1e-3: # Check if scale changed significantly
+                current_scale = scale_factor_ref[0]
+                if prev_scale_factor is not None and abs(current_scale - prev_scale_factor) > 1e-3:
                     print(f"Scale factor changed ({prev_scale_factor:.2f} -> {current_scale:.2f}). Resetting smoothing state.")
                     smoothed_points_xyz = None
                     prev_depth_map = None
-                    # Also reset smoothed mean depth to avoid sudden jumps
                     smoothed_mean_depth = None
-                prev_scale_factor = current_scale # Update previous scale factor for next check
-                # --- End Smoothing Reset Logic ---
+                prev_scale_factor = current_scale
 
-                # Removed debug print
                 current_time = time.time()
-                # Keep the user-facing print below
                 print(f"Running inference for frame {frame_count} (Time since last: {current_time - last_inference_time:.2f}s)")
                 last_inference_time = current_time
 
-                # Removed debug print
                 try:
-                    # --- Preprocess Frame ---
-                    data_queue.put(("status", f"Preprocessing frame {frame_count}...")) # Status update
-                    # Convert BGR (OpenCV) to RGB
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame_h = rgb_frame.shape[0] # Get frame height
-                    # Convert to torch tensor (HWC -> CHW) and move to device
-                    # Assuming UniK3D handles normalization internally based on README example
+                    data_queue.put(("status", f"Preprocessing frame {frame_count}..."))
+                    rgb_frame = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
+                    frame_h, frame_w, _ = rgb_frame.shape
                     frame_tensor = torch.from_numpy(rgb_frame).permute(2, 0, 1).float().to(device)
-                    # Add batch dimension
                     frame_tensor = frame_tensor.unsqueeze(0)
 
-                    # --- Inference ---
-                    data_queue.put(("status", f"Running inference on frame {frame_count}...")) # Status update
+                    data_queue.put(("status", f"Running inference on frame {frame_count}..."))
                     with torch.no_grad():
-                        predictions = model.infer(frame_tensor) # No camera intrinsics for now
-                        # Removed debug print for prediction keys
-                        # Removed key logging print(f"DEBUG: Prediction keys: {predictions.keys()}")
+                        predictions = model.infer(frame_tensor)
 
-                    # --- Get Points (Depth calculation removed) ---
+                    points_xyz = None
+                    scaled_depth_map_for_queue = None
+
                     if 'rays' in predictions and 'depth' in predictions:
-                        # We still need depth and rays to calculate initial points_xyz
-                        # but we won't use the depth difference for motion anymore.
-                        current_depth_map = predictions['depth'].squeeze() # (H, W)
+                        current_depth_map = predictions['depth'].squeeze()
 
-                        # --- Calculate Per-Pixel Depth Motion Map ---
-                        per_pixel_depth_motion_map = None # Initialize motion map for this frame
-                        per_pixel_depth_motion = None # Initialize motion value for this frame
-                        if prev_depth_map is not None:
-                            if current_depth_map.shape == prev_depth_map.shape:
-                                depth_diff = torch.abs(current_depth_map - prev_depth_map)
-                                # Scale difference to 0-1 motion value per pixel
-                                per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0) # Normalized 0-1
+                        per_pixel_depth_motion_map = None
+                        per_pixel_depth_motion = None
+                        if prev_depth_map is not None and current_depth_map.shape == prev_depth_map.shape:
+                            depth_diff = torch.abs(current_depth_map - prev_depth_map)
+                            per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0) # Use defined threshold
+                            normalized_depth = torch.clamp(current_depth_map / 10.0, 0.0, 1.0)
+                            distance_modulated_motion = per_pixel_depth_motion * (1.0 - normalized_depth)
+                            per_pixel_depth_motion_map = distance_modulated_motion
 
-                                # --- Modulate motion by distance ---
-                                # Normalize depth (0 near, 1 far, clamped at 10 units)
-                                normalized_depth = torch.clamp(current_depth_map / 10.0, 0.0, 1.0)
-                                # Reduce motion sensitivity for farther points
-                                distance_modulated_motion = per_pixel_depth_motion * (1.0 - normalized_depth)
-                                per_pixel_depth_motion_map = distance_modulated_motion # Use modulated motion map
-                                # --- End distance modulation ---
-                            # else: map remains None if shape changes
-
-                        # --- End Per-Pixel Depth Motion Map --- (per_pixel_depth_motion_map now holds distance_modulated_motion)
-
-                        # Store prev_depth_map *after* using current_depth_map for modulation calc
                         prev_depth_map = current_depth_map.clone()
 
-                        # --- Apply Global Scale Smoothing (Adaptive) ---
-                        # Calculate global motion based on the *original* per-pixel motion map
-                        # before distance modulation for a more stable global metric.
                         global_motion_unmodulated = 0.0
-                        if per_pixel_depth_motion is not None: # Use original motion before modulation
+                        if per_pixel_depth_motion is not None:
                             global_motion_unmodulated = per_pixel_depth_motion.mean().item()
 
-                        scaled_depth_map = current_depth_map # Default to current if no smoothing needed
+                        scaled_depth_map = current_depth_map
                         current_mean_depth = current_depth_map.mean().item()
-                        # Calculate adaptive alpha for scale using non-linear mapping (exponent 1.5) on unmodulated global motion
-                        motion_factor_scale = global_motion_unmodulated ** 2.0 # Increased exponent for sharper drop-off
+                        motion_factor_scale = global_motion_unmodulated ** 2.0
                         adaptive_alpha_scale = min_alpha_scale + (max_alpha_scale - min_alpha_scale) * motion_factor_scale
 
                         if smoothed_mean_depth is None:
                             smoothed_mean_depth = current_mean_depth
                         else:
-                            # Apply EMA to the mean depth
                             smoothed_mean_depth = adaptive_alpha_scale * current_mean_depth + (1.0 - adaptive_alpha_scale) * smoothed_mean_depth
 
-                        # Calculate and apply scale correction factor
-                        if current_mean_depth > 1e-6: # Avoid division by zero
+                        if current_mean_depth > 1e-6:
                             scale_factor = smoothed_mean_depth / current_mean_depth
                             scaled_depth_map = current_depth_map * scale_factor
-                        # --- End Global Scale Smoothing ---
 
-                        # --- Calculate Points from Scaled Depth ---
+                        scaled_depth_map_for_queue = scaled_depth_map
+
                         rays = predictions['rays'].squeeze()
-                        if rays.shape[0] == 3 and rays.ndim == 3: # Permute if (C, H, W)
-                            rays = rays.permute(1, 2, 0) # (H, W, 3)
-                        # Use the globally scaled depth map
-                        depth_to_multiply = scaled_depth_map.unsqueeze(-1) # (H, W, 1)
-                        points_xyz = rays * depth_to_multiply # (H, W, 3)
-                        # --- End Point Calculation ---
+                        if rays.shape[0] == 3 and rays.ndim == 3:
+                            rays = rays.permute(1, 2, 0)
+                        depth_to_multiply = scaled_depth_map.unsqueeze(-1)
+                        points_xyz = rays * depth_to_multiply
                         data_queue.put(("status", f"Calculated points for frame {frame_count}..."))
+
                     elif "points" in predictions:
-                        # Fallback if depth or rays are missing but points are present
                         data_queue.put(("status", f"Using direct points for frame {frame_count}..."))
-                        points_xyz = predictions["points"] # Use original points
+                        points_xyz = predictions["points"]
                     else:
-                        # If neither depth/rays nor points are available
-                        points_xyz = None
                         data_queue.put(("warning", f"No points/depth found for frame {frame_count}"))
 
-                    # --- Original Point Extraction (Now part of fallback) ---
-                    # points_xyz = predictions["points"] # Shape might be (B, N, 3) or similar
-
-                    # --- Apply EMA Smoothing to Points ---
                     if points_xyz is not None:
                         if smoothed_points_xyz is None:
                             smoothed_points_xyz = points_xyz.clone()
                         else:
-                            # Ensure shapes match before EMA
                             if smoothed_points_xyz.shape == points_xyz.shape:
-                                if enable_point_smoothing and per_pixel_depth_motion_map is not None:
-                                    # Check if points_xyz has compatible shape (H, W, 3)
+                                # Check enable_point_smoothing state from main thread via ImGui control
+                                # This requires passing the state or using a shared mechanism.
+                                # For now, using the initial argument passed to the thread.
+                                if enable_point_smoothing_arg and per_pixel_depth_motion_map is not None:
                                     if points_xyz.ndim == 3 and points_xyz.shape[:2] == per_pixel_depth_motion_map.shape:
-                                        # --- Calculate Per-Point Adaptive Alpha Map with distance-dependent min_alpha and non-linear mapping ---
-                                        # Calculate distance-dependent minimum alpha (0.1 near, 0.0 far)
-                                        # Removed distance-dependent minimum alpha calculation
-                                        # Use original per_pixel_depth_motion for mapping, apply exponent 2.0
-                                        motion_factor_points = per_pixel_depth_motion ** 2.0 # Increased exponent for sharper drop-off
-                                        # Interpolate between global min (0.0) and global max (1.0)
+                                        motion_factor_points = per_pixel_depth_motion ** 2.0
                                         adaptive_alpha_points_map = min_alpha_points + (max_alpha_points - min_alpha_points) * motion_factor_points
-                                        # Unsqueeze for broadcasting: (H, W) -> (H, W, 1)
                                         adaptive_alpha_points_map = adaptive_alpha_points_map.unsqueeze(-1)
-                                        # --- Apply EMA with Per-Point Adaptive Alpha ---
                                         smoothed_points_xyz = adaptive_alpha_points_map * points_xyz + (1.0 - adaptive_alpha_points_map) * smoothed_points_xyz
                                     else:
-                                        # Fallback if shapes don't match: use current points
                                         smoothed_points_xyz = points_xyz
                                 else:
-                                    # If smoothing disabled or no motion map, use current points
                                     smoothed_points_xyz = points_xyz
                             else:
                                 print("Warning: Points tensor shape changed, resetting smoothing.")
                                 smoothed_points_xyz = points_xyz.clone()
-                        # Use the smoothed points for further processing
                         points_xyz_to_process = smoothed_points_xyz
                     else:
-                        points_xyz_to_process = None # Handle case where points were None initially
-                    # --- End Point Smoothing ---
+                        points_xyz_to_process = None
 
-                    # Removed debug print
-                    if points_xyz_to_process is None or points_xyz_to_process.numel() == 0: # Check the processed points
-                        # Removed debug print
-                        # Put None to signal empty frame? Or just skip? Let's skip for now.
+                    if points_xyz_to_process is None or points_xyz_to_process.numel() == 0:
                         continue
-                    # Removed debug print
 
-                    # Ensure it's on CPU and NumPy for pyglet
-                    # Removed shape debug prints
-                    # Use the (potentially smoothed) points_xyz_to_process
-                    points_xyz_np = points_xyz_to_process.squeeze().cpu().numpy() # Remove batch dim if present
-                    # Removed debug print
+                    points_xyz_np = points_xyz_to_process.squeeze().cpu().numpy()
 
-                    # --- Reshape based on observed (C, H, W) format ---
                     num_vertices = 0
-                    try: # Wrap the whole reshape logic in try/except
-                        if points_xyz_np.ndim == 3 and points_xyz_np.shape[0] == 3: # Check if shape is (3, H, W)
-                                # Transpose from (C, H, W) to (H, W, C)
-                                points_xyz_np = np.transpose(points_xyz_np, (1, 2, 0))
-                                # Reshape to (N, 3) where N = H * W
-                                num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
-                                points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
-                        elif points_xyz_np.ndim == 2 and points_xyz_np.shape[1] == 3: # Handle expected (N, 3) case
+                    try:
+                        if points_xyz_np.ndim == 3 and points_xyz_np.shape[0] == 3:
+                            points_xyz_np = np.transpose(points_xyz_np, (1, 2, 0))
+                            num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
+                            points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
+                        elif points_xyz_np.ndim == 2 and points_xyz_np.shape[1] == 3:
                              num_vertices = points_xyz_np.shape[0]
-                        elif points_xyz_np.ndim == 3 and points_xyz_np.shape[2] == 3: # Handle (H, W, 3) case
+                        elif points_xyz_np.ndim == 3 and points_xyz_np.shape[2] == 3:
                              num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
-                             points_xyz_np = points_xyz_np.reshape(num_vertices, 3) # Reshape to (N, 3)
+                             points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
                         else:
                             print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np.shape}")
-                        # Removed debug print
                     except Exception as e_reshape:
                             print(f"Error reshaping points_xyz_np: {e_reshape}")
-                            num_vertices = 0 # Prevent further processing if reshape fails
-                    # Removed duplicated elif/else block below
-                    # ----------------------------------------------------
-                    # Removed num_vertices debug print
+                            num_vertices = 0
 
-                    # --- Get Colors from Input Frame & Subsample ---
                     colors_np = None
                     if num_vertices > 0:
                         try:
-                            # Reshape rgb_frame (H, W, 3) to (N, 3) matching points
-                            # Assuming rgb_frame is already (H, W, 3) after cvtColor
-                            original_h, original_w, _ = rgb_frame.shape
-                            colors_np = rgb_frame.reshape(original_h * original_w, 3)
-
-                            # Subsample points AND colors
-                            subsample_rate = 1 # Render all points (was 4)
-                            if subsample_rate > 1: # Only subsample if rate > 1
+                            colors_np = rgb_frame.reshape(frame_h * frame_w, 3)
+                            subsample_rate = 1
+                            if subsample_rate > 1:
                                 points_xyz_np = points_xyz_np[::subsample_rate]
-                                colors_np = colors_np[::subsample_rate] # Apply same subsampling to colors
-
-                            # Recalculate num_vertices after potential subsampling
+                                colors_np = colors_np[::subsample_rate]
                             num_vertices = points_xyz_np.shape[0]
 
-                            # Normalize colors (uint8 0-255 -> float32 0.0-1.0)
                             if colors_np.dtype == np.uint8:
                                 colors_np = colors_np.astype(np.float32) / 255.0
-                            elif colors_np.dtype == np.float32: # Just in case it's already float
+                            elif colors_np.dtype == np.float32:
                                 colors_np = np.clip(colors_np, 0.0, 1.0)
-                            else: # Fallback if unexpected dtype
+                            else:
                                 print(f"Warning: Unexpected color dtype {colors_np.dtype}, using white.")
                                 colors_np = None
-
                         except Exception as e_color_subsample:
                             print(f"Error processing/subsampling colors: {e_color_subsample}")
-                            colors_np = None # Fallback
-                            # Ensure points are still subsampled even if color fails
-                            if num_vertices > 0: # Check if num_vertices was calculated before error
-                                points_xyz_np = points_xyz_np[::subsample_rate] # Apply point subsampling
-                                num_vertices = points_xyz_np.shape[0] # Recalculate
+                            colors_np = None
+                            if num_vertices > 0:
+                                points_xyz_np = points_xyz_np[::subsample_rate]
+                                num_vertices = points_xyz_np.shape[0]
 
-                    # --- End Color/Subsample ---
-
-                    # --- Queue data if vertices were processed successfully --- (Corrected Indentation)
                     if num_vertices > 0:
-                        # Ensure points_xyz_np is now (N, 3) before flattening
                         vertices_flat = points_xyz_np.flatten()
-
-                        # Create colors (either from frame or fallback white)
                         if colors_np is not None:
                             colors_flat = colors_np.flatten()
-                        else: # Fallback to white if color processing failed
+                        else:
                             colors_np_white = np.ones((num_vertices, 3), dtype=np.float32)
                             colors_flat = colors_np_white.flatten()
 
-                        # Put data into queue for the viewer
-                        # Removed debug print
+                        # Put all data into queue
                         if not data_queue.full():
-                                # No longer passing motion confidence
-                                data_queue.put((vertices_flat, colors_flat, num_vertices, frame_h, t_capture))
-                                # Removed debug print
+                                data_queue.put((vertices_flat, colors_flat, num_vertices,
+                                                rgb_frame, # Pass the raw frame (numpy uint8)
+                                                scaled_depth_map_for_queue, # Pass the depth tensor
+                                                t_capture))
                         else:
-                            print(f"Warning: Viewer queue full, dropping frame {frame_count}.") # Modified warning
-                            data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}")) # Status update
-                    else: # This 'else' corresponds to 'if num_vertices > 0:'
-                        # Removed debug print
-                        pass # Keep the else block structure
+                            print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
+                            data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
+                    else:
+                        pass
 
+                except Exception as e_infer:
+                    print(f"Error during inference processing for frame {frame_count}: {e_infer}")
+                    traceback.print_exc()
 
-                except Exception as e_infer: # Corrected indentation to match 'try' on line 96
-                    print(f"Error during inference processing for frame {frame_count}: {e_infer}") # Modified print
-                    traceback.print_exc() # Uncommented to show full error details
-
-            # Small sleep to prevent busy-looping if camera is fast
             time.sleep(0.005)
 
     except Exception as e_thread:
         print(f"Error in inference thread: {e_thread}")
         traceback.print_exc()
         data_queue.put(("error", str(e_thread)))
-        data_queue.put(("status", "Inference thread error!")) # Status update
+        data_queue.put(("status", "Inference thread error!"))
     finally:
         if 'cap' in locals() and cap.isOpened():
             cap.release()
         print("Inference thread finished.")
-        data_queue.put(("status", "Inference thread finished.")) # Status update
+        data_queue.put(("status", "Inference thread finished."))
 
 
 # --- Viewer Class ---
 class LiveViewerWindow(pyglet.window.Window):
-    def __init__(self, model_name, inference_interval=1, # Changed default interval
-                 disable_point_smoothing=False, # Removed depth smoothing arg
+    def __init__(self, model_name, inference_interval=1,
+                 disable_point_smoothing=False,
                  *args, **kwargs):
         # Store args before calling super
         self._model_name = model_name
         self._inference_interval = inference_interval
-        self._disable_point_smoothing = disable_point_smoothing
+        # Store the initial smoothing preference
+        self._initial_disable_point_smoothing = disable_point_smoothing
 
         super().__init__(*args, **kwargs)
 
-        self.vertex_list = None # Initialize as None
-        # FBO related attributes removed as FBO approach is abandoned for now
-        # self.fbo = None
-        # self.fbo_color_texture = None
-        # self.fbo_depth_buffer = None
-        # self.quad_shader_program = None
-        # self.quad_vertex_list = None
-        self.frame_count_display = 0 # For UI
-        self.current_point_count = 0 # For UI
-        # --- FPS / Latency Tracking ---
+        self.vertex_list = None
+        self.frame_count_display = 0
+        self.current_point_count = 0
         self.last_update_time = time.time()
         self.point_cloud_fps = 0.0
         self.last_capture_timestamp = None
-        # -----------------------------
 
         # --- Control State Variables (Initialized in load_settings) ---
         self.render_mode = None
@@ -588,45 +486,47 @@ class LiveViewerWindow(pyglet.window.Window):
         self.sharpness = None
         self.point_size_boost = None
         self.input_scale_factor = None
+        self.enable_point_smoothing = None # Initialized in load_settings
+        self.show_camera_feed = None
+        self.show_depth_map = None
         self.scale_factor_ref = None # Initialized in load_settings
 
-        # Load initial settings
-        self.load_settings()
+        # --- Debug View State ---
+        self.latest_rgb_frame = None
+        self.latest_depth_map_viz = None
+        self.camera_texture = None
+        self.depth_texture = None
+        self.debug_textures_initialized = False
 
-        # --- Status Display (Using Pyglet Labels - can be removed if ImGui replaces) ---
-        self.ui_batch = pyglet.graphics.Batch() # Create a batch for UI elements
+        # Load initial settings (this initializes control variables and scale_factor_ref)
+        self.load_settings()
+        # Set initial smoothing state based on loaded/default settings
+        # Note: This doesn't change the running thread dynamically yet
+        # self._disable_point_smoothing = not self.enable_point_smoothing # This was incorrect logic
+
+
+        # --- Status Display ---
+        self.ui_batch = pyglet.graphics.Batch() # Still used? Maybe remove later
         self.status_message = "Initializing..."
-        # Status Label (moved up slightly)
-        # self.status_label = pyglet.text.Label(...) # Replaced by ImGui
-        # Point Count Label (bottom-left) - Replaced by ImGui
-        # self.point_count_label = pyglet.text.Label(...)
-        # Scale Factor Label (top-right) - Replaced by ImGui
-        # self.scale_factor_label = pyglet.text.Label(...)
-        # Point Size Boost Label (below scale factor) - Replaced by ImGui
-        # self.point_boost_label = pyglet.text.Label(...)
-        # --------------------
+        # Pyglet labels removed as ImGui handles display
 
         # --- Camera Setup ---
-        self.camera_position = Vec3(0, 0, 5) # Start slightly back
+        self.camera_position = Vec3(0, 0, 5)
         self.camera_rotation_x = 0.0
         self.camera_rotation_y = 0.0
         self.world_up_vector = Vec3(0, 1, 0)
-        self._aspect_ratio = float(self.width) / self.height if self.height > 0 else 1.0 # Renamed to avoid conflict
-        self.move_speed = 2.0 # Slower speed for potentially smaller scenes
+        self._aspect_ratio = float(self.width) / self.height if self.height > 0 else 1.0
+        self.move_speed = 2.0
         self.fast_move_speed = 6.0
-        # Track previous state for motion detection
-        # Manually copy Vec3 components as .copy() doesn't exist
         self.prev_camera_position = Vec3(self.camera_position.x, self.camera_position.y, self.camera_position.z)
         self.prev_camera_rotation_x = self.camera_rotation_x
         self.prev_camera_rotation_y = self.camera_rotation_y
-        self.camera_motion_confidence = 0.0 # Initialize motion confidence
-        # --------------------
+        self.camera_motion_confidence = 0.0
 
         # --- Input Handlers ---
         self.keys = key.KeyStateHandler()
         self.push_handlers(self.keys)
         self.mouse_down = False
-        # --------------------
 
         # --- Geometry Shader Source ---
         # (Keep geometry_source definition as is)
@@ -672,15 +572,13 @@ class LiveViewerWindow(pyglet.window.Window):
                 EndPrimitive();
             }
         """
-        # --------------------------
 
         # Shader only (No Batch)
         try:
             print("DEBUG: Creating shaders...")
             vert_shader = pyglet.graphics.shader.Shader(vertex_source, 'vertex')
             frag_shader = pyglet.graphics.shader.Shader(fragment_source, 'fragment')
-            geom_shader = pyglet.graphics.shader.Shader(geometry_source, 'geometry') # Create geometry shader
-            # Include geometry shader in program
+            geom_shader = pyglet.graphics.shader.Shader(geometry_source, 'geometry')
             self.shader_program = pyglet.graphics.shader.ShaderProgram(vert_shader, frag_shader, geom_shader)
             print(f"DEBUG: Shader program created.")
         except pyglet.graphics.shader.ShaderException as e:
@@ -693,30 +591,25 @@ class LiveViewerWindow(pyglet.window.Window):
              return
 
         # Schedule the main update function
-        pyglet.clock.schedule_interval(self.update, 1.0 / 60.0) # Update viewer frequently
-        pyglet.clock.schedule_interval(self.update_camera, 1.0 / 60.0) # Update camera
+        pyglet.clock.schedule_interval(self.update, 1.0 / 60.0)
+        pyglet.clock.schedule_interval(self.update_camera, 1.0 / 60.0)
 
-        # --- Threading Setup --- Moved Before start_inference_thread
-        self._data_queue = queue.Queue(maxsize=5) # Limit queue size
+        # --- Threading Setup ---
+        self._data_queue = queue.Queue(maxsize=5)
         self._exit_event = threading.Event()
         self.inference_thread = None
-        # ---------------------
 
-        # Start the inference thread, passing point smoothing flag
-        # self.scale_factor_ref is initialized in load_settings now
+        # Start the inference thread
+        # self.scale_factor_ref is initialized in load_settings
         self.start_inference_thread(self._model_name, self._inference_interval,
-                                    self._disable_point_smoothing)
+                                    not self.enable_point_smoothing) # Pass correct initial state
 
         # Set up OpenGL state
         gl.glClearColor(0.1, 0.1, 0.1, 1.0)
-        gl.glEnable(gl.GL_DEPTH_TEST) # Ensure depth test is enabled
-        gl.glEnable(gl.GL_PROGRAM_POINT_SIZE) # Needed for vertex shader gl_PointSize
-        gl.glEnable(gl.GL_BLEND) # Enable blending
-        # Set default blend func (used by Gaussian mode, ImGui, maybe UI labels)
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-
-        # FBO Setup Removed
-        # Quad Shader & Geometry Setup Removed (Not needed without FBO)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA) # Default blend func
 
         # --- ImGui Setup ---
         try:
@@ -730,22 +623,58 @@ class LiveViewerWindow(pyglet.window.Window):
             return
         # --- End ImGui Setup ---
 
+        # --- Debug Texture Setup ---
+        self.create_debug_textures()
+
+
+    def create_debug_textures(self):
+        """Creates or re-creates textures for debug views."""
+        # Delete existing textures if they exist
+        if hasattr(self, 'camera_texture') and self.camera_texture:
+            try: gl.glDeleteTextures(1, self.camera_texture)
+            except: pass # Ignore if already deleted or invalid
+        if hasattr(self, 'depth_texture') and self.depth_texture:
+            try: gl.glDeleteTextures(1, self.depth_texture)
+            except: pass
+
+        # Create Camera Texture (using window size initially)
+        width = max(1, self.width)
+        height = max(1, self.height)
+        self.camera_texture = gl.GLuint()
+        gl.glGenTextures(1, self.camera_texture)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+
+        # Create Depth Texture (using window size initially)
+        self.depth_texture = gl.GLuint()
+        gl.glGenTextures(1, self.depth_texture)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
+        self.debug_textures_initialized = True
+        print("DEBUG: Debug textures created/recreated.")
+
 
     def start_inference_thread(self, model_name, inference_interval,
-                               disable_point_smoothing): # Removed depth smoothing arg
+                               disable_point_smoothing):
         # Ensure scale_factor_ref is initialized before starting thread
         if not hasattr(self, 'scale_factor_ref') or self.scale_factor_ref is None:
-             self.scale_factor_ref = [DEFAULT_SETTINGS['input_scale_factor']] # Initialize if needed
+             # Initialize from loaded/default settings
+             self.scale_factor_ref = [self.input_scale_factor]
 
         if self.inference_thread is None or not self.inference_thread.is_alive():
             self._exit_event.clear()
-            # Pass point smoothing flag to the thread function
-            # Note: We pass the *enable* flag, so negate the disable flag from args
-            # Pass the scale factor reference list
+            # Pass the *initial* smoothing state from args/defaults
+            enable_smoothing_arg = not disable_point_smoothing
             self.inference_thread = threading.Thread(
                 target=inference_thread_func,
                 args=(self._data_queue, self._exit_event, model_name, inference_interval,
-                      not disable_point_smoothing, self.scale_factor_ref), # Pass scale_factor_ref
+                      enable_smoothing_arg, self.scale_factor_ref), # Pass initial smoothing state
                 daemon=True
             )
             self.inference_thread.start()
@@ -754,27 +683,66 @@ class LiveViewerWindow(pyglet.window.Window):
     def update(self, dt):
         """Scheduled function to process data from the inference thread."""
         try:
-            # Process all available data in the queue non-blockingly
             while True:
                 latest_data = self._data_queue.get_nowait()
 
-                # Check if data is a status/error message (tuple starting with string)
                 if isinstance(latest_data, tuple) and isinstance(latest_data[0], str):
-                    if latest_data[0] == "status":
-                        self.status_message = latest_data[1]
-                    elif latest_data[0] == "error":
-                        self.status_message = f"ERROR: {latest_data[1]}"
-                        print(f"ERROR from inference thread: {latest_data[1]}")
-                    elif latest_data[0] == "warning":
-                        self.status_message = f"WARN: {latest_data[1]}"
-                        print(f"WARNING from inference thread: {latest_data[1]}")
+                    # Handle status/error/warning messages
+                    if latest_data[0] == "status": self.status_message = latest_data[1]
+                    elif latest_data[0] == "error": self.status_message = f"ERROR: {latest_data[1]}"; print(f"ERROR: {latest_data[1]}")
+                    elif latest_data[0] == "warning": self.status_message = f"WARN: {latest_data[1]}"; print(f"WARN: {latest_data[1]}")
                     continue
                 else:
-                    # --- Process actual vertex data ---
+                    # --- Process actual vertex and image data ---
                     try:
-                        vertices_data, colors_data, _, frame_h, t_capture = latest_data
-                        self.current_image_height = frame_h
+                        # Unpack new data format
+                        vertices_data, colors_data, num_vertices_actual, \
+                        rgb_frame_np, depth_map_tensor, t_capture = latest_data
+
                         self.last_capture_timestamp = t_capture
+
+                        # --- Update Debug Views ---
+                        self.latest_rgb_frame = rgb_frame_np # Store uint8 numpy frame
+
+                        if depth_map_tensor is not None:
+                            try:
+                                depth_np = depth_map_tensor.cpu().numpy()
+                                # Normalize depth for visualization (e.g., 0-10 meters)
+                                depth_normalized = np.clip(depth_np / 10.0, 0.0, 1.0)
+                                depth_vis = (depth_normalized * 255).astype(np.uint8)
+                                # Apply colormap (e.g., VIRIDIS or JET)
+                                depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+                                # Ensure it's contiguous
+                                self.latest_depth_map_viz = np.ascontiguousarray(depth_vis_colored)
+                            except Exception as e_depth_viz:
+                                print(f"Error processing depth map for viz: {e_depth_viz}")
+                                self.latest_depth_map_viz = None
+                        else:
+                            self.latest_depth_map_viz = None
+
+                        # Update textures if they exist and data is available
+                        if self.debug_textures_initialized:
+                            if self.latest_rgb_frame is not None and self.camera_texture is not None:
+                                try:
+                                    h, w, _ = self.latest_rgb_frame.shape
+                                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
+                                    # Check if texture needs resizing (using glGetTexLevelParameteriv requires GL context)
+                                    # Simpler: just use glTexImage2D which handles resize internally
+                                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_rgb_frame.ctypes.data)
+                                except Exception as e_tex_cam:
+                                    print(f"Error updating camera texture: {e_tex_cam}")
+
+
+                            if self.latest_depth_map_viz is not None and self.depth_texture is not None:
+                                try:
+                                    h, w, _ = self.latest_depth_map_viz.shape
+                                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
+                                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, self.latest_depth_map_viz.ctypes.data) # OpenCV uses BGR
+                                except Exception as e_tex_depth:
+                                     print(f"Error updating depth texture: {e_tex_depth}")
+
+                            gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
+
 
                         # --- Calculate Point Cloud FPS ---
                         current_time = time.time()
@@ -784,22 +752,17 @@ class LiveViewerWindow(pyglet.window.Window):
                         self.last_update_time = current_time
                         # -----------------------------
 
-                        actual_num_vertices = 0
-                        if vertices_data is not None:
-                            actual_num_vertices = len(vertices_data) // 3
-                            self.current_point_count = actual_num_vertices
+                        self.current_point_count = num_vertices_actual
 
-                        if vertices_data is not None and colors_data is not None and actual_num_vertices > 0:
+                        if vertices_data is not None and colors_data is not None and num_vertices_actual > 0:
                             if self.vertex_list:
-                                try:
-                                    self.vertex_list.delete()
-                                except Exception as e_del:
-                                    print(f"Error deleting previous vertex list: {e_del}")
+                                try: self.vertex_list.delete()
+                                except Exception: pass # Ignore error if already deleted
                                 self.vertex_list = None
 
                             try:
                                 self.vertex_list = self.shader_program.vertex_list(
-                                    actual_num_vertices,
+                                    num_vertices_actual,
                                     gl.GL_POINTS,
                                     vertices=('f', vertices_data),
                                     colors=('f', colors_data)
@@ -812,7 +775,7 @@ class LiveViewerWindow(pyglet.window.Window):
                             self.frame_count_display += 1
 
                     except Exception as e_unpack:
-                        print(f"Error unpacking or processing vertex data: {e_unpack}")
+                        print(f"Error unpacking or processing data: {e_unpack}")
                         traceback.print_exc()
 
         except queue.Empty:
@@ -821,6 +784,11 @@ class LiveViewerWindow(pyglet.window.Window):
 
     def update_camera(self, dt):
         """Scheduled function to handle camera movement based on key states."""
+        # Check if ImGui wants keyboard focus before processing camera movement
+        io = imgui.get_io()
+        if io.want_capture_keyboard:
+            return
+
         speed = self.fast_move_speed if self.keys[key.LSHIFT] or self.keys[key.RSHIFT] else self.move_speed
         move_amount = speed * dt
         rot_y = -math.radians(self.camera_rotation_y)
@@ -869,32 +837,28 @@ class LiveViewerWindow(pyglet.window.Window):
 
     def load_settings(self, filename="viewer_settings.json"):
         """Loads settings from a JSON file or uses defaults."""
+        # Initialize attributes from defaults first
+        for key, value in DEFAULT_SETTINGS.items():
+            setattr(self, key, value)
+
         try:
             if os.path.exists(filename):
                 with open(filename, 'r') as f:
                     loaded_settings = json.load(f)
-                # Update attributes, falling back to default if key missing
+                # Update attributes from loaded file, keeping defaults if key missing
                 for key in DEFAULT_SETTINGS:
-                    setattr(self, key, loaded_settings.get(key, DEFAULT_SETTINGS[key]))
+                    setattr(self, key, loaded_settings.get(key, getattr(self, key))) # Use current (default) if missing
                 print(f"DEBUG: Settings loaded from {filename}")
-                # self.status_message = f"Settings loaded from {filename}" # Avoid overwriting init message
             else:
-                # If file doesn't exist, load defaults
                 print(f"DEBUG: Settings file {filename} not found, using defaults.")
-                # Initialize attributes from defaults before calling reset
-                for key, value in DEFAULT_SETTINGS.items():
-                    setattr(self, key, value)
-                self.reset_settings() # Use reset to ensure consistency
-                # self.status_message = "Settings file not found, using defaults."
+                # Defaults are already set
         except Exception as e:
             print(f"Error loading settings: {e}. Using defaults.")
-            # Initialize attributes from defaults before calling reset
+            # Ensure defaults are set if loading fails
             for key, value in DEFAULT_SETTINGS.items():
                 setattr(self, key, value)
-            self.reset_settings() # Use defaults on error
-            # self.status_message = "Error loading settings, using defaults."
-        # Ensure scale factor reference list is updated/created
-        # This needs to happen *after* input_scale_factor has its definitive value
+
+        # Ensure scale factor reference list is updated/created *after* loading/defaults
         self.scale_factor_ref = [self.input_scale_factor]
 
 
@@ -911,7 +875,7 @@ class LiveViewerWindow(pyglet.window.Window):
             self.shader_program['view'] = current_view
             self.shader_program['viewportSize'] = (float(self.width), float(self.height))
             # Pass control uniforms to shader
-            self.shader_program['inputScaleFactor'] = self.input_scale_factor # Renamed state var
+            self.shader_program['inputScaleFactor'] = self.input_scale_factor
             self.shader_program['pointSizeBoost'] = self.point_size_boost
             self.shader_program['renderMode'] = self.render_mode
             self.shader_program['falloffFactor'] = self.falloff_factor
@@ -952,9 +916,25 @@ class LiveViewerWindow(pyglet.window.Window):
         # --- ImGui Frame ---
         imgui.new_frame()
 
-        # Define the UI Panel
+        # --- Debug Views ---
+        if self.show_camera_feed and self.camera_texture and self.latest_rgb_frame is not None:
+            imgui.set_next_window_size(320, 240, imgui.ONCE)
+            imgui.begin("Camera Feed")
+            # Use texture ID directly with imgui.image
+            imgui.image(self.camera_texture, self.latest_rgb_frame.shape[1], self.latest_rgb_frame.shape[0])
+            imgui.end()
+
+        if self.show_depth_map and self.depth_texture and self.latest_depth_map_viz is not None:
+            imgui.set_next_window_size(320, 240, imgui.ONCE)
+            imgui.begin("Depth Map")
+            imgui.image(self.depth_texture, self.latest_depth_map_viz.shape[1], self.latest_depth_map_viz.shape[0])
+            imgui.end()
+        # --- End Debug Views ---
+
+
+        # --- Controls Panel ---
         imgui.set_next_window_position(self.width - 310, 10, imgui.ONCE) # Position bottom-rightish once
-        imgui.set_next_window_size(300, 400, imgui.ONCE) # Adjusted size
+        imgui.set_next_window_size(300, 500, imgui.ONCE) # Adjusted size
         imgui.begin("Controls", True) # True = closable window
 
         # --- Presets ---
@@ -1006,6 +986,21 @@ class LiveViewerWindow(pyglet.window.Window):
             changed_shp, self.sharpness = imgui.slider_float("Sharpness", self.sharpness, 0.1, 3.0)
             if imgui.button("Reset##Sharpness"): self.sharpness = DEFAULT_SETTINGS["sharpness"]
 
+        # --- Smoothing Section ---
+        if imgui.collapsing_header("Smoothing")[0]:
+             # Note: This checkbox only reflects the initial state passed to the thread.
+             # Changing it here won't dynamically change the running thread's behavior.
+             # We use the loaded/default value for display.
+             _, self.enable_point_smoothing = imgui.checkbox("Enable Point Smoothing", self.enable_point_smoothing)
+             imgui.text_disabled("(Restart required to change)")
+
+
+        # --- Debug Views Section ---
+        if imgui.collapsing_header("Debug Views")[0]:
+            _, self.show_camera_feed = imgui.checkbox("Show Camera Feed", self.show_camera_feed)
+            _, self.show_depth_map = imgui.checkbox("Show Depth Map", self.show_depth_map)
+
+
         # --- Info Section ---
         if imgui.collapsing_header("Info")[0]:
             imgui.text(f"Points: {self.current_point_count}")
@@ -1013,6 +1008,7 @@ class LiveViewerWindow(pyglet.window.Window):
             imgui.text_wrapped(f"Status: {self.status_message}")
 
         imgui.end()
+        # --- End Controls Panel ---
 
         # Render ImGui
         # Ensure correct GL state for ImGui rendering (standard alpha blend)
@@ -1024,76 +1020,48 @@ class LiveViewerWindow(pyglet.window.Window):
         self.imgui_renderer.render(imgui.get_draw_data())
         # --- End ImGui Frame ---
 
-        # --- Draw Pyglet UI Labels (Optional, can be replaced by ImGui) ---
-        # self.ui_batch.draw() # Draw status label etc. if needed
-
         # Restore GL state needed for next 3D frame
         gl.glEnable(gl.GL_DEPTH_TEST)
 
 
-    # --- Input Handlers (Simplified for brevity, same as before) ---
+    # --- Input Handlers ---
     def on_resize(self, width, height):
         gl.glViewport(0, 0, max(1, width), max(1, height))
         self._aspect_ratio = float(width) / height if height > 0 else 1.0 # Update renamed variable
-        # Update label positions if using pyglet labels
-        # if hasattr(self, 'scale_factor_label'):
-        #     self.scale_factor_label.x = width - 10
-        #     self.scale_factor_label.y = height - 10
-        # if hasattr(self, 'point_boost_label'):
-        #     self.point_boost_label.x = width - 10
-        #     self.point_boost_label.y = height - 30
+        # Recreate debug textures on resize
+        self.create_debug_textures()
 
     def on_mouse_press(self, x, y, button, modifiers):
-        # Prevent camera control if ImGui wants mouse
         io = imgui.get_io()
-        # Removed incorrect renderer call
-        if io.want_capture_mouse:
-             # Let ImGui handle it internally via its Pyglet integration
-            return
+        if io.want_capture_mouse: return
         if button == pyglet.window.mouse.LEFT: self.set_exclusive_mouse(True); self.mouse_down = True
 
     def on_mouse_release(self, x, y, button, modifiers):
-        # Prevent camera control if ImGui wants mouse
         io = imgui.get_io()
-        # Removed incorrect renderer call
-        if io.want_capture_mouse:
-            # Let ImGui handle it internally
-            return
+        if io.want_capture_mouse: return
         if button == pyglet.window.mouse.LEFT: self.set_exclusive_mouse(False); self.mouse_down = False
 
     def on_mouse_motion(self, x, y, dx, dy):
-        # Pass event to ImGui first (handled internally by integration)
         io = imgui.get_io()
-        # Removed incorrect renderer call
-        if io.want_capture_mouse:
-            return # Don't control camera if ImGui used the mouse
-
+        if io.want_capture_mouse: return
         if self.mouse_down:
             sensitivity = 0.1; self.camera_rotation_y -= dx * sensitivity; self.camera_rotation_y %= 360
             self.camera_rotation_x += dy * sensitivity; self.camera_rotation_x = max(min(self.camera_rotation_x, 89.9), -89.9)
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
-        # Pass event to ImGui first (handled internally by integration)
         io = imgui.get_io()
-        # Removed incorrect renderer call
-        if io.want_capture_mouse:
-            return # Don't control camera if ImGui used the scroll
-
+        if io.want_capture_mouse: return
         zoom_speed = 0.5; rot_y = -math.radians(self.camera_rotation_y); rot_x = -math.radians(self.camera_rotation_x)
         forward = Vec3(math.sin(rot_y) * math.cos(rot_x), -math.sin(rot_x), -math.cos(rot_y) * math.cos(rot_x)).normalize()
         self.camera_position += forward * scroll_y * zoom_speed
 
     def on_key_press(self, symbol, modifiers):
-        # Pass event to ImGui first (handled internally by integration)
         io = imgui.get_io()
-        # Removed incorrect renderer call
-        if io.want_capture_keyboard:
-            return # Don't process key if ImGui used it
-
+        if io.want_capture_keyboard: return
         if symbol == pyglet.window.key.ESCAPE:
             self.set_exclusive_mouse(False)
             self.close()
-        # Removed keybindings for scale and point size boost
+        # Keybindings for scale/boost removed
 
     def on_close(self):
         print("Window closing, stopping inference thread...")
@@ -1104,8 +1072,13 @@ class LiveViewerWindow(pyglet.window.Window):
             try: self.vertex_list.delete()
             except Exception as e_del: print(f"Error deleting vertex list on close: {e_del}")
         if self.shader_program: self.shader_program.delete()
-        # FBO cleanup removed
-        # Quad cleanup removed
+        # Debug texture cleanup
+        if hasattr(self, 'camera_texture') and self.camera_texture:
+             try: gl.glDeleteTextures(1, self.camera_texture)
+             except: pass
+        if hasattr(self, 'depth_texture') and self.depth_texture:
+             try: gl.glDeleteTextures(1, self.depth_texture)
+             except: pass
         # --- ImGui Cleanup ---
         if hasattr(self, 'imgui_renderer') and self.imgui_renderer:
             self.imgui_renderer.shutdown()
@@ -1117,13 +1090,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Live SLAM viewer using UniK3D.")
     parser.add_argument("--model", type=str, default="unik3d-vitl", help="Name of the UniK3D model to use (e.g., unik3d-vits, unik3d-vitb, unik3d-vitl)")
     parser.add_argument("--interval", type=int, default=1, help="Run inference every N frames (default: 1).")
-    # Removed --enable-depth-smoothing argument
-    parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points (default: enabled).") # Clarified default
+    parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points (default: enabled).")
     args = parser.parse_args()
 
     # Pass smoothing flags to window constructor (using default GL config)
     window = LiveViewerWindow(model_name=args.model, inference_interval=args.interval,
-                              # Removed depth smoothing argument
                               disable_point_smoothing=args.disable_point_smoothing,
                               width=1024, height=768, caption='Live UniK3D SLAM Viewer', resizable=True)
     try:
@@ -1136,7 +1107,6 @@ if __name__ == '__main__':
         # Ensure ImGui context is destroyed if app exits unexpectedly
         if imgui.get_current_context():
             print("DEBUG: Destroying ImGui context in finally block.")
-            # Ensure renderer is shutdown first if it exists
             if hasattr(window, 'imgui_renderer') and window.imgui_renderer:
                  try:
                      window.imgui_renderer.shutdown()
