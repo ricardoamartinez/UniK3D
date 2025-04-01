@@ -9,6 +9,7 @@ import time
 import queue # For thread-safe communication
 import cv2 # For camera capture
 import torch # For UniK3D model and tensors
+import json # For saving/loading settings
 
 # Assuming unik3d is installed and importable
 from unik3d.models import UniK3D
@@ -17,6 +18,20 @@ from pyglet.math import Mat4, Vec3
 from pyglet.window import key # Import key for KeyStateHandler
 import traceback # Import traceback
 import pyglet.text # Import for Label
+import imgui
+from imgui.integrations.pyglet import create_renderer
+
+# Default settings dictionary
+DEFAULT_SETTINGS = {
+    "render_mode": 2, # 0=Square, 1=Circle, 2=Gaussian
+    "falloff_factor": 5.0,
+    "saturation": 1.5,
+    "brightness": 1.0,
+    "contrast": 1.1,
+    "sharpness": 1.1, # Simple contrast boost for sharpening
+    "point_size_boost": 2.5,
+    "input_scale_factor": 0.9,
+}
 
 # Simple shaders (Using 'vertices' instead of 'position')
 # Expects vec3 floats for both vertices and colors
@@ -28,53 +43,48 @@ vertex_source = """#version 150 core
 
     uniform mat4 projection;
     uniform mat4 view;
-    uniform float inputScaleFactor; // Added uniform for dynamic input scale
-    uniform float pointSizeBoost;   // Added uniform for dynamic point size boost
-    // Removed viewportHeight uniform
+    uniform float inputScaleFactor; // Controlled via ImGui
+    uniform float pointSizeBoost;   // Controlled via ImGui
 
     void main() {
         gl_Position = projection * view * vec4(vertices, 1.0);
         vertex_colors = colors; // Pass color data through
 
         // --- Point Size based ONLY on distance from Origin ---
-        // 1. Calculate distance from origin (capturing camera)
         float originDist = length(vertices);
-
-        // 2. Calculate pixel size directly proportional to origin distance.
-        //    Adjust scalingFactor (e.g., 3.0) and min/max pixels (e.g., 1.0, 30.0) as needed.
-        float baseScalingFactor = 1.0; // Reduced overall point size multiplier
-        // Adjust point size based on distance AND inversely by input scale factor
-        // Ensure inputScaleFactor is not zero to avoid division by zero
-        float effectiveScaleFactor = max(0.1, inputScaleFactor); // Prevent division by zero or negative scale
+        float baseScalingFactor = 1.0;
+        float effectiveScaleFactor = max(0.1, inputScaleFactor);
         float pointSizePixels = (baseScalingFactor * originDist) / effectiveScaleFactor;
-
-        // 3. Set final point size (clamped)
-        // Clamp the calculated size first
         float clampedSize = max(1.0, min(30.0, pointSizePixels));
-        // Increase the clamped size by the dynamic boost factor
         gl_PointSize = clampedSize * pointSizeBoost;
         // --- End Point Size Calculation ---
     }
 """
 
+# Modified Fragment Shader with Controls
 fragment_source = """#version 150 core
     in vec3 geom_colors; // Input from Geometry Shader
+    in vec2 texCoord;    // Input texture coordinate from Geometry Shader
     out vec4 final_color;
 
+    uniform int renderMode; // 0=Square, 1=Circle, 2=Gaussian
+    uniform float falloffFactor; // For Gaussian
+    uniform float saturation;
+    uniform float brightness;
+    uniform float contrast;
+    uniform float sharpness; // Simple contrast boost for sharpening
+
     // Function to convert RGB to HSV
-    // Source: Adapted from various online sources (e.g., StackOverflow, blogs)
     vec3 rgb2hsv(vec3 c) {
         vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
         vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
         vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
-
         float d = q.x - min(q.w, q.y);
-        float e = 1.0e-10; // Epsilon to avoid division by zero
+        float e = 1.0e-10;
         return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
     }
 
     // Function to convert HSV to RGB
-    // Source: Adapted from various online sources
     vec3 hsv2rgb(vec3 c) {
         vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
         vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
@@ -82,30 +92,114 @@ fragment_source = """#version 150 core
     }
 
     void main() {
-        // Convert incoming RGB color to HSV
-        vec3 hsv = rgb2hsv(geom_colors);
+        // --- Image Processing ---
+        vec3 processed_color = geom_colors;
 
-        // Increase saturation (multiply by a factor > 1, e.g., 1.5)
-        // Clamp saturation to the valid range [0.0, 1.0]
-        float saturationFactor = 1.5;
-        hsv.y = clamp(hsv.y * saturationFactor, 0.0, 1.0);
+        // Saturation, Brightness, Contrast (applied in HSV)
+        vec3 hsv = rgb2hsv(processed_color);
+        hsv.y = clamp(hsv.y * saturation, 0.0, 1.0); // Saturation
+        hsv.z = clamp(hsv.z * brightness, 0.0, 1.0); // Brightness
+        hsv.z = clamp(0.5 + (hsv.z - 0.5) * contrast, 0.0, 1.0); // Contrast
+        processed_color = hsv2rgb(hsv);
 
-        // Convert modified HSV back to RGB
-        vec3 saturatedRgb = hsv2rgb(hsv);
-
-        // --- Approximate Sharpening via Contrast Boost ---
-        // Convert saturated RGB back to HSV
-        vec3 hsv_sharp = rgb2hsv(saturatedRgb);
-        // Define contrast factor (e.g., 1.1 means 10% boost)
-        float contrastFactor = 1.1;
-        // Push Value away from 0.5
-        hsv_sharp.z = clamp(0.5 + (hsv_sharp.z - 0.5) * contrastFactor, 0.0, 1.0);
-        // Convert final HSV back to RGB
-        vec3 finalRgb = hsv2rgb(hsv_sharp);
+        // --- Simple Sharpening via Contrast Boost ---
+        // Apply sharpness factor similar to contrast but maybe on original/less processed color?
+        // For simplicity, applying another contrast boost using the sharpness factor
+        vec3 hsv_sharp = rgb2hsv(processed_color);
+        hsv_sharp.z = clamp(0.5 + (hsv_sharp.z - 0.5) * sharpness, 0.0, 1.0);
+        processed_color = hsv2rgb(hsv_sharp);
         // --- End Sharpening ---
 
-        // Output the final sharpened color
-        final_color = vec4(finalRgb, 1.0);
+
+        // --- Shape & Alpha ---
+        if (renderMode == 0) { // Square (Opaque)
+            final_color = vec4(processed_color, 1.0);
+        } else { // Circle or Gaussian
+            vec2 coord = texCoord - vec2(0.5);
+            float dist_sq = dot(coord, coord);
+
+            if (dist_sq > 0.25) { // Discard if outside circle
+                discard;
+            }
+
+            if (renderMode == 1) { // Circle (Opaque)
+                final_color = vec4(processed_color, 1.0);
+            } else { // Gaussian (renderMode == 2)
+                // Calculate Gaussian alpha
+                float alpha = exp(-4.0 * falloffFactor * dist_sq);
+                // Premultiply color by alpha
+                vec3 premultipliedRgb = processed_color * alpha;
+                final_color = vec4(premultipliedRgb, alpha); // Output premultiplied RGB and alpha
+            }
+        }
+    }
+"""
+
+# Geometry shader remains the same as before (outputting texCoord)
+geometry_source = """#version 150 core
+    layout (points) in;
+    layout (triangle_strip, max_vertices = 4) out;
+
+    in vec3 vertex_colors[]; // Receive from vertex shader
+    out vec3 geom_colors;    // Pass color to fragment shader
+    out vec2 texCoord;       // Pass texture coordinate to fragment shader
+
+    uniform vec2 viewportSize; // To convert pixel size to clip space
+
+    void main() {
+        vec4 centerPosition = gl_in[0].gl_Position;
+        float pointSize = gl_in[0].gl_PointSize; // Get size calculated in vertex shader
+
+        // Calculate half-size in clip space coordinates
+        float halfSizeX = pointSize / viewportSize.x;
+        float halfSizeY = pointSize / viewportSize.y;
+
+        // Emit 4 vertices for the quad
+        gl_Position = centerPosition + vec4(-halfSizeX, -halfSizeY, 0.0, 0.0);
+        geom_colors = vertex_colors[0];
+        texCoord = vec2(0.0, 0.0); // Bottom-left
+        EmitVertex();
+
+        gl_Position = centerPosition + vec4( halfSizeX, -halfSizeY, 0.0, 0.0);
+        geom_colors = vertex_colors[0];
+        texCoord = vec2(1.0, 0.0); // Bottom-right
+        EmitVertex();
+
+        gl_Position = centerPosition + vec4(-halfSizeX,  halfSizeY, 0.0, 0.0);
+        geom_colors = vertex_colors[0];
+        texCoord = vec2(0.0, 1.0); // Top-left
+        EmitVertex();
+
+        gl_Position = centerPosition + vec4( halfSizeX,  halfSizeY, 0.0, 0.0);
+        geom_colors = vertex_colors[0];
+        texCoord = vec2(1.0, 1.0); // Top-right
+        EmitVertex();
+
+        EndPrimitive();
+    }
+"""
+
+# --- Simple Texture Shader (For FBO rendering - if needed later) ---
+# Keep these definitions in case FBO is revisited, but they aren't used now
+texture_vertex_source = """#version 150 core
+    in vec2 position;
+    in vec2 texCoord_in;
+    out vec2 texCoord;
+
+    void main() {
+        gl_Position = vec4(position, 0.0, 1.0);
+        texCoord = texCoord_in;
+    }
+"""
+
+texture_fragment_source = """#version 150 core
+    in vec2 texCoord;
+    out vec4 final_color;
+
+    uniform sampler2D fboTexture;
+
+    void main() {
+        final_color = texture(fboTexture, texCoord);
     }
 """
 
@@ -173,7 +267,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 continue
 
             # --- Dynamically Scale Frame ---
-            current_scale = scale_factor_ref[0] # Read current scale from shared reference
+            # Read current scale from shared reference (controlled by ImGui now)
+            current_scale = scale_factor_ref[0]
             if current_scale > 0.1: # Only resize if scale is reasonably positive
                 new_width = int(frame.shape[1] * current_scale)
                 new_height = int(frame.shape[0] * current_scale)
@@ -234,7 +329,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         current_depth_map = predictions['depth'].squeeze() # (H, W)
 
                         # --- Calculate Per-Pixel Depth Motion Map ---
-                        per_pixel_depth_motion_map = None # Initialize for this frame
+                        per_pixel_depth_motion_map = None # Initialize motion map for this frame
+                        per_pixel_depth_motion = None # Initialize motion value for this frame
                         if prev_depth_map is not None:
                             if current_depth_map.shape == prev_depth_map.shape:
                                 depth_diff = torch.abs(current_depth_map - prev_depth_map)
@@ -461,76 +557,61 @@ class LiveViewerWindow(pyglet.window.Window):
     def __init__(self, model_name, inference_interval=1, # Changed default interval
                  disable_point_smoothing=False, # Removed depth smoothing arg
                  *args, **kwargs):
+        # Store args before calling super
+        self._model_name = model_name
+        self._inference_interval = inference_interval
+        self._disable_point_smoothing = disable_point_smoothing
+
         super().__init__(*args, **kwargs)
 
         self.vertex_list = None # Initialize as None
+        # FBO related attributes removed as FBO approach is abandoned for now
+        # self.fbo = None
+        # self.fbo_color_texture = None
+        # self.fbo_depth_buffer = None
+        # self.quad_shader_program = None
+        # self.quad_vertex_list = None
         self.frame_count_display = 0 # For UI
         self.current_point_count = 0 # For UI
-        self.current_scale_factor = 0.9 # Initial scale factor (Default 0.9x)
-        self.point_size_boost = 2.5 # Initial point size boost factor (Default 2.5x)
-        # self.last_depth_diff = 0.0 # Removed depth diff storage
         # --- FPS / Latency Tracking ---
         self.last_update_time = time.time()
         self.point_cloud_fps = 0.0
         self.last_capture_timestamp = None
         # -----------------------------
 
-        # --- Status Display ---
+        # --- Control State Variables (Initialized in load_settings) ---
+        self.render_mode = None
+        self.falloff_factor = None
+        self.saturation = None
+        self.brightness = None
+        self.contrast = None
+        self.sharpness = None
+        self.point_size_boost = None
+        self.input_scale_factor = None
+        self.scale_factor_ref = None # Initialized in load_settings
+
+        # Load initial settings
+        self.load_settings()
+
+        # --- Status Display (Using Pyglet Labels - can be removed if ImGui replaces) ---
         self.ui_batch = pyglet.graphics.Batch() # Create a batch for UI elements
         self.status_message = "Initializing..."
         # Status Label (moved up slightly)
-        self.status_label = pyglet.text.Label(
-            self.status_message,
-            font_name='Arial',
-            font_size=12,
-            x=10, y=30, # Position slightly higher bottom-left
-            anchor_x='left', anchor_y='bottom',
-            color=(255, 255, 255, 200), # White with some transparency
-            batch=self.ui_batch # Assign label to the batch
-        )
-        # Point Count Label (bottom-left)
-        self.point_count_label = pyglet.text.Label(
-            f"Points: {self.current_point_count}",
-            font_name='Arial',
-            font_size=12,
-            x=10, y=10, # Position at bottom-left
-            anchor_x='left', anchor_y='bottom',
-            color=(255, 255, 255, 200),
-            batch=self.ui_batch
-        )
-        # Scale Factor Label (top-right)
-        self.scale_factor_label = pyglet.text.Label(
-            f"Scale: {self.current_scale_factor:.2f}x",
-            font_name='Arial',
-            font_size=12,
-            x=self.width - 10, y=self.height - 10, # Position near top-right
-            anchor_x='right', anchor_y='top',
-            color=(255, 255, 255, 200),
-            batch=self.ui_batch
-        )
-        # Point Size Boost Label (below scale factor)
-        self.point_boost_label = pyglet.text.Label(
-            f"Pt Boost: {self.point_size_boost:.2f}x",
-            font_name='Arial',
-            font_size=12,
-            x=self.width - 10, y=self.height - 30, # Position below scale label
-            anchor_x='right', anchor_y='top',
-            color=(255, 255, 255, 200),
-            batch=self.ui_batch
-        )
-        # Removed FPSDisplay initialization
+        # self.status_label = pyglet.text.Label(...) # Replaced by ImGui
+        # Point Count Label (bottom-left) - Replaced by ImGui
+        # self.point_count_label = pyglet.text.Label(...)
+        # Scale Factor Label (top-right) - Replaced by ImGui
+        # self.scale_factor_label = pyglet.text.Label(...)
+        # Point Size Boost Label (below scale factor) - Replaced by ImGui
+        # self.point_boost_label = pyglet.text.Label(...)
         # --------------------
 
-        # --- Threading related ---
-        self.data_queue = queue.Queue(maxsize=2) # Only buffer 1-2 results
-        self.inference_thread = None
-        self._exit_event = threading.Event()
-
-        # --- Camera State ---
-        self.camera_position = Vec3(0.0, 1.0, 5.0) # Move camera back and slightly up
-        self.camera_rotation_x = -15.0 # Look slightly down
-        self.camera_rotation_y = 180.0 # Start looking forward (Z-)
+        # --- Camera Setup ---
+        self.camera_position = Vec3(0, 0, 5) # Start slightly back
+        self.camera_rotation_x = 0.0
+        self.camera_rotation_y = 0.0
         self.world_up_vector = Vec3(0, 1, 0)
+        self._aspect_ratio = float(self.width) / self.height if self.height > 0 else 1.0 # Renamed to avoid conflict
         self.move_speed = 2.0 # Slower speed for potentially smaller scenes
         self.fast_move_speed = 6.0
         # Track previous state for motion detection
@@ -548,12 +629,14 @@ class LiveViewerWindow(pyglet.window.Window):
         # --------------------
 
         # --- Geometry Shader Source ---
+        # (Keep geometry_source definition as is)
         geometry_source = """#version 150 core
             layout (points) in;
             layout (triangle_strip, max_vertices = 4) out;
 
             in vec3 vertex_colors[]; // Receive from vertex shader (array because input is point)
-            out vec3 geom_colors;    // Pass to fragment shader
+            out vec3 geom_colors;    // Pass color to fragment shader
+            out vec2 texCoord;       // Pass texture coordinate to fragment shader
 
             uniform vec2 viewportSize; // To convert pixel size to clip space
 
@@ -568,18 +651,22 @@ class LiveViewerWindow(pyglet.window.Window):
                 // Emit 4 vertices for the quad
                 gl_Position = centerPosition + vec4(-halfSizeX, -halfSizeY, 0.0, 0.0);
                 geom_colors = vertex_colors[0];
+                texCoord = vec2(0.0, 0.0); // Bottom-left
                 EmitVertex();
 
                 gl_Position = centerPosition + vec4( halfSizeX, -halfSizeY, 0.0, 0.0);
                 geom_colors = vertex_colors[0];
+                texCoord = vec2(1.0, 0.0); // Bottom-right
                 EmitVertex();
 
                 gl_Position = centerPosition + vec4(-halfSizeX,  halfSizeY, 0.0, 0.0);
                 geom_colors = vertex_colors[0];
+                texCoord = vec2(0.0, 1.0); // Top-left
                 EmitVertex();
 
                 gl_Position = centerPosition + vec4( halfSizeX,  halfSizeY, 0.0, 0.0);
                 geom_colors = vertex_colors[0];
+                texCoord = vec2(1.0, 1.0); // Top-right
                 EmitVertex();
 
                 EndPrimitive();
@@ -609,86 +696,100 @@ class LiveViewerWindow(pyglet.window.Window):
         pyglet.clock.schedule_interval(self.update, 1.0 / 60.0) # Update viewer frequently
         pyglet.clock.schedule_interval(self.update_camera, 1.0 / 60.0) # Update camera
 
+        # --- Threading Setup --- Moved Before start_inference_thread
+        self._data_queue = queue.Queue(maxsize=5) # Limit queue size
+        self._exit_event = threading.Event()
+        self.inference_thread = None
+        # ---------------------
+
         # Start the inference thread, passing point smoothing flag
-        self.start_inference_thread(model_name, inference_interval,
-                                    disable_point_smoothing)
+        # self.scale_factor_ref is initialized in load_settings now
+        self.start_inference_thread(self._model_name, self._inference_interval,
+                                    self._disable_point_smoothing)
 
         # Set up OpenGL state
         gl.glClearColor(0.1, 0.1, 0.1, 1.0)
-        gl.glEnable(gl.GL_DEPTH_TEST)
-        gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+        gl.glEnable(gl.GL_DEPTH_TEST) # Ensure depth test is enabled
+        gl.glEnable(gl.GL_PROGRAM_POINT_SIZE) # Needed for vertex shader gl_PointSize
+        gl.glEnable(gl.GL_BLEND) # Enable blending
+        # Set default blend func (used by Gaussian mode, ImGui, maybe UI labels)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+
+        # FBO Setup Removed
+        # Quad Shader & Geometry Setup Removed (Not needed without FBO)
+
+        # --- ImGui Setup ---
+        try:
+            print("DEBUG: Initializing ImGui...")
+            imgui.create_context()
+            self.imgui_renderer = create_renderer(self)
+            print("DEBUG: ImGui initialized.")
+        except Exception as e_imgui:
+            print(f"FATAL: Error initializing ImGui: {e_imgui}")
+            pyglet.app.exit()
+            return
+        # --- End ImGui Setup ---
+
 
     def start_inference_thread(self, model_name, inference_interval,
                                disable_point_smoothing): # Removed depth smoothing arg
+        # Ensure scale_factor_ref is initialized before starting thread
+        if not hasattr(self, 'scale_factor_ref') or self.scale_factor_ref is None:
+             self.scale_factor_ref = [DEFAULT_SETTINGS['input_scale_factor']] # Initialize if needed
+
         if self.inference_thread is None or not self.inference_thread.is_alive():
             self._exit_event.clear()
             # Pass point smoothing flag to the thread function
             # Note: We pass the *enable* flag, so negate the disable flag from args
-            # Create a mutable reference (list) for the scale factor and store it
-            self.scale_factor_ref = [self.current_scale_factor]
-            thread_args = (self.data_queue, self._exit_event, model_name, inference_interval,
-                           not disable_point_smoothing, self.scale_factor_ref) # Add scale factor ref to args
+            # Pass the scale factor reference list
             self.inference_thread = threading.Thread(
                 target=inference_thread_func,
-                args=thread_args,
-                daemon=True)
+                args=(self._data_queue, self._exit_event, model_name, inference_interval,
+                      not disable_point_smoothing, self.scale_factor_ref), # Pass scale_factor_ref
+                daemon=True
+            )
             self.inference_thread.start()
+            print("DEBUG: Inference thread started via start_inference_thread.")
 
     def update(self, dt):
-        """Checks queue for new point cloud data and recreates VertexList."""
+        """Scheduled function to process data from the inference thread."""
         try:
-            # Get the latest data, discard older ones if queue built up
-            latest_data = None
-            while not self.data_queue.empty():
-                latest_data = self.data_queue.get_nowait()
+            # Process all available data in the queue non-blockingly
+            while True:
+                latest_data = self._data_queue.get_nowait()
 
-            # Removed debug print for latest_data type
-
-            if latest_data:
-                # --- Check for message type ---
-                if isinstance(latest_data[0], str):
-                    # Handle status or error messages
-                    if latest_data[0] == "error":
-                        print(f"Received error from inference thread: {latest_data[1]}")
-                        self.status_message = f"Error: {latest_data[1]}"
-                        self.status_label.text = self.status_message
-                        # Potentially clear vertex list on error?
-                        # if self.vertex_list:
-                        #     self.vertex_list.delete()
-                        #     self.vertex_list = None
-                    elif latest_data[0] == "status":
+                # Check if data is a status/error message (tuple starting with string)
+                if isinstance(latest_data, tuple) and isinstance(latest_data[0], str):
+                    if latest_data[0] == "status":
                         self.status_message = latest_data[1]
-                        self.status_label.text = self.status_message
-                    # After handling string message, do nothing else this update cycle
+                    elif latest_data[0] == "error":
+                        self.status_message = f"ERROR: {latest_data[1]}"
+                        print(f"ERROR from inference thread: {latest_data[1]}")
+                    elif latest_data[0] == "warning":
+                        self.status_message = f"WARN: {latest_data[1]}"
+                        print(f"WARNING from inference thread: {latest_data[1]}")
+                    continue
                 else:
                     # --- Process actual vertex data ---
                     try:
-                        # Unpack data (motion confidence removed)
                         vertices_data, colors_data, _, frame_h, t_capture = latest_data
-                        self.current_image_height = frame_h # Store image height
-                        # self.camera_motion_confidence = motion_confidence # Removed
-                        self.last_capture_timestamp = t_capture # Store capture time
+                        self.current_image_height = frame_h
+                        self.last_capture_timestamp = t_capture
 
                         # --- Calculate Point Cloud FPS ---
                         current_time = time.time()
                         time_delta = current_time - self.last_update_time
-                        if time_delta > 1e-6: # Avoid division by zero
+                        if time_delta > 1e-6:
                             self.point_cloud_fps = 1.0 / time_delta
                         self.last_update_time = current_time
                         # -----------------------------
 
-                        # Calculate actual number of vertices based on received data length
                         actual_num_vertices = 0
                         if vertices_data is not None:
-                            # vertices_data is flattened, length is num_vertices * 3
                             actual_num_vertices = len(vertices_data) // 3
-                            # Update point count state and label
                             self.current_point_count = actual_num_vertices
-                            self.point_count_label.text = f"Points: {self.current_point_count}"
-                        # Removed Debug Print for Point Range
 
                         if vertices_data is not None and colors_data is not None and actual_num_vertices > 0:
-                            # Delete previous vertex list if it exists
                             if self.vertex_list:
                                 try:
                                     self.vertex_list.delete()
@@ -696,31 +797,23 @@ class LiveViewerWindow(pyglet.window.Window):
                                     print(f"Error deleting previous vertex list: {e_del}")
                                 self.vertex_list = None
 
-                            # Create new vertex list using ACTUAL vertex count
                             try:
                                 self.vertex_list = self.shader_program.vertex_list(
-                                    actual_num_vertices, # Use actual count based on data length
+                                    actual_num_vertices,
                                     gl.GL_POINTS,
                                     vertices=('f', vertices_data),
                                     colors=('f', colors_data)
                                 )
-                                self.frame_count_display += 1 # Increment display counter
-                                # Removed final debug print
+                                self.frame_count_display += 1
                             except Exception as e_create:
                                  print(f"Error creating vertex list: {e_create}")
                                  traceback.print_exc()
                         else:
-                            # Handle empty frame or invalid data
-                            # Increment display counter even if data is bad/empty?
                             self.frame_count_display += 1
 
                     except Exception as e_unpack:
                         print(f"Error unpacking or processing vertex data: {e_unpack}")
                         traceback.print_exc()
-                        # Optionally clear vertex list here too
-                        # if self.vertex_list:
-                        #     self.vertex_list.delete()
-                        #     self.vertex_list = None
 
         except queue.Empty:
             pass # No new data is fine
@@ -728,9 +821,6 @@ class LiveViewerWindow(pyglet.window.Window):
 
     def update_camera(self, dt):
         """Scheduled function to handle camera movement based on key states."""
-
-        # Removed viewer camera motion confidence calculation
-
         speed = self.fast_move_speed if self.keys[key.LSHIFT] or self.keys[key.RSHIFT] else self.move_speed
         move_amount = speed * dt
         rot_y = -math.radians(self.camera_rotation_y)
@@ -746,113 +836,264 @@ class LiveViewerWindow(pyglet.window.Window):
         if self.keys[key.E]: self.camera_position += up * move_amount
         if self.keys[key.Q]: self.camera_position -= up * move_amount
 
-        # Removed update for previous viewer camera state
-
     def get_camera_matrices(self):
         rot_y = -math.radians(self.camera_rotation_y)
         rot_x = -math.radians(self.camera_rotation_x)
         forward = Vec3(math.sin(rot_y) * math.cos(rot_x), -math.sin(rot_x), -math.cos(rot_y) * math.cos(rot_x)).normalize()
         target = self.camera_position + forward
         view = Mat4.look_at(self.camera_position, target, self.world_up_vector)
-        projection = Mat4.perspective_projection(self.aspect_ratio, z_near=0.1, z_far=1000.0, fov=60.0)
+        projection = Mat4.perspective_projection(self._aspect_ratio, z_near=0.1, z_far=1000.0, fov=60.0) # Use renamed variable
         return projection, view
 
+    def reset_settings(self):
+        """Resets settings to default values."""
+        print("DEBUG: Resetting settings to default.")
+        for key, value in DEFAULT_SETTINGS.items():
+            # Use setattr to handle potential future additions easily
+            setattr(self, key, value)
+        # Always create/update the scale factor reference list
+        self.scale_factor_ref = [self.input_scale_factor]
+
+
+    def save_settings(self, filename="viewer_settings.json"):
+        """Saves current settings to a JSON file."""
+        settings_to_save = {key: getattr(self, key) for key in DEFAULT_SETTINGS}
+        try:
+            with open(filename, 'w') as f:
+                json.dump(settings_to_save, f, indent=4)
+            print(f"DEBUG: Settings saved to {filename}")
+            self.status_message = f"Settings saved to {filename}"
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+            self.status_message = "Error saving settings."
+
+    def load_settings(self, filename="viewer_settings.json"):
+        """Loads settings from a JSON file or uses defaults."""
+        try:
+            if os.path.exists(filename):
+                with open(filename, 'r') as f:
+                    loaded_settings = json.load(f)
+                # Update attributes, falling back to default if key missing
+                for key in DEFAULT_SETTINGS:
+                    setattr(self, key, loaded_settings.get(key, DEFAULT_SETTINGS[key]))
+                print(f"DEBUG: Settings loaded from {filename}")
+                # self.status_message = f"Settings loaded from {filename}" # Avoid overwriting init message
+            else:
+                # If file doesn't exist, load defaults
+                print(f"DEBUG: Settings file {filename} not found, using defaults.")
+                # Initialize attributes from defaults before calling reset
+                for key, value in DEFAULT_SETTINGS.items():
+                    setattr(self, key, value)
+                self.reset_settings() # Use reset to ensure consistency
+                # self.status_message = "Settings file not found, using defaults."
+        except Exception as e:
+            print(f"Error loading settings: {e}. Using defaults.")
+            # Initialize attributes from defaults before calling reset
+            for key, value in DEFAULT_SETTINGS.items():
+                setattr(self, key, value)
+            self.reset_settings() # Use defaults on error
+            # self.status_message = "Error loading settings, using defaults."
+        # Ensure scale factor reference list is updated/created
+        # This needs to happen *after* input_scale_factor has its definitive value
+        self.scale_factor_ref = [self.input_scale_factor]
+
+
     def on_draw(self):
-        self.clear()
-        projection, current_view = self.get_camera_matrices()
-        self.shader_program.use()
-        self.shader_program['projection'] = projection
-        self.shader_program['view'] = current_view
-        # Removed passing cameraPosition uniform
-        # Removed passing viewportHeight uniform
-        # Pass viewport size for geometry shader calculations
-        self.shader_program['viewportSize'] = (float(self.width), float(self.height))
-        # Pass the current input scale factor to the shader
-        self.shader_program['inputScaleFactor'] = float(self.current_scale_factor)
-        # Pass the current point size boost factor to the shader
-        self.shader_program['pointSizeBoost'] = float(self.point_size_boost)
-        self.shader_program['inputScaleFactor'] = float(self.current_scale_factor)
-        # --- Draw VertexList directly ---
-        # print("DEBUG: on_draw called") # Optional: Uncomment if needed to confirm on_draw frequency
+        # Clear the main window buffer
+        gl.glClearColor(0.1, 0.1, 0.1, 1.0)
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+
+        # --- Draw 3D Splats ---
         if self.vertex_list:
-            print(f"DEBUG: Attempting to draw vertex_list (exists: True, count: {self.vertex_list.count})") # Check if list exists and has points
+            projection, current_view = self.get_camera_matrices()
+            self.shader_program.use()
+            self.shader_program['projection'] = projection
+            self.shader_program['view'] = current_view
+            self.shader_program['viewportSize'] = (float(self.width), float(self.height))
+            # Pass control uniforms to shader
+            self.shader_program['inputScaleFactor'] = self.input_scale_factor # Renamed state var
+            self.shader_program['pointSizeBoost'] = self.point_size_boost
+            self.shader_program['renderMode'] = self.render_mode
+            self.shader_program['falloffFactor'] = self.falloff_factor
+            self.shader_program['saturation'] = self.saturation
+            self.shader_program['brightness'] = self.brightness
+            self.shader_program['contrast'] = self.contrast
+            self.shader_program['sharpness'] = self.sharpness
+
+            # Set GL state based on render mode
+            if self.render_mode == 0: # Square (Opaque)
+                gl.glEnable(gl.GL_DEPTH_TEST)
+                gl.glDepthMask(gl.GL_TRUE)
+                gl.glDisable(gl.GL_BLEND)
+            elif self.render_mode == 1: # Circle (Opaque)
+                gl.glEnable(gl.GL_DEPTH_TEST)
+                gl.glDepthMask(gl.GL_TRUE)
+                gl.glDisable(gl.GL_BLEND)
+            elif self.render_mode == 2: # Gaussian (Premultiplied Alpha Blend)
+                gl.glEnable(gl.GL_DEPTH_TEST)
+                gl.glDepthMask(gl.GL_FALSE) # Disable depth write for transparency
+                gl.glEnable(gl.GL_BLEND)
+                gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA) # Premultiplied alpha blend func
+
+            # Draw the splats
             try:
                 self.vertex_list.draw(gl.GL_POINTS)
-                # print("DEBUG: vertex_list.draw() called successfully") # Optional: Uncomment if needed
             except Exception as e:
                 print(f"Error during vertex_list.draw: {e}")
-        else:
-            print("DEBUG: Skipping draw (vertex_list is None)") # Check if list is None
-        # --------------------------------
+            finally:
+                # Restore default-ish state after drawing splats
+                gl.glDepthMask(gl.GL_TRUE)
+                # Keep blend enabled for ImGui/UI, but set to standard alpha
+                gl.glEnable(gl.GL_BLEND)
+                gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+                self.shader_program.stop()
+        # --- End Draw 3D Splats ---
 
-        self.shader_program.stop()
+        # --- ImGui Frame ---
+        imgui.new_frame()
 
-        # --- Draw Status Label & FPS ---
-        # Disable depth test for 2D UI rendering
-        gl.glDisable(gl.GL_DEPTH_TEST)
+        # Define the UI Panel
+        imgui.set_next_window_position(self.width - 310, 10, imgui.ONCE) # Position bottom-rightish once
+        imgui.set_next_window_size(300, 400, imgui.ONCE) # Adjusted size
+        imgui.begin("Controls", True) # True = closable window
 
-        # Calculate latency
-        latency_ms = (time.time() - self.last_capture_timestamp) * 1000 if self.last_capture_timestamp else 0
+        # --- Presets ---
+        if imgui.button("Load Settings"): self.load_settings()
+        imgui.same_line()
+        if imgui.button("Save Settings"): self.save_settings()
+        imgui.same_line()
+        if imgui.button("Reset All"): self.reset_settings()
+        imgui.separator()
 
-        # Update label text (Motion Confidence removed)
-        status_text = f"PointCloud FPS: {self.point_cloud_fps:.1f} | Latency: {latency_ms:.0f}ms | {self.status_message}"
-        self.status_label.text = status_text
+        # --- Rendering Section ---
+        if imgui.collapsing_header("Rendering", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            imgui.text("Render Mode:")
+            if imgui.radio_button("Square##RenderMode", self.render_mode == 0): self.render_mode = 0
+            imgui.same_line()
+            if imgui.radio_button("Circle##RenderMode", self.render_mode == 1): self.render_mode = 1
+            imgui.same_line()
+            if imgui.radio_button("Gaussian##RenderMode", self.render_mode == 2): self.render_mode = 2
 
-        # Draw the UI batch (which contains the label)
-        self.ui_batch.draw()
+            # Gaussian Params (only relevant if Gaussian mode)
+            if self.render_mode == 2:
+                imgui.indent()
+                changed_falloff, self.falloff_factor = imgui.slider_float("Falloff", self.falloff_factor, 0.1, 20.0)
+                if imgui.button("Reset##Falloff"): self.falloff_factor = DEFAULT_SETTINGS["falloff_factor"]
+                imgui.unindent()
 
-        # Removed FPS display draw call
+        # --- View Section ---
+        if imgui.collapsing_header("View", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            changed_boost, self.point_size_boost = imgui.slider_float("Point Size Boost", self.point_size_boost, 0.1, 10.0)
+            if imgui.button("Reset##PointSize"): self.point_size_boost = DEFAULT_SETTINGS["point_size_boost"]
 
-        # Re-enable depth test for next frame's 3D rendering
+            changed_scale, self.input_scale_factor = imgui.slider_float("Input Scale", self.input_scale_factor, 0.1, 1.0)
+            if changed_scale: self.scale_factor_ref[0] = self.input_scale_factor # Update shared ref for thread
+            if imgui.button("Reset##InputScale"):
+                self.input_scale_factor = DEFAULT_SETTINGS["input_scale_factor"]
+                self.scale_factor_ref[0] = self.input_scale_factor
+
+        # --- Image Processing Section ---
+        if imgui.collapsing_header("Image Processing", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            changed_sat, self.saturation = imgui.slider_float("Saturation", self.saturation, 0.0, 3.0)
+            if imgui.button("Reset##Saturation"): self.saturation = DEFAULT_SETTINGS["saturation"]
+
+            changed_brt, self.brightness = imgui.slider_float("Brightness", self.brightness, 0.0, 2.0)
+            if imgui.button("Reset##Brightness"): self.brightness = DEFAULT_SETTINGS["brightness"]
+
+            changed_con, self.contrast = imgui.slider_float("Contrast", self.contrast, 0.1, 3.0)
+            if imgui.button("Reset##Contrast"): self.contrast = DEFAULT_SETTINGS["contrast"]
+
+            changed_shp, self.sharpness = imgui.slider_float("Sharpness", self.sharpness, 0.1, 3.0)
+            if imgui.button("Reset##Sharpness"): self.sharpness = DEFAULT_SETTINGS["sharpness"]
+
+        # --- Info Section ---
+        if imgui.collapsing_header("Info")[0]:
+            imgui.text(f"Points: {self.current_point_count}")
+            imgui.text(f"FPS: {self.point_cloud_fps:.1f}")
+            imgui.text_wrapped(f"Status: {self.status_message}")
+
+        imgui.end()
+
+        # Render ImGui
+        # Ensure correct GL state for ImGui rendering (standard alpha blend)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glDisable(gl.GL_DEPTH_TEST) # ImGui draws in 2D
+
+        imgui.render()
+        self.imgui_renderer.render(imgui.get_draw_data())
+        # --- End ImGui Frame ---
+
+        # --- Draw Pyglet UI Labels (Optional, can be replaced by ImGui) ---
+        # self.ui_batch.draw() # Draw status label etc. if needed
+
+        # Restore GL state needed for next 3D frame
         gl.glEnable(gl.GL_DEPTH_TEST)
-        # -------------------------
 
 
     # --- Input Handlers (Simplified for brevity, same as before) ---
     def on_resize(self, width, height):
         gl.glViewport(0, 0, max(1, width), max(1, height))
-        # Removed FPS display update
+        self._aspect_ratio = float(width) / height if height > 0 else 1.0 # Update renamed variable
+        # Update label positions if using pyglet labels
+        # if hasattr(self, 'scale_factor_label'):
+        #     self.scale_factor_label.x = width - 10
+        #     self.scale_factor_label.y = height - 10
+        # if hasattr(self, 'point_boost_label'):
+        #     self.point_boost_label.x = width - 10
+        #     self.point_boost_label.y = height - 30
+
     def on_mouse_press(self, x, y, button, modifiers):
+        # Prevent camera control if ImGui wants mouse
+        io = imgui.get_io()
+        # Removed incorrect renderer call
+        if io.want_capture_mouse:
+             # Let ImGui handle it internally via its Pyglet integration
+            return
         if button == pyglet.window.mouse.LEFT: self.set_exclusive_mouse(True); self.mouse_down = True
+
     def on_mouse_release(self, x, y, button, modifiers):
+        # Prevent camera control if ImGui wants mouse
+        io = imgui.get_io()
+        # Removed incorrect renderer call
+        if io.want_capture_mouse:
+            # Let ImGui handle it internally
+            return
         if button == pyglet.window.mouse.LEFT: self.set_exclusive_mouse(False); self.mouse_down = False
+
     def on_mouse_motion(self, x, y, dx, dy):
+        # Pass event to ImGui first (handled internally by integration)
+        io = imgui.get_io()
+        # Removed incorrect renderer call
+        if io.want_capture_mouse:
+            return # Don't control camera if ImGui used the mouse
+
         if self.mouse_down:
             sensitivity = 0.1; self.camera_rotation_y -= dx * sensitivity; self.camera_rotation_y %= 360
             self.camera_rotation_x += dy * sensitivity; self.camera_rotation_x = max(min(self.camera_rotation_x, 89.9), -89.9)
+
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
+        # Pass event to ImGui first (handled internally by integration)
+        io = imgui.get_io()
+        # Removed incorrect renderer call
+        if io.want_capture_mouse:
+            return # Don't control camera if ImGui used the scroll
+
         zoom_speed = 0.5; rot_y = -math.radians(self.camera_rotation_y); rot_x = -math.radians(self.camera_rotation_x)
         forward = Vec3(math.sin(rot_y) * math.cos(rot_x), -math.sin(rot_x), -math.cos(rot_y) * math.cos(rot_x)).normalize()
         self.camera_position += forward * scroll_y * zoom_speed
+
     def on_key_press(self, symbol, modifiers):
+        # Pass event to ImGui first (handled internally by integration)
+        io = imgui.get_io()
+        # Removed incorrect renderer call
+        if io.want_capture_keyboard:
+            return # Don't process key if ImGui used it
+
         if symbol == pyglet.window.key.ESCAPE:
             self.set_exclusive_mouse(False)
             self.close()
-        elif symbol == pyglet.window.key.UP:
-            # Increase scale factor
-            self.current_scale_factor += 0.1
-            if hasattr(self, 'scale_factor_ref'): # Check if ref exists (thread started)
-                self.scale_factor_ref[0] = self.current_scale_factor
-            self.scale_factor_label.text = f"Scale: {self.current_scale_factor:.2f}x"
-            print(f"Scale factor increased to: {self.current_scale_factor:.2f}")
-        elif symbol == pyglet.window.key.DOWN:
-            # Decrease scale factor, with a minimum limit
-            self.current_scale_factor = max(0.1, self.current_scale_factor - 0.1) # Min scale 0.1
-            if hasattr(self, 'scale_factor_ref'): # Check if ref exists
-                self.scale_factor_ref[0] = self.current_scale_factor
-            self.scale_factor_label.text = f"Scale: {self.current_scale_factor:.2f}x"
-            print(f"Scale factor decreased to: {self.current_scale_factor:.2f}")
-        elif symbol == pyglet.window.key.RIGHT:
-            # Increase point size boost
-            self.point_size_boost += 0.1
-            self.point_boost_label.text = f"Pt Boost: {self.point_size_boost:.2f}x"
-            print(f"Point boost increased to: {self.point_size_boost:.2f}")
-        elif symbol == pyglet.window.key.LEFT:
-            # Decrease point size boost, with a minimum limit
-            self.point_size_boost = max(0.1, self.point_size_boost - 0.1) # Min boost 0.1
-            self.point_boost_label.text = f"Pt Boost: {self.point_size_boost:.2f}x"
-            print(f"Point boost decreased to: {self.point_size_boost:.2f}")
-        # Add other key presses if needed (like pause, loop toggle - less relevant for live view)
+        # Removed keybindings for scale and point size boost
 
     def on_close(self):
         print("Window closing, stopping inference thread...")
@@ -863,6 +1104,12 @@ class LiveViewerWindow(pyglet.window.Window):
             try: self.vertex_list.delete()
             except Exception as e_del: print(f"Error deleting vertex list on close: {e_del}")
         if self.shader_program: self.shader_program.delete()
+        # FBO cleanup removed
+        # Quad cleanup removed
+        # --- ImGui Cleanup ---
+        if hasattr(self, 'imgui_renderer') and self.imgui_renderer:
+            self.imgui_renderer.shutdown()
+        # --- End ImGui Cleanup ---
         super().on_close()
 
 
@@ -874,9 +1121,7 @@ if __name__ == '__main__':
     parser.add_argument("--disable-point-smoothing", action="store_true", help="Disable temporal smoothing on 3D points (default: enabled).") # Clarified default
     args = parser.parse_args()
 
-    gl.glEnable(gl.GL_BLEND)
-    gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-    # Pass smoothing flags from args to window constructor
+    # Pass smoothing flags to window constructor (using default GL config)
     window = LiveViewerWindow(model_name=args.model, inference_interval=args.interval,
                               # Removed depth smoothing argument
                               disable_point_smoothing=args.disable_point_smoothing,
@@ -888,4 +1133,19 @@ if __name__ == '__main__':
         traceback.print_exc()
         print("------------------------")
     finally:
-        print("Exiting application.")
+        # Ensure ImGui context is destroyed if app exits unexpectedly
+        if imgui.get_current_context():
+            print("DEBUG: Destroying ImGui context in finally block.")
+            # Ensure renderer is shutdown first if it exists
+            if hasattr(window, 'imgui_renderer') and window.imgui_renderer:
+                 try:
+                     window.imgui_renderer.shutdown()
+                     print("DEBUG: ImGui renderer shutdown.")
+                 except Exception as e_shutdown:
+                     print(f"Error shutting down ImGui renderer: {e_shutdown}")
+            try:
+                imgui.destroy_context()
+                print("DEBUG: ImGui context destroyed.")
+            except Exception as e_destroy:
+                print(f"Error destroying ImGui context: {e_destroy}")
+        print("Application finished.")
