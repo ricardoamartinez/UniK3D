@@ -12,8 +12,9 @@ import torch # For UniK3D model and tensors
 import json # For saving/loading settings
 import tkinter as tk
 from tkinter import filedialog
-import glob # For finding PLY files
-import re # For sorting PLY files numerically
+import glob # For finding files
+import re # For sorting files numerically
+import trimesh # For GLB saving/loading
 
 # Assuming unik3d is installed and importable
 from unik3d.models import UniK3D
@@ -27,7 +28,7 @@ from imgui.integrations.pyglet import create_renderer
 
 # Default settings dictionary
 DEFAULT_SETTINGS = {
-    "input_mode": "Live", # "Live", "File", "PLY Sequence"
+    "input_mode": "Live", # "Live", "File", "GLB Sequence"
     "input_filepath": "", # Can be file or directory path
     "render_mode": 2, # 0=Square, 1=Circle, 2=Gaussian
     "falloff_factor": 5.0,
@@ -48,8 +49,8 @@ DEFAULT_SETTINGS = {
     "rgb_edge_threshold2": 150.0,
     "edge_smoothing_influence": 0.7,
     "gradient_influence_scale": 1.0,
-    "playback_speed": 1.0, # For video/PLY sequence files
-    "loop_video": True, # For video/PLY sequence files
+    "playback_speed": 1.0, # For video/GLB sequence files
+    "loop_video": True, # For video/GLB sequence files
     "is_recording": False, # Recording state
     "recording_output_dir": "recording_output", # Default output dir
     "show_camera_feed": False,
@@ -58,112 +59,66 @@ DEFAULT_SETTINGS = {
     "show_smoothing_map": False,
 }
 
-# --- PLY Loading Helper ---
-def load_ply(filepath):
-    """Loads points and optionally colors from an ASCII PLY file."""
+# --- GLB Saving Helper ---
+def save_glb(filepath, points, colors=None):
+    """Saves a point cloud to a GLB file using trimesh."""
     try:
-        with open(filepath, 'r') as f:
-            lines = f.readlines()
-
-        header_end_index = -1
-        num_vertices = 0
-        properties = []
-        has_color = False
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if line.startswith("element vertex"):
-                num_vertices = int(line.split()[-1])
-            elif line.startswith("property"):
-                properties.append(line.split()[-1]) # Store property names (x, y, z, red, green, blue)
-                if line.split()[-1] in ["red", "green", "blue"]:
-                    has_color = True
-            elif line == "end_header":
-                header_end_index = i
-                break
-
-        if header_end_index == -1 or num_vertices == 0:
-            raise ValueError("Invalid PLY header or no vertices.")
-
-        data_lines = lines[header_end_index + 1 : header_end_index + 1 + num_vertices]
-
-        # Find indices of properties
-        try:
-            x_idx = properties.index("x")
-            y_idx = properties.index("y")
-            z_idx = properties.index("z")
-            r_idx = properties.index("red") if has_color else -1
-            g_idx = properties.index("green") if has_color else -1
-            b_idx = properties.index("blue") if has_color else -1
-        except ValueError as e:
-            raise ValueError(f"Missing required property in PLY header: {e}")
-
-
-        points = np.zeros((num_vertices, 3), dtype=np.float32)
-        colors = np.zeros((num_vertices, 3), dtype=np.float32) if has_color else None
-
-        for i, line in enumerate(data_lines):
-            vals = line.split()
-            points[i, 0] = float(vals[x_idx])
-            points[i, 1] = float(vals[y_idx]) # Load original Y
-            points[i, 2] = float(vals[z_idx])
-            if has_color:
-                colors[i, 0] = int(vals[r_idx]) / 255.0 # Convert uchar back to float 0-1
-                colors[i, 1] = int(vals[g_idx]) / 255.0
-                colors[i, 2] = int(vals[b_idx]) / 255.0
-
-        return points, colors
-
-    except Exception as e:
-        print(f"Error loading PLY file {filepath}: {e}")
-        return None, None
-
-# --- PLY Saving Helper ---
-def save_ply(filepath, points, colors=None):
-    """Saves a point cloud to an ASCII PLY file."""
-    try:
-        # Ensure output directory exists
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-
         num_points = points.shape[0]
-        header = [
-            "ply",
-            "format ascii 1.0",
-            f"element vertex {num_points}",
-            "property float x",
-            "property float y",
-            "property float z",
-        ]
-        # Check if colors array is valid and matches point count
+
+        # Trimesh expects colors as RGBA uint8
+        point_colors = None
         if colors is not None and colors.shape[0] == num_points:
-            header.extend([
-                "property uchar red",
-                "property uchar green",
-                "property uchar blue",
-            ])
+            # Convert float 0-1 to uint8 0-255
+            colors_uint8 = (np.clip(colors, 0.0, 1.0) * 255).astype(np.uint8)
+            # Add alpha channel (fully opaque)
+            point_colors = np.hstack((colors_uint8, np.full((num_points, 1), 255, dtype=np.uint8)))
         else:
-            if colors is not None: # Warn if colors provided but invalid
+             if colors is not None: # Warn if colors provided but invalid
                  print(f"Warning: Color data shape mismatch or invalid for {filepath}. Saving without colors.")
-            colors = None # Don't write colors if invalid
 
-        header.append("end_header")
+        # Create a trimesh PointCloud object
+        # Save with original Y coordinate (invert back from display inversion)
+        cloud = trimesh.points.PointCloud(vertices=points * np.array([1,-1,1]), colors=point_colors)
 
-        with open(filepath, 'w') as f:
-            for line in header:
-                f.write(line + '\n')
-
-            for i in range(num_points):
-                # Save with original Y coordinate (invert back from display inversion)
-                line = f"{points[i, 0]:.6f} {-points[i, 1]:.6f} {points[i, 2]:.6f}"
-                if colors is not None:
-                    # Assuming colors are float 0-1, convert to uchar 0-255
-                    r = int(np.clip(colors[i, 0] * 255, 0, 255))
-                    g = int(np.clip(colors[i, 1] * 255, 0, 255))
-                    b = int(np.clip(colors[i, 2] * 255, 0, 255))
-                    line += f" {r} {g} {b}"
-                f.write(line + '\n')
-        # print(f"Saved {filepath}") # Optional: Log saving
+        # Export to GLB
+        cloud.export(filepath, file_type='glb')
+        # print(f"Saved {filepath}") # Optional
     except Exception as e:
-        print(f"Error saving PLY file {filepath}: {e}")
+        print(f"Error saving GLB file {filepath}: {e}")
+        traceback.print_exc()
+
+
+# --- GLB Loading Helper ---
+def load_glb(filepath):
+    """Loads points and colors from a GLB file using trimesh."""
+    try:
+        # Load the GLB file
+        mesh = trimesh.load(filepath, file_type='glb', process=False) # process=False to keep original data
+
+        if isinstance(mesh, trimesh.points.PointCloud):
+            points = np.array(mesh.vertices, dtype=np.float32)
+            colors = None
+            if hasattr(mesh, 'colors') and mesh.colors is not None and len(mesh.colors) == len(points):
+                # Convert RGBA uint8 to RGB float 0-1
+                colors = np.array(mesh.colors[:, :3], dtype=np.float32) / 255.0
+            return points, colors
+        elif isinstance(mesh, trimesh.Trimesh):
+             # If it loaded as a mesh, just use its vertices
+             print(f"Warning: Loaded GLB {filepath} as Trimesh, using vertices only.")
+             points = np.array(mesh.vertices, dtype=np.float32)
+             # Try to get vertex colors if they exist
+             colors = None
+             if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None and len(mesh.visual.vertex_colors) == len(points):
+                 colors = np.array(mesh.visual.vertex_colors[:, :3], dtype=np.float32) / 255.0
+             return points, colors
+        else:
+            print(f"Warning: Loaded GLB {filepath} is not a PointCloud or Trimesh.")
+            return None, None
+
+    except Exception as e:
+        print(f"Error loading GLB file {filepath}: {e}")
+        return None, None
 
 
 # Simple shaders (Using 'vertices' instead of 'position')
@@ -344,8 +299,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
     cap = None # Video capture object
     is_video = False
     is_image = False
-    is_ply_sequence = False # Added flag for PLY sequence
-    ply_files = [] # List of PLY file paths
+    is_glb_sequence = False # Changed from is_ply_sequence
+    glb_files = [] # Changed from ply_files
     frame_source_name = "Live Camera"
     video_total_frames = 0
     video_fps = 30 # Default assumption
@@ -353,9 +308,9 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
     recorded_frame_counter = 0 # Counter for saved frames
 
     try:
-        # --- Load Model (Only if not playing PLY sequence) ---
+        # --- Load Model (Only if not playing GLB sequence) ---
         model = None
-        if input_mode != "PLY Sequence": # Don't load model if playing PLY
+        if input_mode != "GLB Sequence": # Don't load model if playing GLB
             print(f"Loading UniK3D model: {model_name}...")
             data_queue.put(("status", f"Loading model: {model_name}..."))
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -385,22 +340,24 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         elif input_mode == "File" and input_filepath and os.path.exists(input_filepath):
             frame_source_name = os.path.basename(input_filepath)
             if os.path.isdir(input_filepath):
-                # --- Load PLY Sequence ---
-                print(f"Scanning directory for PLY files: {input_filepath}")
+                # --- Load GLB Sequence ---
+                print(f"Scanning directory for GLB files: {input_filepath}")
                 data_queue.put(("status", f"Scanning directory: {frame_source_name}..."))
-                ply_files = sorted(glob.glob(os.path.join(input_filepath, "*.ply")),
+                # Scan for .glb files instead of .ply
+                glb_files = sorted(glob.glob(os.path.join(input_filepath, "*.glb")),
                                    key=lambda x: int(re.search(r'(\d+)', os.path.basename(x)).group(1)) if re.search(r'(\d+)', os.path.basename(x)) else -1) # Sort numerically
-                if not ply_files:
-                    print(f"Error: No .ply files found in directory: {input_filepath}")
-                    data_queue.put(("error", f"No .ply files found in: {frame_source_name}"))
+                if not glb_files:
+                    print(f"Error: No .glb files found in directory: {input_filepath}")
+                    data_queue.put(("error", f"No .glb files found in: {frame_source_name}"))
                     return
-                is_ply_sequence = True
-                video_total_frames = len(ply_files)
-                video_fps = 30 # Assume 30 FPS for PLY sequences for now
+                is_glb_sequence = True # Set GLB flag
+                input_mode = "GLB Sequence" # Update mode explicitly
+                video_total_frames = len(glb_files)
+                video_fps = 30 # Assume 30 FPS for GLB sequences for now
                 playback_state_ref["total_frames"] = video_total_frames
                 playback_state_ref["current_frame"] = 0
-                print(f"PLY sequence loaded successfully ({video_total_frames} frames).")
-                data_queue.put(("status", f"Loaded PLY sequence: {frame_source_name}"))
+                print(f"GLB sequence loaded successfully ({video_total_frames} frames).")
+                data_queue.put(("status", f"Loaded GLB sequence: {frame_source_name}"))
             else:
                 # --- Load Video or Image File ---
                 print(f"Initializing video capture for file: {input_filepath}")
@@ -417,7 +374,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 else:
                     print("Failed to open as video, trying as image...")
                     try:
-                        image_frame = cv2.imread(input_filepath)
+                        image_frame = cv2.imread(input_filepath) # Load image frame here
                         if image_frame is not None:
                             is_image = True
                             print("Image file loaded successfully.")
@@ -437,7 +394,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
         # --- Start of main loop logic ---
         frame_count = 0 # Overall frames processed by thread
-        sequence_frame_index = 0 # Current frame index for video/PLY sequence
+        sequence_frame_index = 0 # Current frame index for video/GLB sequence
         last_inference_time = time.time()
         last_frame_read_time = time.time() # For playback speed control
         smoothed_points_xyz = None
@@ -450,19 +407,20 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
         while not exit_event.is_set(): # Check exit event at start of loop
             t_capture = time.time()
-            frame = None
-            ret = False
-            points_xyz_np = None # For PLY loading
-            colors_np = None # For PLY loading
+            frame = None # Frame from video/camera
+            ret = False # Frame read success
+            points_xyz_np = None # Loaded from GLB
+            colors_np = None # Loaded from GLB or generated from frame
+            num_vertices = 0 # Number of points for current frame
 
             # --- Playback Control & Frame Reading/Loading ---
             is_playing = playback_state_ref.get("is_playing", True)
             playback_speed = playback_state_ref.get("speed", 1.0)
-            loop_video = playback_state_ref.get("loop", True) # Applies to PLY sequence too
+            loop_video = playback_state_ref.get("loop", True) # Applies to GLB sequence too
             restart_video = playback_state_ref.get("restart", False)
 
             if restart_video:
-                if (is_video and cap) or is_ply_sequence:
+                if (is_video and cap) or is_glb_sequence:
                     if cap: cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     sequence_frame_index = 0
                     playback_state_ref["current_frame"] = 0
@@ -500,33 +458,32 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     sleep_time = target_delta - time_since_last_read
                     time.sleep(max(0.001, sleep_time))
                     continue
-            elif is_ply_sequence and read_next_frame:
+            elif is_glb_sequence and read_next_frame: # Changed from is_ply_sequence
                 target_delta = (1.0 / video_fps) / playback_speed if video_fps > 0 and playback_speed > 0 else 0.1
                 time_since_last_read = time.time() - last_frame_read_time
                 if time_since_last_read >= target_delta:
-                    if sequence_frame_index >= len(ply_files): # End of sequence
+                    if sequence_frame_index >= len(glb_files): # End of sequence
                         if loop_video:
-                            print("Looping PLY sequence.")
+                            print("Looping GLB sequence.")
                             sequence_frame_index = 0
                             playback_state_ref["current_frame"] = 0
                             recorded_frame_counter = 0
                         else:
-                            print("End of PLY sequence.")
+                            print("End of GLB sequence.")
                             data_queue.put(("status", f"Finished processing: {frame_source_name}"))
                             break
 
-                    current_ply_path = ply_files[sequence_frame_index]
-                    points_xyz_np, colors_np = load_ply(current_ply_path)
+                    current_glb_path = glb_files[sequence_frame_index]
+                    points_xyz_np, colors_np = load_glb(current_glb_path) # Load GLB data
                     last_frame_read_time = time.time()
 
                     if points_xyz_np is not None:
-                        ret = True
-                        playback_state_ref["current_frame"] = sequence_frame_index + 1 # Update UI frame count (1-based)
-                        sequence_frame_index += 1 # Move to next frame for next iteration
+                        ret = True # Indicate success
+                        playback_state_ref["current_frame"] = sequence_frame_index + 1
+                        sequence_frame_index += 1
                     else:
-                        print(f"Error loading PLY frame: {current_ply_path}")
-                        # Option: skip frame or stop? Stop for now.
-                        break
+                        print(f"Error loading GLB frame: {current_glb_path}")
+                        break # Stop on error
                 else:
                     sleep_time = target_delta - time_since_last_read
                     time.sleep(max(0.001, sleep_time))
@@ -540,23 +497,24 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     data_queue.put(("status", f"Finished processing image: {frame_source_name}"))
                     while not exit_event.is_set(): time.sleep(0.1)
                     break
-            elif not is_playing and (is_video or is_ply_sequence):
+            elif not is_playing and (is_video or is_glb_sequence):
                  time.sleep(0.05)
                  continue
             else:
                 print("Error: No valid input source or state.")
                 break
 
-            if not ret or (frame is None and not is_ply_sequence): # Check frame only if not PLY
-                if (is_video or is_ply_sequence) and not loop_video: break
+            if not ret: # Check if frame/GLB reading failed
+                if (is_video or is_glb_sequence) and not loop_video: break
                 time.sleep(0.1)
                 continue
 
-            # --- Process Frame (Inference or PLY Load) ---
+            # --- Process Frame (Inference or GLB Load) ---
             frame_count += 1
-            run_inference_this_frame = is_image or (frame_count % inference_interval == 0) or is_ply_sequence
+            run_inference_this_frame = (is_video or is_image) # Only run inference for non-GLB
+            process_glb_this_frame = is_glb_sequence # Flag to process loaded GLB data
 
-            if run_inference_this_frame:
+            if run_inference_this_frame or process_glb_this_frame:
                 if exit_event.is_set(): break
 
                 current_scale = scale_factor_ref[0]
@@ -571,19 +529,45 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 print(f"Processing frame {frame_count} (Seq Idx: {sequence_frame_index}) (Time since last: {current_time - last_inference_time:.2f}s)")
                 last_inference_time = current_time
 
+                # Reset per-frame data
+                rgb_frame_orig = None
+                scaled_depth_map_for_queue = None
+                edge_map_viz = None
+                smoothing_map_viz = None
+                points_xyz_np_processed = None # Use this for queuing
+                colors_np_processed = None # Use this for queuing
+                num_vertices = 0
+
                 try:
-                    # --- Get Data (Inference or PLY Load) ---
-                    if is_ply_sequence:
-                        # Data (points_xyz_np, colors_np) already loaded above
-                        # Need rgb_frame_orig for debug view if possible (use placeholder?)
-                        # Use first frame's image if available, else black
-                        rgb_frame_orig = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else np.zeros((100,100,3), dtype=np.uint8)
-                        scaled_depth_map_for_queue = None # No depth map from PLY
-                        edge_map_viz = None # No edge map from PLY
-                        smoothing_map_viz = None # No smoothing map from PLY
-                        frame_h, frame_w, _ = rgb_frame_orig.shape # Get dims from placeholder/frame
-                    else: # Live or Video/Image File -> Run Inference
+                    if is_glb_sequence:
+                        # --- Process Loaded GLB Data ---
+                        if points_xyz_np is not None:
+                            num_vertices = points_xyz_np.shape[0]
+                            points_xyz_np[:, 1] *= -1.0 # Invert Y for display
+                            points_xyz_np_processed = points_xyz_np
+                            colors_np_processed = colors_np # Already loaded or None
+                            # Create placeholders for other maps
+                            frame_h, frame_w = (100, 100) if num_vertices == 0 else (int(np.sqrt(num_vertices)), int(np.sqrt(num_vertices))) # Guess dims
+                            rgb_frame_orig = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+                            scaled_depth_map_for_queue = None
+                            edge_map_viz = None
+                            smoothing_map_viz = None
+                        else:
+                            continue # Skip if GLB load failed earlier
+
+                    else: # Live, Video File, or Image File -> Run Inference
+                        # --- Run Inference and Process ---
                         data_queue.put(("status", f"Preprocessing frame {frame_count}..."))
+
+                        # Perform scaling here, inside the else block
+                        if current_scale > 0.1:
+                            new_width = int(frame.shape[1] * current_scale)
+                            new_height = int(frame.shape[0] * current_scale)
+                            interpolation = cv2.INTER_AREA if current_scale < 1.0 else cv2.INTER_LINEAR
+                            scaled_frame = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
+                        else:
+                            scaled_frame = frame
+
                         rgb_frame_orig = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
 
                         enable_sharpening = edge_params_ref.get("enable_sharpening", False)
@@ -604,10 +588,6 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                             predictions = model.infer(frame_tensor)
 
                         points_xyz = None
-                        scaled_depth_map_for_queue = None
-                        edge_map_viz = None
-                        smoothing_map_viz = None
-
                         if 'rays' in predictions and 'depth' in predictions:
                             current_depth_map = predictions['depth'].squeeze()
 
@@ -761,84 +741,71 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         if points_xyz_to_process is None or points_xyz_to_process.numel() == 0:
                             continue
 
-                        points_xyz_np = points_xyz_to_process.squeeze().cpu().numpy()
+                        points_xyz_np_processed = points_xyz_to_process.squeeze().cpu().numpy()
 
                         # --- Invert Y Coordinate ---
-                        points_xyz_np[:, 1] *= -1.0
+                        points_xyz_np_processed[:, 1] *= -1.0
                         # -------------------------
 
                         num_vertices = 0
                         try:
-                            if points_xyz_np.ndim == 3 and points_xyz_np.shape[0] == 3:
-                                points_xyz_np = np.transpose(points_xyz_np, (1, 2, 0))
-                                num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
-                                points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
-                            elif points_xyz_np.ndim == 2 and points_xyz_np.shape[1] == 3:
-                                 num_vertices = points_xyz_np.shape[0]
-                            elif points_xyz_np.ndim == 3 and points_xyz_np.shape[2] == 3:
-                                 num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
-                                 points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
+                            if points_xyz_np_processed.ndim == 3 and points_xyz_np_processed.shape[0] == 3:
+                                points_xyz_np_processed = np.transpose(points_xyz_np_processed, (1, 2, 0))
+                                num_vertices = points_xyz_np_processed.shape[0] * points_xyz_np_processed.shape[1]
+                                points_xyz_np_processed = points_xyz_np_processed.reshape(num_vertices, 3)
+                            elif points_xyz_np_processed.ndim == 2 and points_xyz_np_processed.shape[1] == 3:
+                                 num_vertices = points_xyz_np_processed.shape[0]
+                            elif points_xyz_np_processed.ndim == 3 and points_xyz_np_processed.shape[2] == 3:
+                                 num_vertices = points_xyz_np_processed.shape[0] * points_xyz_np_processed.shape[1]
+                                 points_xyz_np_processed = points_xyz_np_processed.reshape(num_vertices, 3)
                             else:
-                                print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np.shape}")
+                                print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np_processed.shape}")
                         except Exception as e_reshape:
                                 print(f"Error reshaping points_xyz_np: {e_reshape}")
                                 num_vertices = 0
 
-                        colors_np = None
+                        colors_np_processed = None
                         if num_vertices > 0:
                             try:
                                 # Use the processed (potentially sharpened) frame for colors
                                 if rgb_frame_processed is not None and rgb_frame_processed.ndim == 3:
                                     if rgb_frame_processed.shape[0] == frame_h and rgb_frame_processed.shape[1] == frame_w:
-                                        colors_np = rgb_frame_processed.reshape(frame_h * frame_w, 3)
+                                        colors_np_processed = rgb_frame_processed.reshape(frame_h * frame_w, 3)
                                         subsample_rate = 1
                                         if subsample_rate > 1:
-                                            points_xyz_np = points_xyz_np[::subsample_rate]
-                                            colors_np = colors_np[::subsample_rate]
-                                        num_vertices = points_xyz_np.shape[0]
+                                            # points_xyz_np_processed = points_xyz_np_processed[::subsample_rate] # Reshaped already
+                                            colors_np_processed = colors_np_processed[::subsample_rate]
+                                        # num_vertices = points_xyz_np_processed.shape[0] # Already set
 
-                                        if colors_np.dtype == np.uint8:
-                                            colors_np = colors_np.astype(np.float32) / 255.0
-                                        elif colors_np.dtype == np.float32:
-                                            colors_np = np.clip(colors_np, 0.0, 1.0)
+                                        if colors_np_processed.dtype == np.uint8:
+                                            colors_np_processed = colors_np_processed.astype(np.float32) / 255.0
+                                        elif colors_np_processed.dtype == np.float32:
+                                            colors_np_processed = np.clip(colors_np_processed, 0.0, 1.0)
                                         else:
-                                            print(f"Warning: Unexpected color dtype {colors_np.dtype}, using white.")
-                                            colors_np = None
+                                            print(f"Warning: Unexpected color dtype {colors_np_processed.dtype}, using white.")
+                                            colors_np_processed = None
                                     else:
                                          print(f"Warning: Dimension mismatch between points ({frame_h}x{frame_w}) and processed frame ({rgb_frame_processed.shape[:2]})")
-                                         colors_np = None
+                                         colors_np_processed = None
                                 else:
                                     print("Warning: rgb_frame_processed invalid for color extraction.")
-                                    colors_np = None
+                                    colors_np_processed = None
 
                             except Exception as e_color_subsample:
                                 print(f"Error processing/subsampling colors: {e_color_subsample}")
-                                colors_np = None
-                                if num_vertices > 0:
-                                    points_xyz_np = points_xyz_np[::subsample_rate]
-                                    num_vertices = points_xyz_np.shape[0]
+                                colors_np_processed = None
+                                # if num_vertices > 0: # Resampling points here is tricky after reshape
+                                #     # points_xyz_np_processed = points_xyz_np_processed[::subsample_rate]
+                                #     num_vertices = points_xyz_np_processed.shape[0]
                         # --- End Color Sampling ---
+                    # --- End Inference/Processing Block ---
 
-                    # --- Process PLY Data (if loaded) ---
-                    elif is_ply_sequence:
-                        # points_xyz_np and colors_np were loaded earlier
-                        if points_xyz_np is None: continue # Skip if PLY load failed
 
-                        num_vertices = points_xyz_np.shape[0]
-                        # Invert Y for display
-                        points_xyz_np[:, 1] *= -1.0
-                        # No inference data to generate other maps
-                        rgb_frame_orig = np.zeros((100,100,3), dtype=np.uint8) # Placeholder
-                        scaled_depth_map_for_queue = None
-                        edge_map_viz = None
-                        smoothing_map_viz = None
-                    # --- End PLY Data Processing ---
-
-                    # --- Queue Data ---
+                    # --- Common Post-Processing & Queuing ---
                     if num_vertices > 0:
-                        vertices_flat = points_xyz_np.flatten()
-                        if colors_np is not None:
-                            colors_flat = colors_np.flatten()
+                        vertices_flat = points_xyz_np_processed.flatten()
+                        if colors_np_processed is not None:
+                            colors_flat = colors_np_processed.flatten()
                         else:
                             colors_np_white = np.ones((num_vertices, 3), dtype=np.float32)
                             colors_flat = colors_np_white.flatten()
@@ -849,9 +816,11 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         current_recorded_count = 0 # Default value
                         if is_recording:
                             recorded_frame_counter += 1
-                            ply_filename = os.path.join(output_dir, f"frame_{recorded_frame_counter:05d}.ply")
+                            # Use sequence_frame_index for GLB naming if available and non-zero, else use recorded_frame_counter
+                            save_index = sequence_frame_index if (is_video or is_glb_sequence) and sequence_frame_index > 0 else recorded_frame_counter
+                            glb_filename = os.path.join(output_dir, f"frame_{save_index:05d}.glb")
                             # Save points with original Y coordinate
-                            save_ply(ply_filename, points_xyz_np * np.array([1,-1,1]), colors_np)
+                            save_glb(glb_filename, points_xyz_np_processed * np.array([1,-1,1]), colors_np_processed)
                             current_recorded_count = recorded_frame_counter
                             if recorded_frame_counter % 10 == 0:
                                 data_queue.put(("status", f"Recording frame {recorded_frame_counter}..."))
@@ -872,10 +841,17 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
                             data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
                     else:
-                        pass # No vertices to process
+                        # If no vertices generated/loaded, still send minimal update for UI
+                         if not data_queue.full():
+                                data_queue.put((None, None, 0,
+                                                rgb_frame_orig if rgb_frame_orig is not None else np.zeros((100,100,3), dtype=np.uint8),
+                                                None, None, None, t_capture,
+                                                sequence_frame_index, video_total_frames,
+                                                recorded_frame_counter if is_recording else 0))
 
-                except Exception as e_infer:
-                    print(f"Error during inference/processing for frame {frame_count}: {e_infer}")
+
+                except Exception as e_main_proc:
+                    print(f"Error during main processing loop for frame {frame_count}: {e_main_proc}")
                     traceback.print_exc()
 
             # Only sleep if processing live video to avoid busy loop
@@ -1337,7 +1313,13 @@ class LiveViewerWindow(pyglet.window.Window):
                                  print(f"Error creating vertex list: {e_create}")
                                  traceback.print_exc()
                         else:
-                            self.frame_count_display += 1
+                            # If no vertices, clear the list to avoid drawing stale points
+                            if self.vertex_list:
+                                try: self.vertex_list.delete()
+                                except Exception: pass
+                                self.vertex_list = None
+                                self.current_point_count = 0
+                            self.frame_count_display += 1 # Still increment frame count
 
                     except Exception as e_unpack:
                         print(f"Error unpacking or processing data: {e_unpack}")
@@ -1350,7 +1332,7 @@ class LiveViewerWindow(pyglet.window.Window):
     def update_camera(self, dt):
         """Scheduled function to handle camera movement based on key states."""
         io = imgui.get_io()
-        if io.want_capture_keyboard: return
+        if io.want_capture_keyboard or io.want_capture_mouse: return # Check mouse capture too
 
         speed = self.fast_move_speed if self.keys[key.LSHIFT] or self.keys[key.RSHIFT] else self.move_speed
         move_amount = speed * dt
@@ -1447,12 +1429,12 @@ class LiveViewerWindow(pyglet.window.Window):
         root = tk.Tk()
         root.withdraw() # Hide the main tkinter window
         # Ask for directory first
-        dir_path = filedialog.askdirectory(title="Select PLY Sequence Directory")
+        dir_path = filedialog.askdirectory(title="Select GLB Sequence Directory")
         if dir_path:
              file_path = dir_path # Treat directory as the selection
              print(f"DEBUG: Directory selected: {file_path}")
              self.input_filepath = file_path
-             self.input_mode = "File" # Let thread determine if it's PLY sequence
+             self.input_mode = "GLB Sequence" # Explicitly set mode
              self.status_message = f"Directory selected: {os.path.basename(file_path)}"
         else: # If directory selection cancelled, ask for file
             file_path = filedialog.askopenfilename(
@@ -1465,7 +1447,7 @@ class LiveViewerWindow(pyglet.window.Window):
             if file_path:
                 print(f"DEBUG: File selected: {file_path}")
                 self.input_filepath = file_path
-                self.input_mode = "File"
+                self.input_mode = "File" # Set mode to generic File
                 self.status_message = f"File selected: {os.path.basename(file_path)}"
             else:
                 print("DEBUG: File selection cancelled.")
@@ -1591,8 +1573,8 @@ class LiveViewerWindow(pyglet.window.Window):
                 elif self.input_mode == "File":
                     status_text = f"Status: Processing File ({os.path.basename(self.input_filepath)})"
                     status_color = (0.1, 0.6, 1.0, 1.0) # Blue
-                elif self.input_mode == "PLY Sequence":
-                     status_text = f"Status: Playing PLY Sequence ({os.path.basename(self.input_filepath)})"
+                elif self.input_mode == "GLB Sequence":
+                     status_text = f"Status: Playing GLB Sequence ({os.path.basename(self.input_filepath)})"
                      status_color = (1.0, 0.6, 0.1, 1.0) # Orange
             elif "Error" in self.status_message:
                  status_text = f"Status: Error"
@@ -1609,21 +1591,25 @@ class LiveViewerWindow(pyglet.window.Window):
                     self.input_filepath = "" # Clear filepath for live mode
                     self.start_inference_thread() # Restart thread
             imgui.same_line()
-            if imgui.radio_button("File/Sequence##InputMode", self.input_mode != "Live"): # Combine File/PLY
-                 # Don't change mode here, let browse handle it or keep current file
-                 pass # Button just indicates current state is not Live
-                 # If user wants to switch *back* to file after live, they must browse
+            # Combined File/Sequence button logic
+            is_file_mode = self.input_mode == "File" or self.input_mode == "GLB Sequence"
+            if imgui.radio_button("File/Sequence##InputMode", is_file_mode):
+                 if not is_file_mode: # If switching TO file mode from Live
+                    self.input_mode = "File" # Default to generic file initially
+                    # Stop live thread if running, but don't start new one yet
+                    if self.inference_thread and self.inference_thread.is_alive():
+                        self.start_inference_thread()
 
             imgui.text("Source:")
             imgui.same_line()
             display_path = self.input_filepath if self.input_filepath else "None (Using Live Camera)"
-            if self.input_mode == "PLY Sequence": display_path += " (PLY Sequence)"
+            if self.input_mode == "GLB Sequence": display_path += " (GLB Sequence)"
             imgui.text_disabled(display_path)
 
             if imgui.button("Browse File/Dir..."):
-                self._browse_file() # This handles setting mode and restarting thread
+                self._browse_file() # Handles setting mode and restarting thread
 
-            # --- Playback Controls (Visible only for File mode video/PLY) ---
+            # --- Playback Controls (Visible only for File mode video/GLB) ---
             if self.input_mode != "Live" and self.video_total_frames > 0:
                 imgui.separator()
                 imgui.text("Playback:")
