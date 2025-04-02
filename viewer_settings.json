@@ -1,0 +1,13 @@
+{
+    "render_mode": 1,
+    "falloff_factor": 5.0,
+    "saturation": 1.7899999618530273,
+    "brightness": 1.2710000276565552,
+    "contrast": 1.100000023841858,
+    "sharpness": 1.1729999780654907,
+    "point_size_boost": 3.765000104904175,
+    "input_scale_factor": 0.8999999761581421,
+    "enable_point_smoothing": true,
+    "show_camera_feed": true,
+    "show_depth_map": true
+}
