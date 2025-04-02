@@ -48,11 +48,52 @@ DEFAULT_SETTINGS = {
     "gradient_influence_scale": 1.0,
     "playback_speed": 1.0, # For video files
     "loop_video": True, # For video files
+    "is_recording": False, # Recording state
+    "recording_output_dir": "recording_output", # Default output dir
     "show_camera_feed": False,
     "show_depth_map": False,
     "show_edge_map": False,
     "show_smoothing_map": False,
 }
+
+# --- PLY Saving Helper ---
+def save_ply(filepath, points, colors=None):
+    """Saves a point cloud to an ASCII PLY file."""
+    try:
+        num_points = points.shape[0]
+        header = [
+            "ply",
+            "format ascii 1.0",
+            f"element vertex {num_points}",
+            "property float x",
+            "property float y",
+            "property float z",
+        ]
+        if colors is not None:
+            header.extend([
+                "property uchar red",
+                "property uchar green",
+                "property uchar blue",
+            ])
+        header.append("end_header")
+
+        with open(filepath, 'w') as f:
+            for line in header:
+                f.write(line + '\n')
+
+            for i in range(num_points):
+                line = f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f}"
+                if colors is not None:
+                    # Assuming colors are float 0-1, convert to uchar 0-255
+                    r = int(np.clip(colors[i, 0] * 255, 0, 255))
+                    g = int(np.clip(colors[i, 1] * 255, 0, 255))
+                    b = int(np.clip(colors[i, 2] * 255, 0, 255))
+                    line += f" {r} {g} {b}"
+                f.write(line + '\n')
+        # print(f"Saved {filepath}") # Optional: Log saving
+    except Exception as e:
+        print(f"Error saving PLY file {filepath}: {e}")
+
 
 # Simple shaders (Using 'vertices' instead of 'position')
 vertex_source = """#version 150 core
@@ -224,7 +265,8 @@ texture_fragment_source = """#version 150 core
 # --- Inference Thread Function ---
 def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
                           scale_factor_ref, edge_params_ref,
-                          input_mode, input_filepath, playback_state_ref): # Added playback state
+                          input_mode, input_filepath, playback_state_ref,
+                          recording_state_ref): # Added recording state
     """Loads model, captures camera/video/image, runs inference, puts results in queue."""
     print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}")
     data_queue.put(("status", f"Inference thread started ({input_mode})..."))
@@ -235,6 +277,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
     video_total_frames = 0
     video_fps = 30 # Default assumption
     image_frame = None # Store loaded image frame
+    recorded_frame_counter = 0 # Counter for saved frames
 
     try:
         # --- Load Model ---
@@ -663,6 +706,19 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                             colors_np_white = np.ones((num_vertices, 3), dtype=np.float32)
                             colors_flat = colors_np_white.flatten()
 
+                        # --- Recording Logic ---
+                        is_recording = recording_state_ref.get("is_recording", False)
+                        output_dir = recording_state_ref.get("output_dir", "recording_output")
+                        if is_recording:
+                            # Use a dedicated counter for recorded frames
+                            recorded_frame_counter += 1
+                            ply_filename = os.path.join(output_dir, f"frame_{recorded_frame_counter:05d}.ply")
+                            save_ply(ply_filename, points_xyz_np, colors_np)
+                            # Update status only occasionally to avoid flooding queue
+                            if recorded_frame_counter % 10 == 0:
+                                data_queue.put(("status", f"Recording frame {recorded_frame_counter}..."))
+                        # ---------------------
+
                         # Put all data into queue
                         if not data_queue.full():
                                 data_queue.put((vertices_flat, colors_flat, num_vertices,
@@ -672,7 +728,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                                 smoothing_map_viz,
                                                 t_capture,
                                                 video_frame_index, # Pass video playback info
-                                                video_total_frames))
+                                                video_total_frames,
+                                                recorded_frame_counter if is_recording else 0)) # Pass recorded count
                         else:
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
                             data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
@@ -746,6 +803,8 @@ class LiveViewerWindow(pyglet.window.Window):
         self.gradient_influence_scale = None
         self.playback_speed = None
         self.loop_video = None
+        self.is_recording = None # Added
+        self.recording_output_dir = None # Added
         self.show_camera_feed = None
         self.show_depth_map = None
         self.show_edge_map = None
@@ -753,12 +812,15 @@ class LiveViewerWindow(pyglet.window.Window):
         self.scale_factor_ref = None # Initialized in load_settings
         self.edge_params_ref = {} # Dictionary to pass edge params to thread
         self.playback_state_ref = {} # Dictionary for playback control
+        self.recording_state_ref = {} # Dictionary for recording control
 
         # --- Playback State ---
         self.is_playing = True # Separate from ref for UI interaction
         self.video_total_frames = 0
         self.video_current_frame = 0
 
+        # --- Recording State ---
+        self.recorded_frame_count = 0 # UI display counter
 
         # --- Debug View State ---
         self.latest_rgb_frame = None
@@ -976,6 +1038,8 @@ class LiveViewerWindow(pyglet.window.Window):
              self.update_edge_params_ref()
         if not hasattr(self, 'playback_state_ref') or not self.playback_state_ref:
              self.update_playback_state_ref() # Initialize playback ref
+        if not hasattr(self, 'recording_state_ref') or not self.recording_state_ref:
+             self.update_recording_state_ref() # Initialize recording ref
 
         # Start new thread with current settings
         self.inference_thread = threading.Thread(
@@ -985,7 +1049,8 @@ class LiveViewerWindow(pyglet.window.Window):
                   self.edge_params_ref,
                   self.input_mode, # Pass current mode
                   self.input_filepath, # Pass current filepath
-                  self.playback_state_ref), # Pass playback state dict
+                  self.playback_state_ref, # Pass playback state dict
+                  self.recording_state_ref), # Pass recording state dict
             daemon=True
         )
         self.inference_thread.start()
@@ -1016,6 +1081,11 @@ class LiveViewerWindow(pyglet.window.Window):
         # self.playback_state_ref["restart"] = False # Don't reset restart flag here
         # Total frames and current frame are updated by the thread
 
+    def update_recording_state_ref(self):
+        """Updates the dictionary passed to the inference thread for recording."""
+        self.recording_state_ref["is_recording"] = self.is_recording
+        self.recording_state_ref["output_dir"] = self.recording_output_dir
+
 
     def update(self, dt):
         """Scheduled function to process data from the inference thread."""
@@ -1032,15 +1102,17 @@ class LiveViewerWindow(pyglet.window.Window):
                 else:
                     # --- Process actual vertex and image data ---
                     try:
-                        # Unpack new data format including playback info
+                        # Unpack new data format including recording info
                         vertices_data, colors_data, num_vertices_actual, \
                         rgb_frame_np, depth_map_tensor, edge_map_viz_np, \
                         smoothing_map_viz_np, t_capture, \
-                        current_frame_idx, total_frames = latest_data # Added playback info
+                        current_frame_idx, total_frames, \
+                        recorded_count = latest_data # Added recording count
 
                         self.last_capture_timestamp = t_capture
                         self.video_current_frame = current_frame_idx
                         self.video_total_frames = total_frames
+                        self.recorded_frame_count = recorded_count # Update UI counter
 
                         # --- Update Debug Views ---
                         self.latest_rgb_frame = rgb_frame_np
@@ -1177,6 +1249,8 @@ class LiveViewerWindow(pyglet.window.Window):
         self.update_edge_params_ref()
         # Update playback state ref dictionary
         self.update_playback_state_ref()
+        # Update recording state ref dictionary
+        self.update_recording_state_ref()
 
 
     def save_settings(self, filename="viewer_settings.json"):
@@ -1226,7 +1300,8 @@ class LiveViewerWindow(pyglet.window.Window):
         # Ensure reference dicts are updated/created *after* loading/defaults
         self.scale_factor_ref = [self.input_scale_factor]
         self.update_edge_params_ref()
-        self.update_playback_state_ref() # Initialize playback ref
+        self.update_playback_state_ref()
+        self.update_recording_state_ref() # Initialize recording ref
 
 
     def _browse_file(self):
@@ -1341,7 +1416,7 @@ class LiveViewerWindow(pyglet.window.Window):
 
         # --- Controls Panel ---
         imgui.set_next_window_position(self.width - 310, 10, imgui.ONCE) # Position bottom-rightish once
-        imgui.set_next_window_size(300, 700, imgui.ONCE) # Increased height further
+        imgui.set_next_window_size(300, 750, imgui.ONCE) # Increased height further
         imgui.begin("Controls", True) # True = closable window
 
         # --- Presets ---
@@ -1354,7 +1429,6 @@ class LiveViewerWindow(pyglet.window.Window):
 
         # --- Input Source Section ---
         if imgui.collapsing_header("Input Source", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-            mode_changed = False
             # Determine current status text and color
             status_text = "Status: Idle"
             status_color = (0.5, 0.5, 0.5, 1.0) # Gray
@@ -1367,7 +1441,6 @@ class LiveViewerWindow(pyglet.window.Window):
                 elif self.input_mode == "File":
                     status_text = f"Status: Processing File ({os.path.basename(self.input_filepath)})"
                     status_color = (0.1, 0.6, 1.0, 1.0) # Blue
-            # Check status message for specific states if thread isn't running
             elif "Error" in self.status_message:
                  status_text = f"Status: Error"
                  status_color = (1.0, 0.1, 0.1, 1.0) # Red
@@ -1384,11 +1457,13 @@ class LiveViewerWindow(pyglet.window.Window):
             imgui.same_line()
             if imgui.radio_button("File##InputMode", self.input_mode == "File"):
                 if self.input_mode != "File":
-                    # Don't immediately restart, wait for file selection or browse
                     self.input_mode = "File"
-                    # Stop live thread if it was running
-                    if self.inference_thread and self.inference_thread.is_alive():
-                        self.start_inference_thread() # Call to stop existing thread
+                    # If no file selected yet, don't start, wait for browse
+                    if self.input_filepath:
+                        self.start_inference_thread()
+                    else: # Stop live thread if running
+                         if self.inference_thread and self.inference_thread.is_alive():
+                            self.start_inference_thread() # Call to stop existing thread
 
             imgui.text("File:")
             imgui.same_line()
@@ -1416,6 +1491,35 @@ class LiveViewerWindow(pyglet.window.Window):
 
                 # Simple frame display
                 imgui.text(f"Frame: {self.video_current_frame} / {self.video_total_frames}")
+
+        # --- Recording Section ---
+        if imgui.collapsing_header("Recording", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            rec_button_text = " Stop Recording " if self.is_recording else " Start Recording "
+            if imgui.button(rec_button_text):
+                self.is_recording = not self.is_recording
+                if self.is_recording:
+                    # Create directory if it doesn't exist
+                    try:
+                        os.makedirs(self.recording_output_dir, exist_ok=True)
+                        self.recorded_frame_count = 0 # Reset counter
+                        self.status_message = f"Recording started to {self.recording_output_dir}"
+                    except Exception as e_dir:
+                        print(f"Error creating recording directory: {e_dir}")
+                        self.status_message = "Error creating recording dir!"
+                        self.is_recording = False # Abort recording
+                else:
+                    self.status_message = f"Recording stopped. {self.recorded_frame_count} frames saved."
+                self.update_recording_state_ref() # Update thread state
+
+            imgui.same_line()
+            imgui.text(f"({self.recorded_frame_count} frames)")
+
+            # Use input_text for directory path
+            changed_dir, self.recording_output_dir = imgui.input_text(
+                "Output Dir", self.recording_output_dir, 256
+            )
+            if changed_dir and not self.is_recording: # Update ref only if not recording
+                 self.update_recording_state_ref()
 
 
         # --- Rendering Section ---
