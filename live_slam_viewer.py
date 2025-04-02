@@ -69,12 +69,15 @@ def save_ply(filepath, points, colors=None):
             "property float y",
             "property float z",
         ]
-        if colors is not None:
+        if colors is not None and colors.shape[0] == num_points:
             header.extend([
                 "property uchar red",
                 "property uchar green",
                 "property uchar blue",
             ])
+        else:
+            colors = None # Don't write colors if invalid
+
         header.append("end_header")
 
         with open(filepath, 'w') as f:
@@ -82,7 +85,8 @@ def save_ply(filepath, points, colors=None):
                 f.write(line + '\n')
 
             for i in range(num_points):
-                line = f"{points[i, 0]:.6f} {points[i, 1]:.6f} {points[i, 2]:.6f}"
+                # Invert Y coordinate back for saving PLY
+                line = f"{points[i, 0]:.6f} {-points[i, 1]:.6f} {points[i, 2]:.6f}"
                 if colors is not None:
                     # Assuming colors are float 0-1, convert to uchar 0-255
                     r = int(np.clip(colors[i, 0] * 255, 0, 255))
@@ -368,6 +372,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     video_frame_index = 0
                     playback_state_ref["current_frame"] = 0
+                    recorded_frame_counter = 0 # Reset recording counter on video restart
                     print("DEBUG: Video restarted.")
                 playback_state_ref["restart"] = False # Consume restart flag
 
@@ -392,6 +397,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                             video_frame_index = 0
                             playback_state_ref["current_frame"] = 0
+                            recorded_frame_counter = 0 # Reset recording counter on loop
                             if exit_event.is_set(): break # Check before blocking read
                             ret, frame = cap.read() # Read the first frame again
                             if not ret:
@@ -709,11 +715,14 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         # --- Recording Logic ---
                         is_recording = recording_state_ref.get("is_recording", False)
                         output_dir = recording_state_ref.get("output_dir", "recording_output")
+                        current_recorded_count = 0 # Default value
                         if is_recording:
                             # Use a dedicated counter for recorded frames
                             recorded_frame_counter += 1
                             ply_filename = os.path.join(output_dir, f"frame_{recorded_frame_counter:05d}.ply")
-                            save_ply(ply_filename, points_xyz_np, colors_np)
+                            # Pass the original points_xyz_np before Y-inversion for saving
+                            save_ply(ply_filename, points_xyz_to_process.squeeze().cpu().numpy(), colors_np)
+                            current_recorded_count = recorded_frame_counter
                             # Update status only occasionally to avoid flooding queue
                             if recorded_frame_counter % 10 == 0:
                                 data_queue.put(("status", f"Recording frame {recorded_frame_counter}..."))
@@ -729,7 +738,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                                 t_capture,
                                                 video_frame_index, # Pass video playback info
                                                 video_total_frames,
-                                                recorded_frame_counter if is_recording else 0)) # Pass recorded count
+                                                current_recorded_count)) # Pass recorded count
                         else:
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
                             data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
