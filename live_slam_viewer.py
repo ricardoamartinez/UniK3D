@@ -63,6 +63,7 @@ DEFAULT_SETTINGS = {
     "show_input_fps_overlay": False,
     "show_depth_fps_overlay": False,
     "show_latency_overlay": False,
+    "live_processing_mode": "Real-time", # "Real-time" or "Buffered"
 }
 
 # --- GLB Saving Helper ---
@@ -793,8 +794,8 @@ def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices, rgb_fra
 # --- Main Inference Thread Function (Refactored) ---
 def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
                           scale_factor_ref, edge_params_ref,
-                          input_mode, input_filepath, playback_state, # Renamed parameter
-                          recording_state_ref):
+                          input_mode, input_filepath, playback_state,
+                          recording_state, live_processing_mode): # Corrected params
     """Loads model, captures/loads data, runs inference, processes, and queues results."""
     print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}")
     data_queue.put(("status", f"Inference thread started ({input_mode})..."))
@@ -849,19 +850,59 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         last_depth_processed_time = time.time() # For depth/processing FPS calculation
 
         while not exit_event.is_set():
-            t_capture = time.time()
+            frame = None
+            points_xyz_np_loaded = None
+            colors_np_loaded = None
+            ret = False
+            frame_read_delta_t = 0.0
+            end_of_stream = False
+            t_capture = time.time() # Capture time at loop start for latency
 
-            # --- Read/Load Frame ---
-            frame, points_xyz_np_loaded, colors_np_loaded, ret, \
-            sequence_frame_index, frame_read_delta_t, end_of_stream = \
-                _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index,
-                                   playback_state, last_frame_read_time_ref, video_fps, # Pass renamed playback_state dict
-                                   is_video, is_image, is_glb_sequence, image_frame,
-                                   frame_count, data_queue, frame_source_name)
+            # --- Frame Acquisition Logic ---
+            if input_mode == "Live" and is_video and cap:
+                if live_processing_mode == "Real-time":
+                    # Grab latest frame, discard older ones
+                    grabbed = False
+                    # Limit grabs? Or just grab until retrieve? Let's try simple grab/retrieve first.
+                    # for _ in range(5): # Optional: Limit grabs to avoid blocking?
+                    #     if not cap.grab(): break
+                    if cap.grab(): # Grab the latest frame internally
+                         t_capture = time.time() # Update capture time closer to actual frame
+                         ret, frame = cap.retrieve() # Decode and return the grabbed frame
+                         if ret:
+                             current_time = time.time()
+                             frame_read_delta_t = current_time - last_frame_read_time_ref[0]
+                             last_frame_read_time_ref[0] = current_time
+                             # sequence_frame_index doesn't make sense here, maybe use frame_count?
+                             playback_state["current_frame"] = frame_count + 1 # Update for UI display?
+                         else:
+                             print("Warning: Failed to retrieve frame in Real-time mode.")
+                             time.sleep(0.01) # Avoid busy loop on retrieve error
+                             continue # Skip processing this cycle
+                    else:
+                        print("Warning: Failed to grab frame in Real-time mode.")
+                        time.sleep(0.01) # Avoid busy loop on grab error
+                        continue # Skip processing this cycle
+
+                else: # Buffered mode for Live Camera
+                    frame, _, _, ret, sequence_frame_index, frame_read_delta_t, end_of_stream = \
+                        _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index,
+                                           playback_state, last_frame_read_time_ref, video_fps,
+                                           is_video, is_image, is_glb_sequence, image_frame,
+                                           frame_count, data_queue, frame_source_name)
+            else: # File, GLB Sequence, or Image mode
+                 frame, points_xyz_np_loaded, colors_np_loaded, ret, \
+                 sequence_frame_index, frame_read_delta_t, end_of_stream = \
+                     _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index,
+                                        playback_state, last_frame_read_time_ref, video_fps,
+                                        is_video, is_image, is_glb_sequence, image_frame,
+                                        frame_count, data_queue, frame_source_name)
+
+            # --- Loop/End/Skip Checks ---
             # Check if sequence looped or restarted (index reset by _read_or_load_frame)
             # Reset recorder counter accordingly
             # Use frame_count > 1 to avoid resetting on the very first frame
-            if frame_count > 1 and sequence_frame_index <= 1:
+            if frame_count > 1 and sequence_frame_index <= 1 and input_mode != "Live": # Only reset for sequences/files
                  if recorded_frame_counter > 0: # Only reset if it was actually counting
                     print("DEBUG: Resetting recorded frame counter due to loop/restart.")
                     recorded_frame_counter = 0
@@ -869,7 +910,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             if end_of_stream:
                 break # Exit loop if end of file/sequence and not looping
 
-            if not ret: # If no frame was read (e.g., paused or waiting for next frame time)
+            if not ret: # If no frame was read/retrieved (e.g., paused or error)
                 continue
 
             # --- Process Frame ---
@@ -962,11 +1003,17 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             vertices_flat = points_xyz_np_processed.flatten() if points_xyz_np_processed is not None else None
             colors_flat = colors_np_processed.flatten() if colors_np_processed is not None else None
 
-            _queue_results(data_queue, vertices_flat, colors_flat, num_vertices,
-                           rgb_frame_orig, scaled_depth_map_for_queue, edge_map_viz,
-                           smoothing_map_viz, t_capture, sequence_frame_index,
-                           video_total_frames, recorded_frame_counter, frame_count,
-                           frame_read_delta_t, depth_process_delta_t, latency_ms) # Pass timing
+            # --- Queue Results (with Real-time handling) ---
+            if input_mode == "Live" and live_processing_mode == "Real-time" and data_queue.full():
+                print(f"Warning: Viewer queue full in Real-time mode, dropping frame {frame_count}.")
+                # Skip queuing to prioritize processing next frame
+            else:
+                # Queue normally for Buffered mode or if queue is not full
+                _queue_results(data_queue, vertices_flat, colors_flat, num_vertices,
+                               rgb_frame_orig, scaled_depth_map_for_queue, edge_map_viz,
+                               smoothing_map_viz, t_capture, sequence_frame_index,
+                               video_total_frames, recorded_frame_counter, frame_count,
+                               frame_read_delta_t, depth_process_delta_t, latency_ms) # Pass timing
 
             # Short sleep for live mode to prevent busy loop
             if is_video and input_mode == "Live":
@@ -1039,6 +1086,7 @@ class LiveViewerWindow(pyglet.window.Window):
         self.show_input_fps_overlay = None
         self.show_depth_fps_overlay = None
         self.show_latency_overlay = None
+        self.live_processing_mode = None # Added attribute
         self.scale_factor_ref = None # Initialized in load_settings
         self.edge_params_ref = {} # Dictionary to pass edge params to thread
         self.playback_state = {} # Dictionary for playback control
@@ -1299,7 +1347,8 @@ class LiveViewerWindow(pyglet.window.Window):
                   self.input_mode, # Pass current mode
                   self.input_filepath, # Pass current filepath
                   self.playback_state, # Pass playback state dict
-                  self.recording_state), # Pass recording state dict
+                  self.recording_state, # Pass recording state dict
+                  self.live_processing_mode), # Pass live processing mode
             daemon=True
         )
         self.inference_thread.start()
@@ -1735,6 +1784,35 @@ class LiveViewerWindow(pyglet.window.Window):
                 if self.input_mode == "GLB Sequence": display_path += " (GLB Sequence)"
                 imgui.text_wrapped(display_path)
                 imgui.pop_item_width()
+
+                # Live Processing Mode (Only show if Live Camera is selected)
+                if self.input_mode == "Live":
+                    imgui.separator()
+                    imgui.text("Live Processing Mode:")
+                    mode_changed = False
+                    if imgui.radio_button("Real-time (Low Latency)", self.live_processing_mode == "Real-time"):
+                        if self.live_processing_mode != "Real-time":
+                            self.live_processing_mode = "Real-time"
+                            mode_changed = True
+                    imgui.same_line()
+                    if imgui.radio_button("Buffered (Process All Frames)", self.live_processing_mode == "Buffered"):
+                         if self.live_processing_mode != "Buffered":
+                            self.live_processing_mode = "Buffered"
+                            mode_changed = True
+                    if mode_changed:
+                        # Restart thread with new mode if it's currently running
+                        if self.inference_thread and self.inference_thread.is_alive():
+                            print(f"Switching live processing mode to {self.live_processing_mode}, restarting thread...")
+                            self.start_inference_thread()
+                    if imgui.radio_button("Buffered (Process All Frames)", self.live_processing_mode == "Buffered"):
+                         if self.live_processing_mode != "Buffered":
+                            self.live_processing_mode = "Buffered"
+                            mode_changed = True
+                    if mode_changed:
+                        # Restart thread with new mode if it's currently running
+                        if self.inference_thread and self.inference_thread.is_alive():
+                            print(f"Switching live processing mode to {self.live_processing_mode}, restarting thread...")
+                            self.start_inference_thread()
 
                 imgui.separator()
                 imgui.text("Recording")
