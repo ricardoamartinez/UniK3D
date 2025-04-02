@@ -10,6 +10,8 @@ import queue # For thread-safe communication
 import cv2 # For camera capture
 import torch # For UniK3D model and tensors
 import json # For saving/loading settings
+import tkinter as tk
+from tkinter import filedialog
 
 # Assuming unik3d is installed and importable
 from unik3d.models import UniK3D
@@ -23,12 +25,15 @@ from imgui.integrations.pyglet import create_renderer
 
 # Default settings dictionary
 DEFAULT_SETTINGS = {
+    "input_mode": "Live", # "Live" or "File"
+    "input_filepath": "",
     "render_mode": 2, # 0=Square, 1=Circle, 2=Gaussian
     "falloff_factor": 5.0,
     "saturation": 1.5,
     "brightness": 1.0,
     "contrast": 1.1,
     "sharpness": 1.1,
+    "enable_sharpening": False,
     "point_size_boost": 2.5,
     "input_scale_factor": 0.9,
     "enable_point_smoothing": True,
@@ -40,7 +45,9 @@ DEFAULT_SETTINGS = {
     "rgb_edge_threshold1": 50.0,
     "rgb_edge_threshold2": 150.0,
     "edge_smoothing_influence": 0.7,
-    "gradient_influence_scale": 1.0, # How much depth gradient scales edge influence
+    "gradient_influence_scale": 1.0,
+    "playback_speed": 1.0, # For video files
+    "loop_video": True, # For video files
     "show_camera_feed": False,
     "show_depth_map": False,
     "show_edge_map": False,
@@ -216,10 +223,19 @@ texture_fragment_source = """#version 150 core
 
 # --- Inference Thread Function ---
 def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
-                          scale_factor_ref, edge_params_ref):
-    """Loads model, captures camera, runs inference, puts results in queue."""
-    print("Inference thread started.")
-    data_queue.put(("status", "Inference thread started..."))
+                          scale_factor_ref, edge_params_ref,
+                          input_mode, input_filepath, playback_state_ref): # Added playback state
+    """Loads model, captures camera/video/image, runs inference, puts results in queue."""
+    print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}")
+    data_queue.put(("status", f"Inference thread started ({input_mode})..."))
+    cap = None # Video capture object
+    is_video = False
+    is_image = False
+    frame_source_name = "Live Camera"
+    video_total_frames = 0
+    video_fps = 30 # Default assumption
+    image_frame = None # Store loaded image frame
+
     try:
         # --- Load Model ---
         print(f"Loading UniK3D model: {model_name}...")
@@ -232,33 +248,141 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         print("Model loaded.")
         data_queue.put(("status", "Model loaded."))
 
-        # --- Initialize Camera ---
-        print("Initializing camera...")
-        data_queue.put(("status", "Initializing camera..."))
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("Error: Could not open camera.")
-            data_queue.put(("error", "Could not open camera."))
+        # --- Initialize Input Source ---
+        if input_mode == "Live":
+            print("Initializing camera...")
+            data_queue.put(("status", "Initializing camera..."))
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("Error: Could not open camera.")
+                data_queue.put(("error", "Could not open camera."))
+                return
+            is_video = True # Treat live feed as a video stream
+            frame_source_name = "Live Camera"
+            video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+            print("Camera initialized.")
+            data_queue.put(("status", "Camera initialized."))
+        elif input_mode == "File" and input_filepath and os.path.exists(input_filepath):
+            frame_source_name = os.path.basename(input_filepath)
+            print(f"Initializing video capture for file: {input_filepath}")
+            data_queue.put(("status", f"Opening file: {frame_source_name}..."))
+            cap = cv2.VideoCapture(input_filepath)
+            if cap.isOpened():
+                is_video = True
+                video_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+                playback_state_ref["total_frames"] = video_total_frames # Update main thread state
+                playback_state_ref["current_frame"] = 0
+                print(f"Video file opened successfully ({video_total_frames} frames @ {video_fps:.2f} FPS).")
+                data_queue.put(("status", f"Opened video: {frame_source_name}"))
+            else:
+                print("Failed to open as video, trying as image...")
+                try:
+                    image_frame = cv2.imread(input_filepath) # Load image frame here
+                    if image_frame is not None:
+                        is_image = True
+                        print("Image file loaded successfully.")
+                        data_queue.put(("status", f"Loaded image: {frame_source_name}"))
+                    else:
+                        print(f"Error: Could not read file as video or image: {input_filepath}")
+                        data_queue.put(("error", f"Cannot open file: {frame_source_name}"))
+                        return
+                except Exception as e_img:
+                    print(f"Error reading file as image: {input_filepath} - {e_img}")
+                    data_queue.put(("error", f"Error reading file: {frame_source_name}"))
+                    return
+        else:
+            print(f"Error: Invalid input mode or file path: {input_mode}, {input_filepath}")
+            data_queue.put(("error", "Invalid input source specified."))
             return
-        print("Camera initialized.")
-        data_queue.put(("status", "Camera initialized."))
 
-        frame_count = 0
+        # --- Start of main loop logic ---
+        frame_count = 0 # Overall frames processed by thread
+        video_frame_index = 0 # Current frame index for video file
         last_inference_time = time.time()
-
-        # --- Temporal Smoothing & Motion Init ---
+        last_frame_read_time = time.time() # For playback speed control
         smoothed_points_xyz = None
         depth_motion_threshold = 0.1
         prev_depth_map = None
         smoothed_mean_depth = None
         prev_scale_factor = None
-        # -----------------------------
+        min_alpha_scale = 0.0
+        max_alpha_scale = 1.0
 
-        while not exit_event.is_set():
+        while not exit_event.is_set(): # Check exit event at start of loop
             t_capture = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                print("Error: Failed to capture frame.")
+            frame = None
+            ret = False
+
+            # --- Playback Control & Frame Reading ---
+            is_playing = playback_state_ref.get("is_playing", True)
+            playback_speed = playback_state_ref.get("speed", 1.0)
+            loop_video = playback_state_ref.get("loop", True)
+            restart_video = playback_state_ref.get("restart", False)
+
+            if restart_video:
+                if is_video and cap:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    video_frame_index = 0
+                    playback_state_ref["current_frame"] = 0
+                    print("DEBUG: Video restarted.")
+                playback_state_ref["restart"] = False # Consume restart flag
+
+            read_next_frame = is_playing or is_image # Read if playing or if it's the first image frame
+
+            if is_video and cap and read_next_frame:
+                # Calculate target time for next frame based on speed
+                target_delta = (1.0 / video_fps) / playback_speed if video_fps > 0 and playback_speed > 0 else 0.1 # Avoid division by zero
+                time_since_last_read = time.time() - last_frame_read_time
+
+                if time_since_last_read >= target_delta:
+                    if exit_event.is_set(): break # Check before blocking read
+                    ret, frame = cap.read()
+                    last_frame_read_time = time.time()
+                    if ret:
+                        video_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) # Get current frame index
+                        playback_state_ref["current_frame"] = video_frame_index
+                    else:
+                        # End of video
+                        if loop_video:
+                            print("Looping video.")
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            video_frame_index = 0
+                            playback_state_ref["current_frame"] = 0
+                            if exit_event.is_set(): break # Check before blocking read
+                            ret, frame = cap.read() # Read the first frame again
+                            if not ret:
+                                print("Error reading first frame after loop.")
+                                break
+                        else:
+                            print("End of video file.")
+                            data_queue.put(("status", f"Finished processing: {frame_source_name}"))
+                            break # Exit loop
+                else:
+                    # Wait for the correct time to display the next frame
+                    sleep_time = target_delta - time_since_last_read
+                    time.sleep(max(0.001, sleep_time)) # Sleep but ensure minimum delay
+                    continue # Skip rest of loop until it's time for next frame
+
+            elif is_image:
+                if frame_count == 0:
+                    frame = image_frame # Use the preloaded image frame
+                    ret = True if frame is not None else False
+                else:
+                    data_queue.put(("status", f"Finished processing image: {frame_source_name}"))
+                    # Keep thread alive but don't process further for image
+                    while not exit_event.is_set(): time.sleep(0.1)
+                    break
+            elif not is_playing and is_video:
+                 time.sleep(0.05) # Sleep briefly if paused
+                 continue # Skip inference if paused
+            else:
+                # This case might be hit if input_mode is File but file failed to open
+                print("Error: No valid input source or state.")
+                break
+
+            if not ret or frame is None:
+                if is_video and not loop_video: break
                 time.sleep(0.1)
                 continue
 
@@ -272,9 +396,14 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             else:
                 scaled_frame = frame
 
-            frame_count += 1
+            frame_count += 1 # Increment overall processed frame count
 
-            if frame_count % inference_interval == 0:
+            # --- Run Inference periodically (or always if not live?) ---
+            run_inference_this_frame = is_image or (frame_count % inference_interval == 0)
+
+            if run_inference_this_frame:
+                if exit_event.is_set(): break # Check before potentially long inference
+
                 current_scale = scale_factor_ref[0]
                 if prev_scale_factor is not None and abs(current_scale - prev_scale_factor) > 1e-3:
                     print(f"Scale factor changed ({prev_scale_factor:.2f} -> {current_scale:.2f}). Resetting smoothing state.")
@@ -284,14 +413,26 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 prev_scale_factor = current_scale
 
                 current_time = time.time()
-                print(f"Running inference for frame {frame_count} (Time since last: {current_time - last_inference_time:.2f}s)")
+                print(f"Running inference for frame {frame_count} (Vid Idx: {video_frame_index}) (Time since last: {current_time - last_inference_time:.2f}s)")
                 last_inference_time = current_time
 
                 try:
                     data_queue.put(("status", f"Preprocessing frame {frame_count}..."))
-                    rgb_frame = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
-                    frame_h, frame_w, _ = rgb_frame.shape
-                    frame_tensor = torch.from_numpy(rgb_frame).permute(2, 0, 1).float().to(device)
+                    rgb_frame_orig = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
+
+                    # --- Apply Sharpening (Unsharp Mask) ---
+                    enable_sharpening = edge_params_ref.get("enable_sharpening", False)
+                    sharpness_amount = edge_params_ref.get("sharpness", 1.5)
+                    if enable_sharpening and sharpness_amount > 0:
+                        blurred = cv2.GaussianBlur(rgb_frame_orig, (0, 0), 3)
+                        sharpened = cv2.addWeighted(rgb_frame_orig, 1.0 + sharpness_amount, blurred, -sharpness_amount, 0)
+                        rgb_frame_processed = np.clip(sharpened, 0, 255).astype(np.uint8)
+                    else:
+                        rgb_frame_processed = rgb_frame_orig
+                    # --- End Sharpening ---
+
+                    frame_h, frame_w, _ = rgb_frame_processed.shape
+                    frame_tensor = torch.from_numpy(rgb_frame_orig).permute(2, 0, 1).float().to(device)
                     frame_tensor = frame_tensor.unsqueeze(0)
 
                     data_queue.put(("status", f"Running inference on frame {frame_count}..."))
@@ -317,26 +458,18 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                 rgb_thresh2 = edge_params_ref["rgb_threshold2"]
 
                                 depth_np_u8 = (torch.clamp(current_depth_map / 10.0, 0.0, 1.0) * 255).byte().cpu().numpy()
-
-                                # Depth Edges (Canny)
                                 depth_edge_map = cv2.Canny(depth_np_u8, depth_thresh1, depth_thresh2)
 
-                                # Depth Gradient (Sobel)
                                 grad_x = cv2.Sobel(depth_np_u8, cv2.CV_64F, 1, 0, ksize=3)
                                 grad_y = cv2.Sobel(depth_np_u8, cv2.CV_64F, 0, 1, ksize=3)
                                 depth_gradient_map = cv2.magnitude(grad_x, grad_y)
-                                # Normalize gradient map 0-1 for influence calculation
                                 if np.max(depth_gradient_map) > 1e-6:
                                     depth_gradient_map = depth_gradient_map / np.max(depth_gradient_map)
 
-                                # RGB Edges (Canny)
-                                gray_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
+                                gray_frame = cv2.cvtColor(rgb_frame_processed, cv2.COLOR_RGB2GRAY)
                                 rgb_edge_map = cv2.Canny(gray_frame, rgb_thresh1, rgb_thresh2)
 
-                                # Combine Edges
                                 combined_edge_map = cv2.bitwise_or(depth_edge_map, rgb_edge_map)
-
-                                # Create RGB visualization for queue
                                 edge_map_viz = cv2.cvtColor(combined_edge_map, cv2.COLOR_GRAY2RGB)
                             except Exception as e_edge:
                                 print(f"Error during edge detection: {e_edge}")
@@ -362,8 +495,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
                         scaled_depth_map = current_depth_map
                         current_mean_depth = current_depth_map.mean().item()
-                        min_alpha_scale = edge_params_ref.get("min_alpha_scale", 0.0) # Default if not set
-                        max_alpha_scale = edge_params_ref.get("max_alpha_scale", 1.0) # Default if not set
+                        min_alpha_scale = edge_params_ref.get("min_alpha_scale", 0.0)
+                        max_alpha_scale = edge_params_ref.get("max_alpha_scale", 1.0)
                         motion_factor_scale = global_motion_unmodulated ** 2.0
                         adaptive_alpha_scale = min_alpha_scale + (max_alpha_scale - min_alpha_scale) * motion_factor_scale
 
@@ -416,19 +549,16 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
                                         # Modulate alpha by combined edge map and gradient
                                         if enable_edge_aware and combined_edge_map is not None and combined_edge_map.shape == base_alpha_map.shape:
-                                            edge_mask_tensor = torch.from_numpy(combined_edge_map / 255.0).float().to(device) # Normalize 0-1
+                                            edge_mask_tensor = torch.from_numpy(combined_edge_map / 255.0).float().to(device)
 
-                                            # Calculate local influence based on gradient
-                                            local_influence = edge_influence # Default to global influence
+                                            local_influence = edge_influence
                                             if depth_gradient_map is not None and depth_gradient_map.shape == base_alpha_map.shape:
                                                 gradient_tensor = torch.from_numpy(depth_gradient_map).float().to(device)
-                                                # Scale global influence by normalized gradient magnitude
                                                 local_influence = edge_influence * torch.clamp(gradient_tensor * grad_influence_scale, 0.0, 1.0)
 
-                                            # Increase alpha (reduce smoothing) near edges, modulated by gradient
                                             final_alpha_map = torch.lerp(base_alpha_map, torch.ones_like(base_alpha_map), edge_mask_tensor * local_influence)
                                         else:
-                                            final_alpha_map = base_alpha_map # Use base alpha if disabled or edge map invalid
+                                            final_alpha_map = base_alpha_map
 
                                         final_alpha_map_unsqueezed = final_alpha_map.unsqueeze(-1)
                                         smoothed_points_xyz = final_alpha_map_unsqueezed * points_xyz + (1.0 - final_alpha_map_unsqueezed) * smoothed_points_xyz
@@ -437,24 +567,16 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                         final_alpha_map = torch.ones_like(points_xyz[:,:,0]) if points_xyz.ndim == 3 else torch.ones(points_xyz.shape[0], device=device)
                                 else:
                                     smoothed_points_xyz = points_xyz
-                                    # Create alpha map visualization even if smoothing is off
-                                    if points_xyz.ndim == 3:
-                                        final_alpha_map = torch.ones_like(points_xyz[:,:,0])
-                                    elif points_xyz.ndim == 2:
-                                         final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
-
+                                    if points_xyz.ndim == 3: final_alpha_map = torch.ones_like(points_xyz[:,:,0])
+                                    elif points_xyz.ndim == 2: final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
                                 # --- End Edge-Aware Smoothing ---
 
                                 # --- Create Smoothing Map Visualization ---
                                 if final_alpha_map is not None:
                                     try:
-                                        # Ensure final_alpha_map has 2 dimensions for visualization
-                                        if final_alpha_map.ndim == 1: # Handle case where points_xyz was (N,3)
-                                            # Cannot directly visualize 1D alpha map as 2D image easily
-                                            # Create a placeholder or skip visualization
-                                            h, w = frame_h, frame_w # Use frame dimensions as fallback
+                                        if final_alpha_map.ndim == 1:
+                                            h, w = frame_h, frame_w
                                             smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
-                                            print("Warning: Cannot visualize 1D smoothing alpha map.")
                                         else:
                                             smoothing_map_vis_np = (final_alpha_map.cpu().numpy() * 255).astype(np.uint8)
                                             smoothing_map_viz = cv2.cvtColor(smoothing_map_vis_np, cv2.COLOR_GRAY2RGB)
@@ -462,7 +584,6 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                         print(f"Error creating smoothing map viz: {e_smooth_viz}")
                                         smoothing_map_viz = None
                                 else:
-                                     # Create black image if no alpha map generated
                                      h, w = frame_h, frame_w
                                      smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
 
@@ -478,6 +599,10 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         continue
 
                     points_xyz_np = points_xyz_to_process.squeeze().cpu().numpy()
+
+                    # --- Invert Y Coordinate ---
+                    points_xyz_np[:, 1] *= -1.0
+                    # -------------------------
 
                     num_vertices = 0
                     try:
@@ -499,24 +624,28 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     colors_np = None
                     if num_vertices > 0:
                         try:
-                            # Ensure rgb_frame has dimensions before reshape
-                            if rgb_frame is not None and rgb_frame.ndim == 3:
-                                colors_np = rgb_frame.reshape(frame_h * frame_w, 3)
-                                subsample_rate = 1
-                                if subsample_rate > 1:
-                                    points_xyz_np = points_xyz_np[::subsample_rate]
-                                    colors_np = colors_np[::subsample_rate]
-                                num_vertices = points_xyz_np.shape[0]
+                            # Use the processed (potentially sharpened) frame for colors
+                            if rgb_frame_processed is not None and rgb_frame_processed.ndim == 3:
+                                if rgb_frame_processed.shape[0] == frame_h and rgb_frame_processed.shape[1] == frame_w:
+                                    colors_np = rgb_frame_processed.reshape(frame_h * frame_w, 3)
+                                    subsample_rate = 1
+                                    if subsample_rate > 1:
+                                        points_xyz_np = points_xyz_np[::subsample_rate]
+                                        colors_np = colors_np[::subsample_rate]
+                                    num_vertices = points_xyz_np.shape[0]
 
-                                if colors_np.dtype == np.uint8:
-                                    colors_np = colors_np.astype(np.float32) / 255.0
-                                elif colors_np.dtype == np.float32:
-                                    colors_np = np.clip(colors_np, 0.0, 1.0)
+                                    if colors_np.dtype == np.uint8:
+                                        colors_np = colors_np.astype(np.float32) / 255.0
+                                    elif colors_np.dtype == np.float32:
+                                        colors_np = np.clip(colors_np, 0.0, 1.0)
+                                    else:
+                                        print(f"Warning: Unexpected color dtype {colors_np.dtype}, using white.")
+                                        colors_np = None
                                 else:
-                                    print(f"Warning: Unexpected color dtype {colors_np.dtype}, using white.")
-                                    colors_np = None
+                                     print(f"Warning: Dimension mismatch between points ({frame_h}x{frame_w}) and processed frame ({rgb_frame_processed.shape[:2]})")
+                                     colors_np = None
                             else:
-                                print("Warning: rgb_frame invalid for color extraction.")
+                                print("Warning: rgb_frame_processed invalid for color extraction.")
                                 colors_np = None
 
                         except Exception as e_color_subsample:
@@ -537,11 +666,13 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         # Put all data into queue
                         if not data_queue.full():
                                 data_queue.put((vertices_flat, colors_flat, num_vertices,
-                                                rgb_frame, # Pass the raw frame (numpy uint8)
-                                                scaled_depth_map_for_queue, # Pass the depth tensor
-                                                edge_map_viz, # Pass edge map visualization
-                                                smoothing_map_viz, # Pass smoothing map visualization
-                                                t_capture))
+                                                rgb_frame_orig, # Pass original frame for camera feed view
+                                                scaled_depth_map_for_queue,
+                                                edge_map_viz,
+                                                smoothing_map_viz,
+                                                t_capture,
+                                                video_frame_index, # Pass video playback info
+                                                video_total_frames))
                         else:
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
                             data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
@@ -552,7 +683,13 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     print(f"Error during inference processing for frame {frame_count}: {e_infer}")
                     traceback.print_exc()
 
-            time.sleep(0.005)
+            # Only sleep if processing live video to avoid busy loop
+            if is_video and input_mode == "Live":
+                time.sleep(0.005)
+
+            # If processing an image, exit after the first frame's inference
+            # (Handled earlier in the loop now)
+
 
     except Exception as e_thread:
         print(f"Error in inference thread: {e_thread}")
@@ -560,7 +697,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         data_queue.put(("error", str(e_thread)))
         data_queue.put(("status", "Inference thread error!"))
     finally:
-        if 'cap' in locals() and cap.isOpened():
+        if cap and is_video: # Only release if it's a video capture object
             cap.release()
         print("Inference thread finished.")
         data_queue.put(("status", "Inference thread finished."))
@@ -569,13 +706,12 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 # --- Viewer Class ---
 class LiveViewerWindow(pyglet.window.Window):
     def __init__(self, model_name, inference_interval=1,
-                 disable_point_smoothing=False,
+                 disable_point_smoothing=False, # This arg is now effectively ignored
                  *args, **kwargs):
         # Store args before calling super
         self._model_name = model_name
         self._inference_interval = inference_interval
-        # Store the initial smoothing preference (used when starting thread)
-        self._initial_disable_point_smoothing = disable_point_smoothing
+        # self._initial_disable_point_smoothing = disable_point_smoothing # No longer needed
 
         super().__init__(*args, **kwargs)
 
@@ -587,12 +723,15 @@ class LiveViewerWindow(pyglet.window.Window):
         self.last_capture_timestamp = None
 
         # --- Control State Variables (Initialized in load_settings) ---
+        self.input_mode = None
+        self.input_filepath = None
         self.render_mode = None
         self.falloff_factor = None
         self.saturation = None
         self.brightness = None
         self.contrast = None
         self.sharpness = None
+        self.enable_sharpening = None
         self.point_size_boost = None
         self.input_scale_factor = None
         self.enable_point_smoothing = None
@@ -604,13 +743,22 @@ class LiveViewerWindow(pyglet.window.Window):
         self.rgb_edge_threshold1 = None
         self.rgb_edge_threshold2 = None
         self.edge_smoothing_influence = None
-        self.gradient_influence_scale = None # New control
+        self.gradient_influence_scale = None
+        self.playback_speed = None
+        self.loop_video = None
         self.show_camera_feed = None
         self.show_depth_map = None
         self.show_edge_map = None
         self.show_smoothing_map = None
         self.scale_factor_ref = None # Initialized in load_settings
         self.edge_params_ref = {} # Dictionary to pass edge params to thread
+        self.playback_state_ref = {} # Dictionary for playback control
+
+        # --- Playback State ---
+        self.is_playing = True # Separate from ref for UI interaction
+        self.video_total_frames = 0
+        self.video_current_frame = 0
+
 
         # --- Debug View State ---
         self.latest_rgb_frame = None
@@ -722,7 +870,7 @@ class LiveViewerWindow(pyglet.window.Window):
 
         # Start the inference thread
         # self.scale_factor_ref and self.edge_params_ref initialized in load_settings
-        self.start_inference_thread(self._model_name, self._inference_interval) # Removed smoothing arg
+        self.start_inference_thread() # Start with loaded/default settings
 
         # Set up OpenGL state
         gl.glClearColor(0.1, 0.1, 0.1, 1.0)
@@ -801,25 +949,48 @@ class LiveViewerWindow(pyglet.window.Window):
         print("DEBUG: Debug textures created/recreated.")
 
 
-    def start_inference_thread(self, model_name, inference_interval): # Removed disable_point_smoothing_initial
-        # Ensure refs are initialized before starting thread
+    def start_inference_thread(self): # Removed arguments, uses self attributes
+        # Stop existing thread first if running
+        if self.inference_thread and self.inference_thread.is_alive():
+            print("DEBUG: Stopping existing inference thread...")
+            self.status_message = "Stopping previous source..." # Update status
+            self._exit_event.set()
+            self.inference_thread.join(timeout=2.0) # Increase timeout slightly
+            if self.inference_thread.is_alive():
+                 print("Warning: Inference thread did not stop quickly.")
+                 # Optionally force kill? Risky.
+            self.inference_thread = None
+            self._exit_event.clear() # Reset event for new thread
+            # Clear vertex list when source changes
+            if self.vertex_list:
+                try: self.vertex_list.delete()
+                except: pass
+                self.vertex_list = None
+                self.current_point_count = 0
+
+
+        # Ensure refs are initialized
         if not hasattr(self, 'scale_factor_ref') or self.scale_factor_ref is None:
              self.scale_factor_ref = [self.input_scale_factor]
         if not hasattr(self, 'edge_params_ref') or not self.edge_params_ref:
-             self.update_edge_params_ref() # Initialize edge params ref
+             self.update_edge_params_ref()
+        if not hasattr(self, 'playback_state_ref') or not self.playback_state_ref:
+             self.update_playback_state_ref() # Initialize playback ref
 
-        if self.inference_thread is None or not self.inference_thread.is_alive():
-            self._exit_event.clear()
-            self.inference_thread = threading.Thread(
-                target=inference_thread_func,
-                args=(self._data_queue, self._exit_event, model_name, inference_interval,
-                      # enable_point_smoothing_arg removed
-                      self.scale_factor_ref,
-                      self.edge_params_ref), # Pass edge params dict
-                daemon=True
-            )
-            self.inference_thread.start()
-            print("DEBUG: Inference thread started via start_inference_thread.")
+        # Start new thread with current settings
+        self.inference_thread = threading.Thread(
+            target=inference_thread_func,
+            args=(self._data_queue, self._exit_event, self._model_name, self._inference_interval,
+                  self.scale_factor_ref,
+                  self.edge_params_ref,
+                  self.input_mode, # Pass current mode
+                  self.input_filepath, # Pass current filepath
+                  self.playback_state_ref), # Pass playback state dict
+            daemon=True
+        )
+        self.inference_thread.start()
+        print(f"DEBUG: Inference thread started (Mode: {self.input_mode}).")
+        self.status_message = f"Starting {self.input_mode}..." # Update status
 
     def update_edge_params_ref(self):
         """Updates the dictionary passed to the inference thread."""
@@ -833,6 +1004,17 @@ class LiveViewerWindow(pyglet.window.Window):
         self.edge_params_ref["rgb_threshold2"] = int(self.rgb_edge_threshold2)
         self.edge_params_ref["influence"] = self.edge_smoothing_influence
         self.edge_params_ref["gradient_influence_scale"] = self.gradient_influence_scale
+        self.edge_params_ref["enable_sharpening"] = self.enable_sharpening
+        self.edge_params_ref["sharpness"] = self.sharpness
+
+    def update_playback_state_ref(self):
+        """Updates the dictionary passed to the inference thread for playback."""
+        self.playback_state_ref["is_playing"] = self.is_playing
+        self.playback_state_ref["speed"] = self.playback_speed
+        self.playback_state_ref["loop"] = self.loop_video
+        # Restart is set to True by button, consumed by thread
+        # self.playback_state_ref["restart"] = False # Don't reset restart flag here
+        # Total frames and current frame are updated by the thread
 
 
     def update(self, dt):
@@ -850,17 +1032,20 @@ class LiveViewerWindow(pyglet.window.Window):
                 else:
                     # --- Process actual vertex and image data ---
                     try:
-                        # Unpack new data format including edge and smoothing maps
+                        # Unpack new data format including playback info
                         vertices_data, colors_data, num_vertices_actual, \
                         rgb_frame_np, depth_map_tensor, edge_map_viz_np, \
-                        smoothing_map_viz_np, t_capture = latest_data
+                        smoothing_map_viz_np, t_capture, \
+                        current_frame_idx, total_frames = latest_data # Added playback info
 
                         self.last_capture_timestamp = t_capture
+                        self.video_current_frame = current_frame_idx
+                        self.video_total_frames = total_frames
 
                         # --- Update Debug Views ---
                         self.latest_rgb_frame = rgb_frame_np
                         self.latest_edge_map = edge_map_viz_np
-                        self.latest_smoothing_map = smoothing_map_viz_np # Store smoothing map viz
+                        self.latest_smoothing_map = smoothing_map_viz_np
 
                         if depth_map_tensor is not None:
                             try:
@@ -990,6 +1175,8 @@ class LiveViewerWindow(pyglet.window.Window):
         self.scale_factor_ref = [self.input_scale_factor]
         # Update edge params ref dictionary
         self.update_edge_params_ref()
+        # Update playback state ref dictionary
+        self.update_playback_state_ref()
 
 
     def save_settings(self, filename="viewer_settings.json"):
@@ -1016,7 +1203,16 @@ class LiveViewerWindow(pyglet.window.Window):
                     loaded_settings = json.load(f)
                 # Update attributes from loaded file, keeping defaults if key missing
                 for key in DEFAULT_SETTINGS:
-                    setattr(self, key, loaded_settings.get(key, getattr(self, key)))
+                    default_val = DEFAULT_SETTINGS[key]
+                    loaded_val = loaded_settings.get(key, default_val)
+                    try:
+                        if isinstance(default_val, bool): setattr(self, key, bool(loaded_val))
+                        elif isinstance(default_val, int): setattr(self, key, int(loaded_val))
+                        elif isinstance(default_val, float): setattr(self, key, float(loaded_val))
+                        else: setattr(self, key, loaded_val)
+                    except (ValueError, TypeError):
+                         print(f"Warning: Could not convert loaded setting '{key}' ({loaded_val}), using default.")
+                         setattr(self, key, default_val)
                 print(f"DEBUG: Settings loaded from {filename}")
             else:
                 print(f"DEBUG: Settings file {filename} not found, using defaults.")
@@ -1027,9 +1223,39 @@ class LiveViewerWindow(pyglet.window.Window):
             for key, value in DEFAULT_SETTINGS.items():
                 setattr(self, key, value)
 
-        # Ensure scale factor and edge params reference dicts are updated/created *after* loading/defaults
+        # Ensure reference dicts are updated/created *after* loading/defaults
         self.scale_factor_ref = [self.input_scale_factor]
-        self.update_edge_params_ref() # Initialize edge params ref
+        self.update_edge_params_ref()
+        self.update_playback_state_ref() # Initialize playback ref
+
+
+    def _browse_file(self):
+        """Opens a file dialog to select a video or image."""
+        root = tk.Tk()
+        root.withdraw() # Hide the main tkinter window
+        file_path = filedialog.askopenfilename(
+            title="Select Video or Image File",
+            filetypes=[("Media Files", "*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp"),
+                       ("Video Files", "*.mp4 *.avi *.mov *.mkv"),
+                       ("Image Files", "*.jpg *.jpeg *.png *.bmp"),
+                       ("All Files", "*.*")]
+        )
+        root.destroy() # Destroy the tkinter instance
+
+        if file_path: # If a file was selected
+            print(f"DEBUG: File selected: {file_path}")
+            self.input_filepath = file_path
+            self.input_mode = "File"
+            self.status_message = f"File selected: {os.path.basename(file_path)}"
+            # Reset playback state for new file
+            self.is_playing = True
+            self.video_current_frame = 0
+            self.video_total_frames = 0
+            self.update_playback_state_ref()
+            # Restart inference thread with new source
+            self.start_inference_thread()
+        else:
+            print("DEBUG: File selection cancelled.")
 
 
     def on_draw(self):
@@ -1115,7 +1341,7 @@ class LiveViewerWindow(pyglet.window.Window):
 
         # --- Controls Panel ---
         imgui.set_next_window_position(self.width - 310, 10, imgui.ONCE) # Position bottom-rightish once
-        imgui.set_next_window_size(300, 650, imgui.ONCE) # Increased height
+        imgui.set_next_window_size(300, 700, imgui.ONCE) # Increased height further
         imgui.begin("Controls", True) # True = closable window
 
         # --- Presets ---
@@ -1125,6 +1351,72 @@ class LiveViewerWindow(pyglet.window.Window):
         imgui.same_line()
         if imgui.button("Reset All"): self.reset_settings()
         imgui.separator()
+
+        # --- Input Source Section ---
+        if imgui.collapsing_header("Input Source", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+            mode_changed = False
+            # Determine current status text and color
+            status_text = "Status: Idle"
+            status_color = (0.5, 0.5, 0.5, 1.0) # Gray
+            thread_is_running = self.inference_thread and self.inference_thread.is_alive()
+
+            if thread_is_running:
+                if self.input_mode == "Live":
+                    status_text = "Status: Live Feed Active"
+                    status_color = (0.1, 1.0, 0.1, 1.0) # Green
+                elif self.input_mode == "File":
+                    status_text = f"Status: Processing File ({os.path.basename(self.input_filepath)})"
+                    status_color = (0.1, 0.6, 1.0, 1.0) # Blue
+            # Check status message for specific states if thread isn't running
+            elif "Error" in self.status_message:
+                 status_text = f"Status: Error"
+                 status_color = (1.0, 0.1, 0.1, 1.0) # Red
+            elif "Finished" in self.status_message:
+                 status_text = f"Status: Finished"
+                 status_color = (0.5, 0.5, 0.5, 1.0) # Gray
+
+            imgui.text_colored(status_text, *status_color)
+
+            if imgui.radio_button("Live Camera##InputMode", self.input_mode == "Live"):
+                if self.input_mode != "Live":
+                    self.input_mode = "Live"
+                    self.start_inference_thread() # Restart thread
+            imgui.same_line()
+            if imgui.radio_button("File##InputMode", self.input_mode == "File"):
+                if self.input_mode != "File":
+                    # Don't immediately restart, wait for file selection or browse
+                    self.input_mode = "File"
+                    # Stop live thread if it was running
+                    if self.inference_thread and self.inference_thread.is_alive():
+                        self.start_inference_thread() # Call to stop existing thread
+
+            imgui.text("File:")
+            imgui.same_line()
+            imgui.text_disabled(self.input_filepath if self.input_filepath else "None Selected")
+            if imgui.button("Browse..."):
+                self._browse_file() # This will set mode to File and restart thread
+
+            # --- Playback Controls (Visible only for File mode video) ---
+            if self.input_mode == "File" and self.video_total_frames > 0:
+                imgui.separator()
+                imgui.text("Playback:")
+                play_button_text = " Pause " if self.is_playing else " Play  "
+                if imgui.button(play_button_text):
+                    self.is_playing = not self.is_playing
+                    self.update_playback_state_ref()
+                imgui.same_line()
+                if imgui.button("Restart"):
+                    self.playback_state_ref["restart"] = True # Signal thread to restart
+                imgui.same_line()
+                loop_changed, self.loop_video = imgui.checkbox("Loop", self.loop_video)
+                if loop_changed: self.update_playback_state_ref()
+
+                speed_changed, self.playback_speed = imgui.slider_float("Speed", self.playback_speed, 0.1, 4.0)
+                if speed_changed: self.update_playback_state_ref()
+
+                # Simple frame display
+                imgui.text(f"Frame: {self.video_current_frame} / {self.video_total_frames}")
+
 
         # --- Rendering Section ---
         if imgui.collapsing_header("Rendering", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
@@ -1164,8 +1456,17 @@ class LiveViewerWindow(pyglet.window.Window):
             changed_con, self.contrast = imgui.slider_float("Contrast", self.contrast, 0.1, 3.0)
             if imgui.button("Reset##Contrast"): self.contrast = DEFAULT_SETTINGS["contrast"]
 
-            changed_shp, self.sharpness = imgui.slider_float("Sharpness", self.sharpness, 0.1, 3.0)
-            if imgui.button("Reset##Sharpness"): self.sharpness = DEFAULT_SETTINGS["sharpness"]
+            changed_sharp_enable, self.enable_sharpening = imgui.checkbox("Enable Sharpening", self.enable_sharpening)
+            if changed_sharp_enable: self.update_edge_params_ref()
+            if self.enable_sharpening:
+                imgui.indent()
+                changed_sharp_amt, self.sharpness = imgui.slider_float("Sharpness Amount", self.sharpness, 0.1, 5.0)
+                if changed_sharp_amt: self.update_edge_params_ref()
+                if imgui.button("Reset##Sharpness"):
+                    self.sharpness = DEFAULT_SETTINGS["sharpness"]
+                    self.update_edge_params_ref()
+                imgui.unindent()
+
 
         # --- Smoothing Section ---
         if imgui.collapsing_header("Smoothing", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
@@ -1291,7 +1592,7 @@ class LiveViewerWindow(pyglet.window.Window):
         print("Window closing, stopping inference thread...")
         self._exit_event.set()
         if self.inference_thread and self.inference_thread.is_alive():
-            self.inference_thread.join(timeout=1.0)
+            self.inference_thread.join(timeout=2.0) # Increased timeout
         if self.vertex_list:
             try: self.vertex_list.delete()
             except Exception as e_del: print(f"Error deleting vertex list on close: {e_del}")
