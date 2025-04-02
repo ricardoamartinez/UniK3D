@@ -12,6 +12,8 @@ import torch # For UniK3D model and tensors
 import json # For saving/loading settings
 import tkinter as tk
 from tkinter import filedialog
+import glob # For finding PLY files
+import re # For sorting PLY files numerically
 
 # Assuming unik3d is installed and importable
 from unik3d.models import UniK3D
@@ -25,8 +27,8 @@ from imgui.integrations.pyglet import create_renderer
 
 # Default settings dictionary
 DEFAULT_SETTINGS = {
-    "input_mode": "Live", # "Live" or "File"
-    "input_filepath": "",
+    "input_mode": "Live", # "Live", "File", "PLY Sequence"
+    "input_filepath": "", # Can be file or directory path
     "render_mode": 2, # 0=Square, 1=Circle, 2=Gaussian
     "falloff_factor": 5.0,
     "saturation": 1.5,
@@ -46,8 +48,8 @@ DEFAULT_SETTINGS = {
     "rgb_edge_threshold2": 150.0,
     "edge_smoothing_influence": 0.7,
     "gradient_influence_scale": 1.0,
-    "playback_speed": 1.0, # For video files
-    "loop_video": True, # For video files
+    "playback_speed": 1.0, # For video/PLY sequence files
+    "loop_video": True, # For video/PLY sequence files
     "is_recording": False, # Recording state
     "recording_output_dir": "recording_output", # Default output dir
     "show_camera_feed": False,
@@ -56,10 +58,72 @@ DEFAULT_SETTINGS = {
     "show_smoothing_map": False,
 }
 
+# --- PLY Loading Helper ---
+def load_ply(filepath):
+    """Loads points and optionally colors from an ASCII PLY file."""
+    try:
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+
+        header_end_index = -1
+        num_vertices = 0
+        properties = []
+        has_color = False
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if line.startswith("element vertex"):
+                num_vertices = int(line.split()[-1])
+            elif line.startswith("property"):
+                properties.append(line.split()[-1]) # Store property names (x, y, z, red, green, blue)
+                if line.split()[-1] in ["red", "green", "blue"]:
+                    has_color = True
+            elif line == "end_header":
+                header_end_index = i
+                break
+
+        if header_end_index == -1 or num_vertices == 0:
+            raise ValueError("Invalid PLY header or no vertices.")
+
+        data_lines = lines[header_end_index + 1 : header_end_index + 1 + num_vertices]
+
+        # Find indices of properties
+        try:
+            x_idx = properties.index("x")
+            y_idx = properties.index("y")
+            z_idx = properties.index("z")
+            r_idx = properties.index("red") if has_color else -1
+            g_idx = properties.index("green") if has_color else -1
+            b_idx = properties.index("blue") if has_color else -1
+        except ValueError as e:
+            raise ValueError(f"Missing required property in PLY header: {e}")
+
+
+        points = np.zeros((num_vertices, 3), dtype=np.float32)
+        colors = np.zeros((num_vertices, 3), dtype=np.float32) if has_color else None
+
+        for i, line in enumerate(data_lines):
+            vals = line.split()
+            points[i, 0] = float(vals[x_idx])
+            points[i, 1] = float(vals[y_idx]) # Load original Y
+            points[i, 2] = float(vals[z_idx])
+            if has_color:
+                colors[i, 0] = int(vals[r_idx]) / 255.0 # Convert uchar back to float 0-1
+                colors[i, 1] = int(vals[g_idx]) / 255.0
+                colors[i, 2] = int(vals[b_idx]) / 255.0
+
+        return points, colors
+
+    except Exception as e:
+        print(f"Error loading PLY file {filepath}: {e}")
+        return None, None
+
 # --- PLY Saving Helper ---
 def save_ply(filepath, points, colors=None):
     """Saves a point cloud to an ASCII PLY file."""
     try:
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
         num_points = points.shape[0]
         header = [
             "ply",
@@ -69,6 +133,7 @@ def save_ply(filepath, points, colors=None):
             "property float y",
             "property float z",
         ]
+        # Check if colors array is valid and matches point count
         if colors is not None and colors.shape[0] == num_points:
             header.extend([
                 "property uchar red",
@@ -76,6 +141,8 @@ def save_ply(filepath, points, colors=None):
                 "property uchar blue",
             ])
         else:
+            if colors is not None: # Warn if colors provided but invalid
+                 print(f"Warning: Color data shape mismatch or invalid for {filepath}. Saving without colors.")
             colors = None # Don't write colors if invalid
 
         header.append("end_header")
@@ -85,7 +152,7 @@ def save_ply(filepath, points, colors=None):
                 f.write(line + '\n')
 
             for i in range(num_points):
-                # Invert Y coordinate back for saving PLY
+                # Save with original Y coordinate (invert back from display inversion)
                 line = f"{points[i, 0]:.6f} {-points[i, 1]:.6f} {points[i, 2]:.6f}"
                 if colors is not None:
                     # Assuming colors are float 0-1, convert to uchar 0-255
@@ -277,6 +344,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
     cap = None # Video capture object
     is_video = False
     is_image = False
+    is_ply_sequence = False # Added flag for PLY sequence
+    ply_files = [] # List of PLY file paths
     frame_source_name = "Live Camera"
     video_total_frames = 0
     video_fps = 30 # Default assumption
@@ -284,16 +353,20 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
     recorded_frame_counter = 0 # Counter for saved frames
 
     try:
-        # --- Load Model ---
-        print(f"Loading UniK3D model: {model_name}...")
-        data_queue.put(("status", f"Loading model: {model_name}..."))
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
-        model = UniK3D.from_pretrained(f"lpiccinelli/{model_name}")
-        model = model.to(device)
-        model.eval()
-        print("Model loaded.")
-        data_queue.put(("status", "Model loaded."))
+        # --- Load Model (Only if not playing PLY sequence) ---
+        model = None
+        if input_mode != "PLY Sequence": # Don't load model if playing PLY
+            print(f"Loading UniK3D model: {model_name}...")
+            data_queue.put(("status", f"Loading model: {model_name}..."))
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            print(f"Using device: {device}")
+            model = UniK3D.from_pretrained(f"lpiccinelli/{model_name}")
+            model = model.to(device)
+            model.eval()
+            print("Model loaded.")
+            data_queue.put(("status", "Model loaded."))
+        else:
+             device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Still need device for smoothing tensors
 
         # --- Initialize Input Source ---
         if input_mode == "Live":
@@ -304,40 +377,59 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 print("Error: Could not open camera.")
                 data_queue.put(("error", "Could not open camera."))
                 return
-            is_video = True # Treat live feed as a video stream
+            is_video = True
             frame_source_name = "Live Camera"
             video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
             print("Camera initialized.")
             data_queue.put(("status", "Camera initialized."))
         elif input_mode == "File" and input_filepath and os.path.exists(input_filepath):
             frame_source_name = os.path.basename(input_filepath)
-            print(f"Initializing video capture for file: {input_filepath}")
-            data_queue.put(("status", f"Opening file: {frame_source_name}..."))
-            cap = cv2.VideoCapture(input_filepath)
-            if cap.isOpened():
-                is_video = True
-                video_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
-                playback_state_ref["total_frames"] = video_total_frames # Update main thread state
-                playback_state_ref["current_frame"] = 0
-                print(f"Video file opened successfully ({video_total_frames} frames @ {video_fps:.2f} FPS).")
-                data_queue.put(("status", f"Opened video: {frame_source_name}"))
-            else:
-                print("Failed to open as video, trying as image...")
-                try:
-                    image_frame = cv2.imread(input_filepath) # Load image frame here
-                    if image_frame is not None:
-                        is_image = True
-                        print("Image file loaded successfully.")
-                        data_queue.put(("status", f"Loaded image: {frame_source_name}"))
-                    else:
-                        print(f"Error: Could not read file as video or image: {input_filepath}")
-                        data_queue.put(("error", f"Cannot open file: {frame_source_name}"))
-                        return
-                except Exception as e_img:
-                    print(f"Error reading file as image: {input_filepath} - {e_img}")
-                    data_queue.put(("error", f"Error reading file: {frame_source_name}"))
+            if os.path.isdir(input_filepath):
+                # --- Load PLY Sequence ---
+                print(f"Scanning directory for PLY files: {input_filepath}")
+                data_queue.put(("status", f"Scanning directory: {frame_source_name}..."))
+                ply_files = sorted(glob.glob(os.path.join(input_filepath, "*.ply")),
+                                   key=lambda x: int(re.search(r'(\d+)', os.path.basename(x)).group(1)) if re.search(r'(\d+)', os.path.basename(x)) else -1) # Sort numerically
+                if not ply_files:
+                    print(f"Error: No .ply files found in directory: {input_filepath}")
+                    data_queue.put(("error", f"No .ply files found in: {frame_source_name}"))
                     return
+                is_ply_sequence = True
+                video_total_frames = len(ply_files)
+                video_fps = 30 # Assume 30 FPS for PLY sequences for now
+                playback_state_ref["total_frames"] = video_total_frames
+                playback_state_ref["current_frame"] = 0
+                print(f"PLY sequence loaded successfully ({video_total_frames} frames).")
+                data_queue.put(("status", f"Loaded PLY sequence: {frame_source_name}"))
+            else:
+                # --- Load Video or Image File ---
+                print(f"Initializing video capture for file: {input_filepath}")
+                data_queue.put(("status", f"Opening file: {frame_source_name}..."))
+                cap = cv2.VideoCapture(input_filepath)
+                if cap.isOpened():
+                    is_video = True
+                    video_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+                    playback_state_ref["total_frames"] = video_total_frames
+                    playback_state_ref["current_frame"] = 0
+                    print(f"Video file opened successfully ({video_total_frames} frames @ {video_fps:.2f} FPS).")
+                    data_queue.put(("status", f"Opened video: {frame_source_name}"))
+                else:
+                    print("Failed to open as video, trying as image...")
+                    try:
+                        image_frame = cv2.imread(input_filepath)
+                        if image_frame is not None:
+                            is_image = True
+                            print("Image file loaded successfully.")
+                            data_queue.put(("status", f"Loaded image: {frame_source_name}"))
+                        else:
+                            print(f"Error: Could not read file as video or image: {input_filepath}")
+                            data_queue.put(("error", f"Cannot open file: {frame_source_name}"))
+                            return
+                    except Exception as e_img:
+                        print(f"Error reading file as image: {input_filepath} - {e_img}")
+                        data_queue.put(("error", f"Error reading file: {frame_source_name}"))
+                        return
         else:
             print(f"Error: Invalid input mode or file path: {input_mode}, {input_filepath}")
             data_queue.put(("error", "Invalid input source specified."))
@@ -345,7 +437,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
         # --- Start of main loop logic ---
         frame_count = 0 # Overall frames processed by thread
-        video_frame_index = 0 # Current frame index for video file
+        sequence_frame_index = 0 # Current frame index for video/PLY sequence
         last_inference_time = time.time()
         last_frame_read_time = time.time() # For playback speed control
         smoothed_points_xyz = None
@@ -360,98 +452,112 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             t_capture = time.time()
             frame = None
             ret = False
+            points_xyz_np = None # For PLY loading
+            colors_np = None # For PLY loading
 
-            # --- Playback Control & Frame Reading ---
+            # --- Playback Control & Frame Reading/Loading ---
             is_playing = playback_state_ref.get("is_playing", True)
             playback_speed = playback_state_ref.get("speed", 1.0)
-            loop_video = playback_state_ref.get("loop", True)
+            loop_video = playback_state_ref.get("loop", True) # Applies to PLY sequence too
             restart_video = playback_state_ref.get("restart", False)
 
             if restart_video:
-                if is_video and cap:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    video_frame_index = 0
+                if (is_video and cap) or is_ply_sequence:
+                    if cap: cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    sequence_frame_index = 0
                     playback_state_ref["current_frame"] = 0
-                    recorded_frame_counter = 0 # Reset recording counter on video restart
-                    print("DEBUG: Video restarted.")
+                    recorded_frame_counter = 0 # Reset recording counter on restart
+                    print("DEBUG: Input restarted.")
                 playback_state_ref["restart"] = False # Consume restart flag
 
             read_next_frame = is_playing or is_image # Read if playing or if it's the first image frame
 
             if is_video and cap and read_next_frame:
-                # Calculate target time for next frame based on speed
-                target_delta = (1.0 / video_fps) / playback_speed if video_fps > 0 and playback_speed > 0 else 0.1 # Avoid division by zero
+                target_delta = (1.0 / video_fps) / playback_speed if video_fps > 0 and playback_speed > 0 else 0.1
                 time_since_last_read = time.time() - last_frame_read_time
-
                 if time_since_last_read >= target_delta:
-                    if exit_event.is_set(): break # Check before blocking read
+                    if exit_event.is_set(): break
                     ret, frame = cap.read()
                     last_frame_read_time = time.time()
                     if ret:
-                        video_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) # Get current frame index
-                        playback_state_ref["current_frame"] = video_frame_index
+                        sequence_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        playback_state_ref["current_frame"] = sequence_frame_index
                     else:
-                        # End of video
                         if loop_video:
                             print("Looping video.")
                             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            video_frame_index = 0
+                            sequence_frame_index = 0
                             playback_state_ref["current_frame"] = 0
-                            recorded_frame_counter = 0 # Reset recording counter on loop
-                            if exit_event.is_set(): break # Check before blocking read
-                            ret, frame = cap.read() # Read the first frame again
-                            if not ret:
-                                print("Error reading first frame after loop.")
-                                break
+                            recorded_frame_counter = 0
+                            if exit_event.is_set(): break
+                            ret, frame = cap.read()
+                            if not ret: break
                         else:
                             print("End of video file.")
                             data_queue.put(("status", f"Finished processing: {frame_source_name}"))
-                            break # Exit loop
+                            break
                 else:
-                    # Wait for the correct time to display the next frame
                     sleep_time = target_delta - time_since_last_read
-                    time.sleep(max(0.001, sleep_time)) # Sleep but ensure minimum delay
-                    continue # Skip rest of loop until it's time for next frame
+                    time.sleep(max(0.001, sleep_time))
+                    continue
+            elif is_ply_sequence and read_next_frame:
+                target_delta = (1.0 / video_fps) / playback_speed if video_fps > 0 and playback_speed > 0 else 0.1
+                time_since_last_read = time.time() - last_frame_read_time
+                if time_since_last_read >= target_delta:
+                    if sequence_frame_index >= len(ply_files): # End of sequence
+                        if loop_video:
+                            print("Looping PLY sequence.")
+                            sequence_frame_index = 0
+                            playback_state_ref["current_frame"] = 0
+                            recorded_frame_counter = 0
+                        else:
+                            print("End of PLY sequence.")
+                            data_queue.put(("status", f"Finished processing: {frame_source_name}"))
+                            break
+
+                    current_ply_path = ply_files[sequence_frame_index]
+                    points_xyz_np, colors_np = load_ply(current_ply_path)
+                    last_frame_read_time = time.time()
+
+                    if points_xyz_np is not None:
+                        ret = True
+                        playback_state_ref["current_frame"] = sequence_frame_index + 1 # Update UI frame count (1-based)
+                        sequence_frame_index += 1 # Move to next frame for next iteration
+                    else:
+                        print(f"Error loading PLY frame: {current_ply_path}")
+                        # Option: skip frame or stop? Stop for now.
+                        break
+                else:
+                    sleep_time = target_delta - time_since_last_read
+                    time.sleep(max(0.001, sleep_time))
+                    continue
 
             elif is_image:
                 if frame_count == 0:
-                    frame = image_frame # Use the preloaded image frame
+                    frame = image_frame
                     ret = True if frame is not None else False
                 else:
                     data_queue.put(("status", f"Finished processing image: {frame_source_name}"))
-                    # Keep thread alive but don't process further for image
                     while not exit_event.is_set(): time.sleep(0.1)
                     break
-            elif not is_playing and is_video:
-                 time.sleep(0.05) # Sleep briefly if paused
-                 continue # Skip inference if paused
+            elif not is_playing and (is_video or is_ply_sequence):
+                 time.sleep(0.05)
+                 continue
             else:
-                # This case might be hit if input_mode is File but file failed to open
                 print("Error: No valid input source or state.")
                 break
 
-            if not ret or frame is None:
-                if is_video and not loop_video: break
+            if not ret or (frame is None and not is_ply_sequence): # Check frame only if not PLY
+                if (is_video or is_ply_sequence) and not loop_video: break
                 time.sleep(0.1)
                 continue
 
-            # --- Dynamically Scale Frame ---
-            current_scale = scale_factor_ref[0]
-            if current_scale > 0.1:
-                new_width = int(frame.shape[1] * current_scale)
-                new_height = int(frame.shape[0] * current_scale)
-                interpolation = cv2.INTER_AREA if current_scale < 1.0 else cv2.INTER_LINEAR
-                scaled_frame = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
-            else:
-                scaled_frame = frame
-
-            frame_count += 1 # Increment overall processed frame count
-
-            # --- Run Inference periodically (or always if not live?) ---
-            run_inference_this_frame = is_image or (frame_count % inference_interval == 0)
+            # --- Process Frame (Inference or PLY Load) ---
+            frame_count += 1
+            run_inference_this_frame = is_image or (frame_count % inference_interval == 0) or is_ply_sequence
 
             if run_inference_this_frame:
-                if exit_event.is_set(): break # Check before potentially long inference
+                if exit_event.is_set(): break
 
                 current_scale = scale_factor_ref[0]
                 if prev_scale_factor is not None and abs(current_scale - prev_scale_factor) > 1e-3:
@@ -462,248 +568,273 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 prev_scale_factor = current_scale
 
                 current_time = time.time()
-                print(f"Running inference for frame {frame_count} (Vid Idx: {video_frame_index}) (Time since last: {current_time - last_inference_time:.2f}s)")
+                print(f"Processing frame {frame_count} (Seq Idx: {sequence_frame_index}) (Time since last: {current_time - last_inference_time:.2f}s)")
                 last_inference_time = current_time
 
                 try:
-                    data_queue.put(("status", f"Preprocessing frame {frame_count}..."))
-                    rgb_frame_orig = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
+                    # --- Get Data (Inference or PLY Load) ---
+                    if is_ply_sequence:
+                        # Data (points_xyz_np, colors_np) already loaded above
+                        # Need rgb_frame_orig for debug view if possible (use placeholder?)
+                        # Use first frame's image if available, else black
+                        rgb_frame_orig = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame is not None else np.zeros((100,100,3), dtype=np.uint8)
+                        scaled_depth_map_for_queue = None # No depth map from PLY
+                        edge_map_viz = None # No edge map from PLY
+                        smoothing_map_viz = None # No smoothing map from PLY
+                        frame_h, frame_w, _ = rgb_frame_orig.shape # Get dims from placeholder/frame
+                    else: # Live or Video/Image File -> Run Inference
+                        data_queue.put(("status", f"Preprocessing frame {frame_count}..."))
+                        rgb_frame_orig = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
 
-                    # --- Apply Sharpening (Unsharp Mask) ---
-                    enable_sharpening = edge_params_ref.get("enable_sharpening", False)
-                    sharpness_amount = edge_params_ref.get("sharpness", 1.5)
-                    if enable_sharpening and sharpness_amount > 0:
-                        blurred = cv2.GaussianBlur(rgb_frame_orig, (0, 0), 3)
-                        sharpened = cv2.addWeighted(rgb_frame_orig, 1.0 + sharpness_amount, blurred, -sharpness_amount, 0)
-                        rgb_frame_processed = np.clip(sharpened, 0, 255).astype(np.uint8)
-                    else:
-                        rgb_frame_processed = rgb_frame_orig
-                    # --- End Sharpening ---
-
-                    frame_h, frame_w, _ = rgb_frame_processed.shape
-                    frame_tensor = torch.from_numpy(rgb_frame_orig).permute(2, 0, 1).float().to(device)
-                    frame_tensor = frame_tensor.unsqueeze(0)
-
-                    data_queue.put(("status", f"Running inference on frame {frame_count}..."))
-                    with torch.no_grad():
-                        predictions = model.infer(frame_tensor)
-
-                    points_xyz = None
-                    scaled_depth_map_for_queue = None
-                    edge_map_viz = None
-                    smoothing_map_viz = None
-
-                    if 'rays' in predictions and 'depth' in predictions:
-                        current_depth_map = predictions['depth'].squeeze()
-
-                        # --- Edge Detection on Depth & RGB ---
-                        combined_edge_map = None
-                        depth_gradient_map = None
-                        if current_depth_map is not None:
-                            try:
-                                depth_thresh1 = edge_params_ref["depth_threshold1"]
-                                depth_thresh2 = edge_params_ref["depth_threshold2"]
-                                rgb_thresh1 = edge_params_ref["rgb_threshold1"]
-                                rgb_thresh2 = edge_params_ref["rgb_threshold2"]
-
-                                depth_np_u8 = (torch.clamp(current_depth_map / 10.0, 0.0, 1.0) * 255).byte().cpu().numpy()
-                                depth_edge_map = cv2.Canny(depth_np_u8, depth_thresh1, depth_thresh2)
-
-                                grad_x = cv2.Sobel(depth_np_u8, cv2.CV_64F, 1, 0, ksize=3)
-                                grad_y = cv2.Sobel(depth_np_u8, cv2.CV_64F, 0, 1, ksize=3)
-                                depth_gradient_map = cv2.magnitude(grad_x, grad_y)
-                                if np.max(depth_gradient_map) > 1e-6:
-                                    depth_gradient_map = depth_gradient_map / np.max(depth_gradient_map)
-
-                                gray_frame = cv2.cvtColor(rgb_frame_processed, cv2.COLOR_RGB2GRAY)
-                                rgb_edge_map = cv2.Canny(gray_frame, rgb_thresh1, rgb_thresh2)
-
-                                combined_edge_map = cv2.bitwise_or(depth_edge_map, rgb_edge_map)
-                                edge_map_viz = cv2.cvtColor(combined_edge_map, cv2.COLOR_GRAY2RGB)
-                            except Exception as e_edge:
-                                print(f"Error during edge detection: {e_edge}")
-                                combined_edge_map = None
-                                edge_map_viz = None
-                                depth_gradient_map = None
-                        # ---------------------------------
-
-                        per_pixel_depth_motion_map = None
-                        per_pixel_depth_motion = None
-                        if prev_depth_map is not None and current_depth_map.shape == prev_depth_map.shape:
-                            depth_diff = torch.abs(current_depth_map - prev_depth_map)
-                            per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0)
-                            normalized_depth = torch.clamp(current_depth_map / 10.0, 0.0, 1.0)
-                            distance_modulated_motion = per_pixel_depth_motion * (1.0 - normalized_depth)
-                            per_pixel_depth_motion_map = distance_modulated_motion
-
-                        prev_depth_map = current_depth_map.clone()
-
-                        global_motion_unmodulated = 0.0
-                        if per_pixel_depth_motion is not None:
-                            global_motion_unmodulated = per_pixel_depth_motion.mean().item()
-
-                        scaled_depth_map = current_depth_map
-                        current_mean_depth = current_depth_map.mean().item()
-                        min_alpha_scale = edge_params_ref.get("min_alpha_scale", 0.0)
-                        max_alpha_scale = edge_params_ref.get("max_alpha_scale", 1.0)
-                        motion_factor_scale = global_motion_unmodulated ** 2.0
-                        adaptive_alpha_scale = min_alpha_scale + (max_alpha_scale - min_alpha_scale) * motion_factor_scale
-
-                        if smoothed_mean_depth is None:
-                            smoothed_mean_depth = current_mean_depth
+                        enable_sharpening = edge_params_ref.get("enable_sharpening", False)
+                        sharpness_amount = edge_params_ref.get("sharpness", 1.5)
+                        if enable_sharpening and sharpness_amount > 0:
+                            blurred = cv2.GaussianBlur(rgb_frame_orig, (0, 0), 3)
+                            sharpened = cv2.addWeighted(rgb_frame_orig, 1.0 + sharpness_amount, blurred, -sharpness_amount, 0)
+                            rgb_frame_processed = np.clip(sharpened, 0, 255).astype(np.uint8)
                         else:
-                            smoothed_mean_depth = adaptive_alpha_scale * current_mean_depth + (1.0 - adaptive_alpha_scale) * smoothed_mean_depth
+                            rgb_frame_processed = rgb_frame_orig
 
-                        if current_mean_depth > 1e-6:
-                            scale_factor = smoothed_mean_depth / current_mean_depth
-                            scaled_depth_map = current_depth_map * scale_factor
+                        frame_h, frame_w, _ = rgb_frame_processed.shape
+                        frame_tensor = torch.from_numpy(rgb_frame_orig).permute(2, 0, 1).float().to(device)
+                        frame_tensor = frame_tensor.unsqueeze(0)
 
-                        scaled_depth_map_for_queue = scaled_depth_map
+                        data_queue.put(("status", f"Running inference on frame {frame_count}..."))
+                        with torch.no_grad():
+                            predictions = model.infer(frame_tensor)
 
-                        rays = predictions['rays'].squeeze()
-                        if rays.shape[0] == 3 and rays.ndim == 3:
-                            rays = rays.permute(1, 2, 0)
-                        depth_to_multiply = scaled_depth_map.unsqueeze(-1)
-                        points_xyz = rays * depth_to_multiply
-                        data_queue.put(("status", f"Calculated points for frame {frame_count}..."))
+                        points_xyz = None
+                        scaled_depth_map_for_queue = None
+                        edge_map_viz = None
+                        smoothing_map_viz = None
 
-                    elif "points" in predictions:
-                        data_queue.put(("status", f"Using direct points for frame {frame_count}..."))
-                        points_xyz = predictions["points"]
-                    else:
-                        data_queue.put(("warning", f"No points/depth found for frame {frame_count}"))
+                        if 'rays' in predictions and 'depth' in predictions:
+                            current_depth_map = predictions['depth'].squeeze()
 
-                    if points_xyz is not None:
-                        if smoothed_points_xyz is None:
-                            smoothed_points_xyz = points_xyz.clone()
+                            # --- Edge Detection ---
+                            combined_edge_map = None
+                            depth_gradient_map = None
+                            if current_depth_map is not None:
+                                try:
+                                    depth_thresh1 = edge_params_ref["depth_threshold1"]
+                                    depth_thresh2 = edge_params_ref["depth_threshold2"]
+                                    rgb_thresh1 = edge_params_ref["rgb_threshold1"]
+                                    rgb_thresh2 = edge_params_ref["rgb_threshold2"]
+
+                                    depth_np_u8 = (torch.clamp(current_depth_map / 10.0, 0.0, 1.0) * 255).byte().cpu().numpy()
+                                    depth_edge_map = cv2.Canny(depth_np_u8, depth_thresh1, depth_thresh2)
+
+                                    grad_x = cv2.Sobel(depth_np_u8, cv2.CV_64F, 1, 0, ksize=3)
+                                    grad_y = cv2.Sobel(depth_np_u8, cv2.CV_64F, 0, 1, ksize=3)
+                                    depth_gradient_map = cv2.magnitude(grad_x, grad_y)
+                                    if np.max(depth_gradient_map) > 1e-6:
+                                        depth_gradient_map = depth_gradient_map / np.max(depth_gradient_map)
+
+                                    gray_frame = cv2.cvtColor(rgb_frame_processed, cv2.COLOR_RGB2GRAY)
+                                    rgb_edge_map = cv2.Canny(gray_frame, rgb_thresh1, rgb_thresh2)
+
+                                    combined_edge_map = cv2.bitwise_or(depth_edge_map, rgb_edge_map)
+                                    edge_map_viz = cv2.cvtColor(combined_edge_map, cv2.COLOR_GRAY2RGB)
+                                except Exception as e_edge:
+                                    print(f"Error during edge detection: {e_edge}")
+                                    combined_edge_map = None
+                                    edge_map_viz = None
+                                    depth_gradient_map = None
+                            # ---------------------
+
+                            per_pixel_depth_motion_map = None
+                            per_pixel_depth_motion = None
+                            if prev_depth_map is not None and current_depth_map.shape == prev_depth_map.shape:
+                                depth_diff = torch.abs(current_depth_map - prev_depth_map)
+                                per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0)
+                                normalized_depth = torch.clamp(current_depth_map / 10.0, 0.0, 1.0)
+                                distance_modulated_motion = per_pixel_depth_motion * (1.0 - normalized_depth)
+                                per_pixel_depth_motion_map = distance_modulated_motion
+
+                            prev_depth_map = current_depth_map.clone()
+
+                            global_motion_unmodulated = 0.0
+                            if per_pixel_depth_motion is not None:
+                                global_motion_unmodulated = per_pixel_depth_motion.mean().item()
+
+                            scaled_depth_map = current_depth_map
+                            current_mean_depth = current_depth_map.mean().item()
+                            min_alpha_scale = edge_params_ref.get("min_alpha_scale", 0.0)
+                            max_alpha_scale = edge_params_ref.get("max_alpha_scale", 1.0)
+                            motion_factor_scale = global_motion_unmodulated ** 2.0
+                            adaptive_alpha_scale = min_alpha_scale + (max_alpha_scale - min_alpha_scale) * motion_factor_scale
+
+                            if smoothed_mean_depth is None:
+                                smoothed_mean_depth = current_mean_depth
+                            else:
+                                smoothed_mean_depth = adaptive_alpha_scale * current_mean_depth + (1.0 - adaptive_alpha_scale) * smoothed_mean_depth
+
+                            if current_mean_depth > 1e-6:
+                                scale_factor = smoothed_mean_depth / current_mean_depth
+                                scaled_depth_map = current_depth_map * scale_factor
+
+                            scaled_depth_map_for_queue = scaled_depth_map
+
+                            rays = predictions['rays'].squeeze()
+                            if rays.shape[0] == 3 and rays.ndim == 3:
+                                rays = rays.permute(1, 2, 0)
+                            depth_to_multiply = scaled_depth_map.unsqueeze(-1)
+                            points_xyz = rays * depth_to_multiply
+                            data_queue.put(("status", f"Calculated points for frame {frame_count}..."))
+
+                        elif "points" in predictions:
+                            data_queue.put(("status", f"Using direct points for frame {frame_count}..."))
+                            points_xyz = predictions["points"]
                         else:
-                            if smoothed_points_xyz.shape == points_xyz.shape:
-                                # --- Edge-Aware Smoothing ---
-                                enable_point_smoothing = edge_params_ref["enable_point_smoothing"]
-                                enable_edge_aware = edge_params_ref["enable_edge_aware"]
-                                edge_influence = edge_params_ref["influence"]
-                                min_alpha_points = edge_params_ref["min_alpha_points"]
-                                max_alpha_points = edge_params_ref["max_alpha_points"]
-                                grad_influence_scale = edge_params_ref["gradient_influence_scale"]
+                            data_queue.put(("warning", f"No points/depth found for frame {frame_count}"))
 
-                                final_alpha_map = None # Initialize
+                        if points_xyz is not None:
+                            if smoothed_points_xyz is None:
+                                smoothed_points_xyz = points_xyz.clone()
+                            else:
+                                if smoothed_points_xyz.shape == points_xyz.shape:
+                                    # --- Edge-Aware Smoothing ---
+                                    enable_point_smoothing = edge_params_ref["enable_point_smoothing"]
+                                    enable_edge_aware = edge_params_ref["enable_edge_aware"]
+                                    edge_influence = edge_params_ref["influence"]
+                                    min_alpha_points = edge_params_ref["min_alpha_points"]
+                                    max_alpha_points = edge_params_ref["max_alpha_points"]
+                                    grad_influence_scale = edge_params_ref["gradient_influence_scale"]
 
-                                if enable_point_smoothing and per_pixel_depth_motion_map is not None:
-                                    if points_xyz.ndim == 3 and points_xyz.shape[:2] == per_pixel_depth_motion_map.shape:
-                                        motion_factor_points = 0.0
-                                        if per_pixel_depth_motion is not None:
-                                             motion_factor_points = per_pixel_depth_motion ** 2.0
+                                    final_alpha_map = None
 
-                                        base_alpha_map = min_alpha_points + (max_alpha_points - min_alpha_points) * motion_factor_points
+                                    if enable_point_smoothing and per_pixel_depth_motion_map is not None:
+                                        if points_xyz.ndim == 3 and points_xyz.shape[:2] == per_pixel_depth_motion_map.shape:
+                                            motion_factor_points = 0.0
+                                            if per_pixel_depth_motion is not None:
+                                                 motion_factor_points = per_pixel_depth_motion ** 2.0
 
-                                        # Modulate alpha by combined edge map and gradient
-                                        if enable_edge_aware and combined_edge_map is not None and combined_edge_map.shape == base_alpha_map.shape:
-                                            edge_mask_tensor = torch.from_numpy(combined_edge_map / 255.0).float().to(device)
+                                            base_alpha_map = min_alpha_points + (max_alpha_points - min_alpha_points) * motion_factor_points
 
-                                            local_influence = edge_influence
-                                            if depth_gradient_map is not None and depth_gradient_map.shape == base_alpha_map.shape:
-                                                gradient_tensor = torch.from_numpy(depth_gradient_map).float().to(device)
-                                                local_influence = edge_influence * torch.clamp(gradient_tensor * grad_influence_scale, 0.0, 1.0)
+                                            if enable_edge_aware and combined_edge_map is not None and combined_edge_map.shape == base_alpha_map.shape:
+                                                edge_mask_tensor = torch.from_numpy(combined_edge_map / 255.0).float().to(device)
 
-                                            final_alpha_map = torch.lerp(base_alpha_map, torch.ones_like(base_alpha_map), edge_mask_tensor * local_influence)
+                                                local_influence = edge_influence
+                                                if depth_gradient_map is not None and depth_gradient_map.shape == base_alpha_map.shape:
+                                                    gradient_tensor = torch.from_numpy(depth_gradient_map).float().to(device)
+                                                    local_influence = edge_influence * torch.clamp(gradient_tensor * grad_influence_scale, 0.0, 1.0)
+
+                                                final_alpha_map = torch.lerp(base_alpha_map, torch.ones_like(base_alpha_map), edge_mask_tensor * local_influence)
+                                            else:
+                                                final_alpha_map = base_alpha_map
+
+                                            final_alpha_map_unsqueezed = final_alpha_map.unsqueeze(-1)
+                                            smoothed_points_xyz = final_alpha_map_unsqueezed * points_xyz + (1.0 - final_alpha_map_unsqueezed) * smoothed_points_xyz
                                         else:
-                                            final_alpha_map = base_alpha_map
-
-                                        final_alpha_map_unsqueezed = final_alpha_map.unsqueeze(-1)
-                                        smoothed_points_xyz = final_alpha_map_unsqueezed * points_xyz + (1.0 - final_alpha_map_unsqueezed) * smoothed_points_xyz
+                                            smoothed_points_xyz = points_xyz
+                                            final_alpha_map = torch.ones_like(points_xyz[:,:,0]) if points_xyz.ndim == 3 else torch.ones(points_xyz.shape[0], device=device)
                                     else:
                                         smoothed_points_xyz = points_xyz
-                                        final_alpha_map = torch.ones_like(points_xyz[:,:,0]) if points_xyz.ndim == 3 else torch.ones(points_xyz.shape[0], device=device)
-                                else:
-                                    smoothed_points_xyz = points_xyz
-                                    if points_xyz.ndim == 3: final_alpha_map = torch.ones_like(points_xyz[:,:,0])
-                                    elif points_xyz.ndim == 2: final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
-                                # --- End Edge-Aware Smoothing ---
+                                        if points_xyz.ndim == 3: final_alpha_map = torch.ones_like(points_xyz[:,:,0])
+                                        elif points_xyz.ndim == 2: final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
+                                    # --- End Edge-Aware Smoothing ---
 
-                                # --- Create Smoothing Map Visualization ---
-                                if final_alpha_map is not None:
-                                    try:
-                                        if final_alpha_map.ndim == 1:
-                                            h, w = frame_h, frame_w
-                                            smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
-                                        else:
-                                            smoothing_map_vis_np = (final_alpha_map.cpu().numpy() * 255).astype(np.uint8)
-                                            smoothing_map_viz = cv2.cvtColor(smoothing_map_vis_np, cv2.COLOR_GRAY2RGB)
-                                    except Exception as e_smooth_viz:
-                                        print(f"Error creating smoothing map viz: {e_smooth_viz}")
-                                        smoothing_map_viz = None
-                                else:
-                                     h, w = frame_h, frame_w
-                                     smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
-
-
-                            else:
-                                print("Warning: Points tensor shape changed, resetting smoothing.")
-                                smoothed_points_xyz = points_xyz.clone()
-                        points_xyz_to_process = smoothed_points_xyz
-                    else:
-                        points_xyz_to_process = None
-
-                    if points_xyz_to_process is None or points_xyz_to_process.numel() == 0:
-                        continue
-
-                    points_xyz_np = points_xyz_to_process.squeeze().cpu().numpy()
-
-                    # --- Invert Y Coordinate ---
-                    points_xyz_np[:, 1] *= -1.0
-                    # -------------------------
-
-                    num_vertices = 0
-                    try:
-                        if points_xyz_np.ndim == 3 and points_xyz_np.shape[0] == 3:
-                            points_xyz_np = np.transpose(points_xyz_np, (1, 2, 0))
-                            num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
-                            points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
-                        elif points_xyz_np.ndim == 2 and points_xyz_np.shape[1] == 3:
-                             num_vertices = points_xyz_np.shape[0]
-                        elif points_xyz_np.ndim == 3 and points_xyz_np.shape[2] == 3:
-                             num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
-                             points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
-                        else:
-                            print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np.shape}")
-                    except Exception as e_reshape:
-                            print(f"Error reshaping points_xyz_np: {e_reshape}")
-                            num_vertices = 0
-
-                    colors_np = None
-                    if num_vertices > 0:
-                        try:
-                            # Use the processed (potentially sharpened) frame for colors
-                            if rgb_frame_processed is not None and rgb_frame_processed.ndim == 3:
-                                if rgb_frame_processed.shape[0] == frame_h and rgb_frame_processed.shape[1] == frame_w:
-                                    colors_np = rgb_frame_processed.reshape(frame_h * frame_w, 3)
-                                    subsample_rate = 1
-                                    if subsample_rate > 1:
-                                        points_xyz_np = points_xyz_np[::subsample_rate]
-                                        colors_np = colors_np[::subsample_rate]
-                                    num_vertices = points_xyz_np.shape[0]
-
-                                    if colors_np.dtype == np.uint8:
-                                        colors_np = colors_np.astype(np.float32) / 255.0
-                                    elif colors_np.dtype == np.float32:
-                                        colors_np = np.clip(colors_np, 0.0, 1.0)
+                                    # --- Create Smoothing Map Visualization ---
+                                    if final_alpha_map is not None:
+                                        try:
+                                            if final_alpha_map.ndim == 1:
+                                                h, w = frame_h, frame_w
+                                                smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
+                                            else:
+                                                smoothing_map_vis_np = (final_alpha_map.cpu().numpy() * 255).astype(np.uint8)
+                                                smoothing_map_viz = cv2.cvtColor(smoothing_map_vis_np, cv2.COLOR_GRAY2RGB)
+                                        except Exception as e_smooth_viz:
+                                            print(f"Error creating smoothing map viz: {e_smooth_viz}")
+                                            smoothing_map_viz = None
                                     else:
-                                        print(f"Warning: Unexpected color dtype {colors_np.dtype}, using white.")
-                                        colors_np = None
+                                         h, w = frame_h, frame_w
+                                         smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
+
+
                                 else:
-                                     print(f"Warning: Dimension mismatch between points ({frame_h}x{frame_w}) and processed frame ({rgb_frame_processed.shape[:2]})")
-                                     colors_np = None
+                                    print("Warning: Points tensor shape changed, resetting smoothing.")
+                                    smoothed_points_xyz = points_xyz.clone()
+                            points_xyz_to_process = smoothed_points_xyz
+                        else:
+                            points_xyz_to_process = None
+
+                        if points_xyz_to_process is None or points_xyz_to_process.numel() == 0:
+                            continue
+
+                        points_xyz_np = points_xyz_to_process.squeeze().cpu().numpy()
+
+                        # --- Invert Y Coordinate ---
+                        points_xyz_np[:, 1] *= -1.0
+                        # -------------------------
+
+                        num_vertices = 0
+                        try:
+                            if points_xyz_np.ndim == 3 and points_xyz_np.shape[0] == 3:
+                                points_xyz_np = np.transpose(points_xyz_np, (1, 2, 0))
+                                num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
+                                points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
+                            elif points_xyz_np.ndim == 2 and points_xyz_np.shape[1] == 3:
+                                 num_vertices = points_xyz_np.shape[0]
+                            elif points_xyz_np.ndim == 3 and points_xyz_np.shape[2] == 3:
+                                 num_vertices = points_xyz_np.shape[0] * points_xyz_np.shape[1]
+                                 points_xyz_np = points_xyz_np.reshape(num_vertices, 3)
                             else:
-                                print("Warning: rgb_frame_processed invalid for color extraction.")
+                                print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np.shape}")
+                        except Exception as e_reshape:
+                                print(f"Error reshaping points_xyz_np: {e_reshape}")
+                                num_vertices = 0
+
+                        colors_np = None
+                        if num_vertices > 0:
+                            try:
+                                # Use the processed (potentially sharpened) frame for colors
+                                if rgb_frame_processed is not None and rgb_frame_processed.ndim == 3:
+                                    if rgb_frame_processed.shape[0] == frame_h and rgb_frame_processed.shape[1] == frame_w:
+                                        colors_np = rgb_frame_processed.reshape(frame_h * frame_w, 3)
+                                        subsample_rate = 1
+                                        if subsample_rate > 1:
+                                            points_xyz_np = points_xyz_np[::subsample_rate]
+                                            colors_np = colors_np[::subsample_rate]
+                                        num_vertices = points_xyz_np.shape[0]
+
+                                        if colors_np.dtype == np.uint8:
+                                            colors_np = colors_np.astype(np.float32) / 255.0
+                                        elif colors_np.dtype == np.float32:
+                                            colors_np = np.clip(colors_np, 0.0, 1.0)
+                                        else:
+                                            print(f"Warning: Unexpected color dtype {colors_np.dtype}, using white.")
+                                            colors_np = None
+                                    else:
+                                         print(f"Warning: Dimension mismatch between points ({frame_h}x{frame_w}) and processed frame ({rgb_frame_processed.shape[:2]})")
+                                         colors_np = None
+                                else:
+                                    print("Warning: rgb_frame_processed invalid for color extraction.")
+                                    colors_np = None
+
+                            except Exception as e_color_subsample:
+                                print(f"Error processing/subsampling colors: {e_color_subsample}")
                                 colors_np = None
+                                if num_vertices > 0:
+                                    points_xyz_np = points_xyz_np[::subsample_rate]
+                                    num_vertices = points_xyz_np.shape[0]
+                        # --- End Color Sampling ---
 
-                        except Exception as e_color_subsample:
-                            print(f"Error processing/subsampling colors: {e_color_subsample}")
-                            colors_np = None
-                            if num_vertices > 0:
-                                points_xyz_np = points_xyz_np[::subsample_rate]
-                                num_vertices = points_xyz_np.shape[0]
+                    # --- Process PLY Data (if loaded) ---
+                    elif is_ply_sequence:
+                        # points_xyz_np and colors_np were loaded earlier
+                        if points_xyz_np is None: continue # Skip if PLY load failed
 
+                        num_vertices = points_xyz_np.shape[0]
+                        # Invert Y for display
+                        points_xyz_np[:, 1] *= -1.0
+                        # No inference data to generate other maps
+                        rgb_frame_orig = np.zeros((100,100,3), dtype=np.uint8) # Placeholder
+                        scaled_depth_map_for_queue = None
+                        edge_map_viz = None
+                        smoothing_map_viz = None
+                    # --- End PLY Data Processing ---
+
+                    # --- Queue Data ---
                     if num_vertices > 0:
                         vertices_flat = points_xyz_np.flatten()
                         if colors_np is not None:
@@ -717,13 +848,11 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         output_dir = recording_state_ref.get("output_dir", "recording_output")
                         current_recorded_count = 0 # Default value
                         if is_recording:
-                            # Use a dedicated counter for recorded frames
                             recorded_frame_counter += 1
                             ply_filename = os.path.join(output_dir, f"frame_{recorded_frame_counter:05d}.ply")
-                            # Pass the original points_xyz_np before Y-inversion for saving
-                            save_ply(ply_filename, points_xyz_to_process.squeeze().cpu().numpy(), colors_np)
+                            # Save points with original Y coordinate
+                            save_ply(ply_filename, points_xyz_np * np.array([1,-1,1]), colors_np)
                             current_recorded_count = recorded_frame_counter
-                            # Update status only occasionally to avoid flooding queue
                             if recorded_frame_counter % 10 == 0:
                                 data_queue.put(("status", f"Recording frame {recorded_frame_counter}..."))
                         # ---------------------
@@ -736,17 +865,17 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                                 edge_map_viz,
                                                 smoothing_map_viz,
                                                 t_capture,
-                                                video_frame_index, # Pass video playback info
+                                                sequence_frame_index, # Pass sequence playback info
                                                 video_total_frames,
                                                 current_recorded_count)) # Pass recorded count
                         else:
                             print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
                             data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
                     else:
-                        pass
+                        pass # No vertices to process
 
                 except Exception as e_infer:
-                    print(f"Error during inference processing for frame {frame_count}: {e_infer}")
+                    print(f"Error during inference/processing for frame {frame_count}: {e_infer}")
                     traceback.print_exc()
 
             # Only sleep if processing live video to avoid busy loop
@@ -1314,32 +1443,44 @@ class LiveViewerWindow(pyglet.window.Window):
 
 
     def _browse_file(self):
-        """Opens a file dialog to select a video or image."""
+        """Opens a file dialog to select a video, image, or directory."""
         root = tk.Tk()
         root.withdraw() # Hide the main tkinter window
-        file_path = filedialog.askopenfilename(
-            title="Select Video or Image File",
-            filetypes=[("Media Files", "*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp"),
-                       ("Video Files", "*.mp4 *.avi *.mov *.mkv"),
-                       ("Image Files", "*.jpg *.jpeg *.png *.bmp"),
-                       ("All Files", "*.*")]
-        )
+        # Ask for directory first
+        dir_path = filedialog.askdirectory(title="Select PLY Sequence Directory")
+        if dir_path:
+             file_path = dir_path # Treat directory as the selection
+             print(f"DEBUG: Directory selected: {file_path}")
+             self.input_filepath = file_path
+             self.input_mode = "File" # Let thread determine if it's PLY sequence
+             self.status_message = f"Directory selected: {os.path.basename(file_path)}"
+        else: # If directory selection cancelled, ask for file
+            file_path = filedialog.askopenfilename(
+                title="Select Video or Image File",
+                filetypes=[("Media Files", "*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp"),
+                           ("Video Files", "*.mp4 *.avi *.mov *.mkv"),
+                           ("Image Files", "*.jpg *.jpeg *.png *.bmp"),
+                           ("All Files", "*.*")]
+            )
+            if file_path:
+                print(f"DEBUG: File selected: {file_path}")
+                self.input_filepath = file_path
+                self.input_mode = "File"
+                self.status_message = f"File selected: {os.path.basename(file_path)}"
+            else:
+                print("DEBUG: File selection cancelled.")
+                root.destroy()
+                return # Exit if no file/dir selected
+
         root.destroy() # Destroy the tkinter instance
 
-        if file_path: # If a file was selected
-            print(f"DEBUG: File selected: {file_path}")
-            self.input_filepath = file_path
-            self.input_mode = "File"
-            self.status_message = f"File selected: {os.path.basename(file_path)}"
-            # Reset playback state for new file
-            self.is_playing = True
-            self.video_current_frame = 0
-            self.video_total_frames = 0
-            self.update_playback_state_ref()
-            # Restart inference thread with new source
-            self.start_inference_thread()
-        else:
-            print("DEBUG: File selection cancelled.")
+        # Reset playback state for new file/directory
+        self.is_playing = True
+        self.video_current_frame = 0
+        self.video_total_frames = 0
+        self.update_playback_state_ref()
+        # Restart inference thread with new source
+        self.start_inference_thread()
 
 
     def on_draw(self):
@@ -1450,6 +1591,9 @@ class LiveViewerWindow(pyglet.window.Window):
                 elif self.input_mode == "File":
                     status_text = f"Status: Processing File ({os.path.basename(self.input_filepath)})"
                     status_color = (0.1, 0.6, 1.0, 1.0) # Blue
+                elif self.input_mode == "PLY Sequence":
+                     status_text = f"Status: Playing PLY Sequence ({os.path.basename(self.input_filepath)})"
+                     status_color = (1.0, 0.6, 0.1, 1.0) # Orange
             elif "Error" in self.status_message:
                  status_text = f"Status: Error"
                  status_color = (1.0, 0.1, 0.1, 1.0) # Red
@@ -1462,26 +1606,25 @@ class LiveViewerWindow(pyglet.window.Window):
             if imgui.radio_button("Live Camera##InputMode", self.input_mode == "Live"):
                 if self.input_mode != "Live":
                     self.input_mode = "Live"
+                    self.input_filepath = "" # Clear filepath for live mode
                     self.start_inference_thread() # Restart thread
             imgui.same_line()
-            if imgui.radio_button("File##InputMode", self.input_mode == "File"):
-                if self.input_mode != "File":
-                    self.input_mode = "File"
-                    # If no file selected yet, don't start, wait for browse
-                    if self.input_filepath:
-                        self.start_inference_thread()
-                    else: # Stop live thread if running
-                         if self.inference_thread and self.inference_thread.is_alive():
-                            self.start_inference_thread() # Call to stop existing thread
+            if imgui.radio_button("File/Sequence##InputMode", self.input_mode != "Live"): # Combine File/PLY
+                 # Don't change mode here, let browse handle it or keep current file
+                 pass # Button just indicates current state is not Live
+                 # If user wants to switch *back* to file after live, they must browse
 
-            imgui.text("File:")
+            imgui.text("Source:")
             imgui.same_line()
-            imgui.text_disabled(self.input_filepath if self.input_filepath else "None Selected")
-            if imgui.button("Browse..."):
-                self._browse_file() # This will set mode to File and restart thread
+            display_path = self.input_filepath if self.input_filepath else "None (Using Live Camera)"
+            if self.input_mode == "PLY Sequence": display_path += " (PLY Sequence)"
+            imgui.text_disabled(display_path)
 
-            # --- Playback Controls (Visible only for File mode video) ---
-            if self.input_mode == "File" and self.video_total_frames > 0:
+            if imgui.button("Browse File/Dir..."):
+                self._browse_file() # This handles setting mode and restarting thread
+
+            # --- Playback Controls (Visible only for File mode video/PLY) ---
+            if self.input_mode != "Live" and self.video_total_frames > 0:
                 imgui.separator()
                 imgui.text("Playback:")
                 play_button_text = " Pause " if self.is_playing else " Play  "
