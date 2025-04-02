@@ -57,6 +57,12 @@ DEFAULT_SETTINGS = {
     "show_depth_map": False,
     "show_edge_map": False,
     "show_smoothing_map": False,
+    # Overlay Toggles
+    "show_fps_overlay": False,
+    "show_points_overlay": False,
+    "show_input_fps_overlay": False,
+    "show_depth_fps_overlay": False,
+    "show_latency_overlay": False,
 }
 
 # --- GLB Saving Helper ---
@@ -78,8 +84,8 @@ def save_glb(filepath, points, colors=None):
                  print(f"Warning: Color data shape mismatch or invalid for {filepath}. Saving without colors.")
 
         # Create a trimesh PointCloud object
-        # Save with original Y coordinate (invert back from display inversion)
-        cloud = trimesh.points.PointCloud(vertices=points * np.array([1,-1,1]), colors=point_colors)
+        # Save coordinates as provided (assuming they are already transformed)
+        cloud = trimesh.points.PointCloud(vertices=points, colors=point_colors)
 
         # Export to GLB
         cloud.export(filepath, file_type='glb')
@@ -98,6 +104,7 @@ def load_glb(filepath):
 
         if isinstance(mesh, trimesh.points.PointCloud):
             points = np.array(mesh.vertices, dtype=np.float32)
+            # No flips here, return raw data
             colors = None
             if hasattr(mesh, 'colors') and mesh.colors is not None and len(mesh.colors) == len(points):
                 # Convert RGBA uint8 to RGB float 0-1
@@ -107,6 +114,7 @@ def load_glb(filepath):
              # If it loaded as a mesh, just use its vertices
              print(f"Warning: Loaded GLB {filepath} as Trimesh, using vertices only.")
              points = np.array(mesh.vertices, dtype=np.float32)
+             # No flips here, return raw data
              # Try to get vertex colors if they exist
              colors = None
              if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None and len(mesh.visual.vertex_colors) == len(points):
@@ -288,32 +296,527 @@ texture_fragment_source = """#version 150 core
     }
 """
 
-# --- Inference Thread Function ---
-def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
-                          scale_factor_ref, edge_params_ref,
-                          input_mode, input_filepath, playback_state_ref,
-                          recording_state_ref): # Added recording state
-    """Loads model, captures camera/video/image, runs inference, puts results in queue."""
-    print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}")
-    data_queue.put(("status", f"Inference thread started ({input_mode})..."))
-    cap = None # Video capture object
+# --- Inference Thread Helper Functions ---
+
+def _initialize_input_source(input_mode, input_filepath, data_queue, playback_state_ref):
+    """Initializes the input source (camera, file, sequence)."""
+    cap = None
     is_video = False
     is_image = False
-    is_glb_sequence = False # Changed from is_ply_sequence
-    glb_files = [] # Changed from ply_files
+    is_glb_sequence = False
+    glb_files = []
     frame_source_name = "Live Camera"
     video_total_frames = 0
-    video_fps = 30 # Default assumption
-    image_frame = None # Store loaded image frame
-    recorded_frame_counter = 0 # Counter for saved frames
+    video_fps = 30
+    image_frame = None
+    error_message = None
+
+    if input_mode == "Live":
+        print("Initializing camera...")
+        data_queue.put(("status", "Initializing camera..."))
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            error_message = "Could not open camera."
+        else:
+            is_video = True
+            frame_source_name = "Live Camera"
+            video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+            print("Camera initialized.")
+            data_queue.put(("status", "Camera initialized."))
+    elif input_mode == "File" and input_filepath and os.path.exists(input_filepath):
+        frame_source_name = os.path.basename(input_filepath)
+        if os.path.isdir(input_filepath):
+            # --- Load GLB Sequence ---
+            print(f"Scanning directory for GLB files: {input_filepath}")
+            data_queue.put(("status", f"Scanning directory: {frame_source_name}..."))
+            glb_files = sorted(glob.glob(os.path.join(input_filepath, "*.glb")),
+                               key=lambda x: int(re.search(r'(\d+)', os.path.basename(x)).group(1)) if re.search(r'(\d+)', os.path.basename(x)) else -1)
+            if not glb_files:
+                error_message = f"No .glb files found in: {frame_source_name}"
+            else:
+                is_glb_sequence = True
+                input_mode = "GLB Sequence" # Update mode explicitly
+                video_total_frames = len(glb_files)
+                video_fps = 30 # Assume 30 FPS
+                playback_state_ref["total_frames"] = video_total_frames
+                playback_state_ref["current_frame"] = 0
+                print(f"GLB sequence loaded successfully ({video_total_frames} frames).")
+                data_queue.put(("status", f"Loaded GLB sequence: {frame_source_name}"))
+        else:
+            # --- Load Video or Image File ---
+            print(f"Initializing video capture for file: {input_filepath}")
+            data_queue.put(("status", f"Opening file: {frame_source_name}..."))
+            cap = cv2.VideoCapture(input_filepath)
+            if cap.isOpened():
+                is_video = True
+                video_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+                playback_state_ref["total_frames"] = video_total_frames
+                playback_state_ref["current_frame"] = 0
+                print(f"Video file opened successfully ({video_total_frames} frames @ {video_fps:.2f} FPS).")
+                data_queue.put(("status", f"Opened video: {frame_source_name}"))
+            else:
+                print("Failed to open as video, trying as image...")
+                try:
+                    image_frame = cv2.imread(input_filepath)
+                    if image_frame is not None:
+                        is_image = True
+                        print("Image file loaded successfully.")
+                        data_queue.put(("status", f"Loaded image: {frame_source_name}"))
+                    else:
+                        error_message = f"Cannot open file: {frame_source_name}"
+                except Exception as e_img:
+                    error_message = f"Error reading file: {frame_source_name} ({e_img})"
+    else:
+        error_message = "Invalid input source specified."
+
+    if error_message:
+        print(f"Error: {error_message}")
+        data_queue.put(("error", error_message))
+        # Return None for critical objects if error occurred
+        return None, None, False, False, False, [], "Error", 0, 30, None, error_message
+
+    return cap, image_frame, is_video, is_image, is_glb_sequence, glb_files, frame_source_name, video_total_frames, video_fps, input_mode, None
+
+
+def _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index, playback_state_ref, last_frame_read_time_ref, video_fps, is_video, is_image, is_glb_sequence, image_frame, frame_count, data_queue, frame_source_name):
+    """Reads the next frame/GLB based on playback state. Returns timing delta."""
+    frame = None
+    points_xyz_np = None
+    colors_np = None
+    ret = False
+    frame_read_delta_t = 0.0 # Time since last successful read
+    current_time = time.time()
+    last_frame_read_time = last_frame_read_time_ref[0] # Get time from mutable ref
+    new_sequence_frame_index = sequence_frame_index
+    end_of_stream = False
+    read_successful = False # Flag to track if we got new data this cycle
+
+    is_playing = playback_state_ref.get("is_playing", True)
+    playback_speed = playback_state_ref.get("speed", 1.0)
+    loop_video = playback_state_ref.get("loop", True)
+    restart_video = playback_state_ref.get("restart", False)
+
+    if restart_video:
+        if (is_video and cap) or is_glb_sequence:
+            if cap: cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            new_sequence_frame_index = 0
+            playback_state_ref["current_frame"] = 0
+            print("DEBUG: Input restarted.")
+        playback_state_ref["restart"] = False # Consume restart flag
+
+    read_next_frame = is_playing or (is_image and frame_count == 0) # Read if playing or first image frame
+
+    if not read_next_frame and (is_video or is_glb_sequence):
+        time.sleep(0.05) # Sleep if paused
+        return None, None, None, False, new_sequence_frame_index, frame_read_delta_t, False # Indicate no frame read
+
+    target_delta = (1.0 / video_fps) / playback_speed if video_fps > 0 and playback_speed > 0 else 0.1
+    time_since_last_read = current_time - last_frame_read_time # Use local copy for calculation
+
+    # Check if it's time to read the next frame or if it's the first image frame
+    if time_since_last_read >= target_delta or (is_image and frame_count == 0):
+        # --- Attempt to read/load based on input mode ---
+        if is_video and cap:
+            ret, frame = cap.read()
+            if ret:
+                new_sequence_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                playback_state_ref["current_frame"] = new_sequence_frame_index
+                read_successful = True
+            else: # End of video
+                if loop_video:
+                    print("Looping video.")
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    new_sequence_frame_index = 0
+                    playback_state_ref["current_frame"] = 0
+                    ret, frame = cap.read() # Read first frame after loop
+                    if ret:
+                        read_successful = True # Read succeeded after loop
+                    else:
+                        end_of_stream = True # Failed to read after loop
+                else:
+                    end_of_stream = True # Not looping, end of stream
+        elif is_glb_sequence:
+            if new_sequence_frame_index >= len(glb_files): # End of sequence
+                if loop_video:
+                    print("Looping GLB sequence.")
+                    new_sequence_frame_index = 0
+                    playback_state_ref["current_frame"] = 0
+                else:
+                    end_of_stream = True
+
+            if not end_of_stream:
+                current_glb_path = glb_files[new_sequence_frame_index]
+                points_xyz_np, colors_np = load_glb(current_glb_path)
+                if points_xyz_np is not None:
+                    ret = True
+                    playback_state_ref["current_frame"] = new_sequence_frame_index + 1
+                    new_sequence_frame_index += 1
+                    read_successful = True
+                else:
+                    print(f"Error loading GLB frame: {current_glb_path}")
+                    end_of_stream = True # Stop on error
+        elif is_image:
+             if frame_count == 0:
+                 frame = image_frame
+                 if frame is not None:
+                     ret = True
+                     read_successful = True
+                 else:
+                     ret = False
+             else: # Only process image once
+                 end_of_stream = True
+        # --- End read/load attempt ---
+
+        # Update timing *once* if read was successful this cycle
+        if read_successful:
+            frame_read_delta_t = current_time - last_frame_read_time
+            last_frame_read_time_ref[0] = current_time # Update ref
+
+        # Handle end of stream condition
+        if end_of_stream:
+            print(f"End of {input_mode}: {frame_source_name}")
+            data_queue.put(("status", f"Finished processing: {frame_source_name}"))
+            # Return timing delta even on the last frame before stopping
+            return None, None, None, False, new_sequence_frame_index, frame_read_delta_t, True
+
+        # Return results for this cycle (if not end of stream)
+        return frame, points_xyz_np, colors_np, ret, new_sequence_frame_index, frame_read_delta_t, False
+
+    else: # Not time to read next frame yet
+        sleep_time = target_delta - time_since_last_read # Calculate sleep_time here
+        time.sleep(max(0.001, sleep_time))
+        return None, None, None, False, new_sequence_frame_index, frame_read_delta_t, False # Indicate no frame read
+
+
+def _apply_sharpening(rgb_frame, edge_params_ref):
+    """Applies sharpening to the RGB frame if enabled."""
+    enable_sharpening = edge_params_ref.get("enable_sharpening", False)
+    sharpness_amount = edge_params_ref.get("sharpness", 1.5) # Use sharpness from edge_params
+    if enable_sharpening and sharpness_amount > 0 and rgb_frame is not None:
+        try:
+            blurred = cv2.GaussianBlur(rgb_frame, (0, 0), 3)
+            # Adjust addWeighted parameters based on sharpness_amount
+            # sharpness_amount=1.0 means no change, >1 means sharpen
+            alpha = 1.0 + (sharpness_amount - 1.0) * 0.5 # Scale effect
+            beta = - (sharpness_amount - 1.0) * 0.5
+            sharpened = cv2.addWeighted(rgb_frame, alpha, blurred, beta, 0)
+            return np.clip(sharpened, 0, 255).astype(np.uint8)
+        except Exception as e_sharp:
+            print(f"Warning: Error during sharpening: {e_sharp}")
+            return rgb_frame
+    else:
+        return rgb_frame
+
+
+def _run_model_inference(model, frame, device):
+    """Runs the UniK3D model inference."""
+    if model is None or frame is None:
+        return None
+    try:
+        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float().to(device)
+        frame_tensor = frame_tensor.unsqueeze(0)
+        with torch.no_grad():
+            predictions = model.infer(frame_tensor)
+        return predictions
+    except Exception as e_infer:
+        print(f"Error during model inference: {e_infer}")
+        traceback.print_exc()
+        return None
+
+
+def _process_inference_results(predictions, rgb_frame_processed, device, edge_params_ref, prev_depth_map, smoothed_mean_depth, smoothed_points_xyz, frame_h, frame_w):
+    """Processes model predictions to generate point clouds, colors, and debug maps."""
+    points_xyz_np_processed = None
+    colors_np_processed = None
+    num_vertices = 0
+    scaled_depth_map_for_queue = None
+    edge_map_viz = None
+    smoothing_map_viz = None
+    new_prev_depth_map = prev_depth_map
+    new_smoothed_mean_depth = smoothed_mean_depth
+    new_smoothed_points_xyz = smoothed_points_xyz
+
+    if predictions is None:
+        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+
+    points_xyz = None
+    current_depth_map = None
+
+    # Extract points or calculate from depth/rays
+    if 'rays' in predictions and 'depth' in predictions:
+        current_depth_map = predictions['depth'].squeeze()
+        rays = predictions['rays'].squeeze()
+        if rays.shape[0] == 3 and rays.ndim == 3: rays = rays.permute(1, 2, 0)
+        if current_depth_map.shape == rays.shape[:2]:
+            depth_to_multiply = current_depth_map.unsqueeze(-1)
+            points_xyz = rays * depth_to_multiply
+        else: print("Warning: Depth and Ray shape mismatch.")
+    elif "points" in predictions:
+        points_xyz = predictions["points"]
+    else:
+        print("Warning: No points/depth found in predictions.")
+        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+
+    if points_xyz is None or points_xyz.numel() == 0:
+        print("Warning: No valid points generated.")
+        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+
+    # --- Edge Detection & Depth Processing (if depth map available) ---
+    combined_edge_map = None
+    depth_gradient_map = None
+    per_pixel_depth_motion_map = None
+    final_alpha_map = None
+
+    if current_depth_map is not None:
+        try:
+            depth_thresh1 = edge_params_ref["depth_threshold1"]
+            depth_thresh2 = edge_params_ref["depth_threshold2"]
+            rgb_thresh1 = edge_params_ref["rgb_threshold1"]
+            rgb_thresh2 = edge_params_ref["rgb_threshold2"]
+
+            depth_np_u8 = (torch.clamp(current_depth_map / 10.0, 0.0, 1.0) * 255).byte().cpu().numpy()
+            depth_edge_map = cv2.Canny(depth_np_u8, depth_thresh1, depth_thresh2)
+
+            grad_x = cv2.Sobel(depth_np_u8, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(depth_np_u8, cv2.CV_64F, 0, 1, ksize=3)
+            depth_gradient_map_np = cv2.magnitude(grad_x, grad_y)
+            if np.max(depth_gradient_map_np) > 1e-6:
+                depth_gradient_map_np = depth_gradient_map_np / np.max(depth_gradient_map_np)
+            depth_gradient_map = torch.from_numpy(depth_gradient_map_np).float().to(device)
+
+            gray_frame = cv2.cvtColor(rgb_frame_processed, cv2.COLOR_RGB2GRAY)
+            rgb_edge_map = cv2.Canny(gray_frame, rgb_thresh1, rgb_thresh2)
+
+            combined_edge_map = cv2.bitwise_or(depth_edge_map, rgb_edge_map)
+            edge_map_viz = cv2.cvtColor(combined_edge_map, cv2.COLOR_GRAY2RGB)
+
+            # Depth motion calculation
+            if new_prev_depth_map is not None and current_depth_map.shape == new_prev_depth_map.shape:
+                depth_diff = torch.abs(current_depth_map - new_prev_depth_map)
+                depth_motion_threshold = 0.1 # TODO: Make configurable?
+                per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0)
+                # normalized_depth = torch.clamp(current_depth_map / 10.0, 0.0, 1.0)
+                # distance_modulated_motion = per_pixel_depth_motion * (1.0 - normalized_depth)
+                per_pixel_depth_motion_map = per_pixel_depth_motion # Use unmodulated for now
+
+            new_prev_depth_map = current_depth_map.clone()
+
+            # Depth scaling based on smoothed mean depth (optional, maybe remove?)
+            # current_mean_depth = current_depth_map.mean().item()
+            # if new_smoothed_mean_depth is None: new_smoothed_mean_depth = current_mean_depth
+            # else: new_smoothed_mean_depth = 0.1 * current_mean_depth + 0.9 * new_smoothed_mean_depth # Simple EMA
+            # if current_mean_depth > 1e-6: scale_factor = new_smoothed_mean_depth / current_mean_depth
+            # else: scale_factor = 1.0
+            # scaled_depth_map = current_depth_map * scale_factor
+            scaled_depth_map_for_queue = current_depth_map # Queue original depth for now
+
+        except Exception as e_edge:
+            print(f"Error during edge/depth processing: {e_edge}")
+            combined_edge_map = None
+            edge_map_viz = None
+            depth_gradient_map = None
+            per_pixel_depth_motion_map = None
+            scaled_depth_map_for_queue = current_depth_map # Still queue original depth if possible
+
+    # --- Temporal Smoothing ---
+    enable_point_smoothing = edge_params_ref["enable_point_smoothing"]
+    if enable_point_smoothing:
+        if new_smoothed_points_xyz is None or new_smoothed_points_xyz.shape != points_xyz.shape:
+            print("Initializing/Resetting smoothing state.")
+            new_smoothed_points_xyz = points_xyz.clone()
+            # Assume full alpha initially if smoothing just started
+            if points_xyz.ndim == 3: final_alpha_map = torch.ones_like(points_xyz[:,:,0])
+            elif points_xyz.ndim == 2: final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
+        else:
+            # Calculate alpha map
+            min_alpha_points = edge_params_ref["min_alpha_points"]
+            max_alpha_points = edge_params_ref["max_alpha_points"]
+
+            # Base alpha on motion (if available)
+            if per_pixel_depth_motion_map is not None and per_pixel_depth_motion_map.shape == points_xyz.shape[:2]:
+                 motion_factor_points = per_pixel_depth_motion_map ** 2.0 # Square to emphasize motion
+                 base_alpha_map = min_alpha_points + (max_alpha_points - min_alpha_points) * motion_factor_points
+            else: # Default to max alpha if no motion map
+                 base_alpha_map = torch.full_like(points_xyz[:,:,0], max_alpha_points) if points_xyz.ndim == 3 else torch.full((points_xyz.shape[0],), max_alpha_points, device=device)
+
+            # Modulate alpha by edges (if enabled and available)
+            enable_edge_aware = edge_params_ref["enable_edge_aware"]
+            if enable_edge_aware and combined_edge_map is not None and combined_edge_map.shape == base_alpha_map.shape:
+                edge_mask_tensor = torch.from_numpy(combined_edge_map / 255.0).float().to(device)
+                edge_influence = edge_params_ref["influence"]
+                local_influence = edge_influence
+
+                # Modulate edge influence by gradient (if available)
+                grad_influence_scale = edge_params_ref["gradient_influence_scale"]
+                if depth_gradient_map is not None and depth_gradient_map.shape == base_alpha_map.shape:
+                    local_influence = edge_influence * torch.clamp(depth_gradient_map * grad_influence_scale, 0.0, 1.0)
+
+                final_alpha_map = torch.lerp(base_alpha_map, torch.ones_like(base_alpha_map), edge_mask_tensor * local_influence)
+            else:
+                final_alpha_map = base_alpha_map
+
+            # Apply smoothing
+            final_alpha_map_unsqueezed = final_alpha_map.unsqueeze(-1) if final_alpha_map.ndim == 2 else final_alpha_map.unsqueeze(-1) # Handle 2D/3D points_xyz
+            new_smoothed_points_xyz = final_alpha_map_unsqueezed * points_xyz + (1.0 - final_alpha_map_unsqueezed) * new_smoothed_points_xyz
+    else: # Smoothing disabled
+        new_smoothed_points_xyz = points_xyz
+        # Create dummy alpha map for visualization if needed
+        if points_xyz.ndim == 3: final_alpha_map = torch.ones_like(points_xyz[:,:,0])
+        elif points_xyz.ndim == 2: final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
+
+
+    # --- Create Smoothing Map Visualization ---
+    if final_alpha_map is not None:
+        try:
+            smoothing_map_vis_np = (final_alpha_map.cpu().numpy() * 255).astype(np.uint8)
+            if smoothing_map_vis_np.ndim == 2: # Ensure it's 3 channels for texture
+                 smoothing_map_viz = cv2.cvtColor(smoothing_map_vis_np, cv2.COLOR_GRAY2RGB)
+            elif smoothing_map_vis_np.ndim == 1: # Handle potential 1D case (unlikely)
+                 smoothing_map_viz = np.zeros((frame_h, frame_w, 3), dtype=np.uint8) # Placeholder
+            else: smoothing_map_viz = smoothing_map_vis_np # Assume already RGB
+        except Exception as e_smooth_viz:
+            print(f"Error creating smoothing map viz: {e_smooth_viz}")
+            smoothing_map_viz = None
+    else: smoothing_map_viz = None
+
+
+    # --- Prepare Output Point Cloud ---
+    points_xyz_to_process = new_smoothed_points_xyz
+    if points_xyz_to_process is None or points_xyz_to_process.numel() == 0:
+        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+
+    points_xyz_np_processed = points_xyz_to_process.squeeze().cpu().numpy()
+
+    # --- Transform Coordinates for OpenGL/GLB standard (+X Right, +Y Up, -Z Forward) ---
+    if points_xyz_np_processed.ndim >= 2 and points_xyz_np_processed.shape[-1] == 3:
+        points_xyz_np_processed[..., 1] *= -1.0 # Flip Y (Down -> Up)
+        points_xyz_np_processed[..., 2] *= -1.0 # Flip Z (Forward -> -Forward)
+    # ------------------------------------
+
+    # Reshape and get vertex count
+    try:
+        if points_xyz_np_processed.ndim == 3 and points_xyz_np_processed.shape[0] == 3: # C, H, W format?
+            points_xyz_np_processed = np.transpose(points_xyz_np_processed, (1, 2, 0)) # H, W, C
+            num_vertices = points_xyz_np_processed.shape[0] * points_xyz_np_processed.shape[1]
+            points_xyz_np_processed = points_xyz_np_processed.reshape(num_vertices, 3)
+        elif points_xyz_np_processed.ndim == 2 and points_xyz_np_processed.shape[1] == 3: # N, C format
+             num_vertices = points_xyz_np_processed.shape[0]
+        elif points_xyz_np_processed.ndim == 3 and points_xyz_np_processed.shape[2] == 3: # H, W, C format
+             num_vertices = points_xyz_np_processed.shape[0] * points_xyz_np_processed.shape[1]
+             points_xyz_np_processed = points_xyz_np_processed.reshape(num_vertices, 3)
+        else:
+            print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np_processed.shape}")
+            num_vertices = 0
+    except Exception as e_reshape:
+            print(f"Error reshaping points_xyz_np: {e_reshape}")
+            num_vertices = 0
+
+    # --- Sample Colors ---
+    if num_vertices > 0 and rgb_frame_processed is not None:
+        try:
+            if rgb_frame_processed.shape[0] == frame_h and rgb_frame_processed.shape[1] == frame_w:
+                colors_np_processed = rgb_frame_processed.reshape(frame_h * frame_w, 3)
+                # Ensure colors match potentially reshaped points (this assumes points correspond to pixels)
+                if colors_np_processed.shape[0] == num_vertices:
+                    if colors_np_processed.dtype == np.uint8:
+                        colors_np_processed = colors_np_processed.astype(np.float32) / 255.0
+                    elif colors_np_processed.dtype == np.float32:
+                        colors_np_processed = np.clip(colors_np_processed, 0.0, 1.0)
+                    else:
+                        print(f"Warning: Unexpected color dtype {colors_np_processed.dtype}, using white.")
+                        colors_np_processed = None
+                else:
+                     print(f"Warning: Point count ({num_vertices}) mismatch with color pixels ({colors_np_processed.shape[0]}). No colors.")
+                     colors_np_processed = None # Mismatch after reshape
+            else:
+                 print(f"Warning: Dimension mismatch between points ({frame_h}x{frame_w}) and processed frame ({rgb_frame_processed.shape[:2]})")
+                 colors_np_processed = None
+        except Exception as e_color:
+            print(f"Error processing colors: {e_color}")
+            colors_np_processed = None
+    else:
+        colors_np_processed = None # No vertices or no frame
+
+    # Use white if colors failed
+    if colors_np_processed is None and num_vertices > 0:
+        colors_np_processed = np.ones((num_vertices, 3), dtype=np.float32)
+
+
+    return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+
+
+def _handle_recording(points_xyz_np, colors_np, recording_state_ref, sequence_frame_index, recorded_frame_counter, is_video, is_glb_sequence, data_queue):
+    """Handles saving the current frame to GLB if recording is active."""
+    new_recorded_frame_counter = recorded_frame_counter
+    is_recording = recording_state_ref.get("is_recording", False)
+    output_dir = recording_state_ref.get("output_dir", "recording_output")
+
+    if is_recording and points_xyz_np is not None:
+        new_recorded_frame_counter += 1
+        # Use sequence_frame_index for GLB naming if available and non-zero, else use recorded_frame_counter
+        # Adjust sequence_frame_index because it's incremented *after* loading
+        current_playback_index = sequence_frame_index -1 if (is_video or is_glb_sequence) else -1
+        save_index = current_playback_index if current_playback_index >= 0 else new_recorded_frame_counter
+
+        glb_filename = os.path.join(output_dir, f"frame_{save_index:05d}.glb")
+        # Save points as they are (coordinate system should be standard here)
+        # Save the already transformed points (X, Y-up, Z-backward)
+        save_glb(glb_filename, points_xyz_np, colors_np)
+        if new_recorded_frame_counter % 30 == 0: # Log every 30 frames
+            data_queue.put(("status", f"Recording frame {new_recorded_frame_counter}..."))
+
+    return new_recorded_frame_counter
+
+
+def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices, rgb_frame_orig, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, t_capture, sequence_frame_index, video_total_frames, current_recorded_count, frame_count, frame_read_delta_t, depth_process_delta_t, latency_ms):
+    """Puts the processed data into the queue for the main thread."""
+    if not data_queue.full():
+            data_queue.put((vertices_flat, colors_flat, num_vertices,
+                            rgb_frame_orig,
+                            scaled_depth_map_for_queue,
+                            edge_map_viz,
+                            smoothing_map_viz,
+                            t_capture,
+                            sequence_frame_index,
+                            video_total_frames,
+                            current_recorded_count,
+                            frame_read_delta_t, depth_process_delta_t, latency_ms)) # Add timing info
+    else:
+        print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
+        # Optionally put a status message instead of dropping silently
+        # data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
+
+
+# --- Main Inference Thread Function ---
+# --- Inference Thread Function ---
+# --- Main Inference Thread Function (Refactored) ---
+def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
+                          scale_factor_ref, edge_params_ref,
+                          input_mode, input_filepath, playback_state, # Renamed parameter
+                          recording_state_ref):
+    """Loads model, captures/loads data, runs inference, processes, and queues results."""
+    print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}")
+    data_queue.put(("status", f"Inference thread started ({input_mode})..."))
+
+    cap = None
+    image_frame = None
+    is_video = False
+    is_image = False
+    is_glb_sequence = False
+    glb_files = []
+    frame_source_name = "N/A"
+    video_total_frames = 0
+    video_fps = 30
+    error_message = None
+    model = None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     try:
-        # --- Load Model (Only if not playing GLB sequence) ---
-        model = None
-        if input_mode != "GLB Sequence": # Don't load model if playing GLB
+        # --- Load Model (if needed) ---
+        if input_mode != "GLB Sequence":
             print(f"Loading UniK3D model: {model_name}...")
             data_queue.put(("status", f"Loading model: {model_name}..."))
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             print(f"Using device: {device}")
             model = UniK3D.from_pretrained(f"lpiccinelli/{model_name}")
             model = model.to(device)
@@ -321,546 +824,153 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             print("Model loaded.")
             data_queue.put(("status", "Model loaded."))
         else:
-             device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Still need device for smoothing tensors
+            print("GLB Sequence mode: Skipping model load.")
+            data_queue.put(("status", "GLB Sequence mode: Skipping model load."))
+
 
         # --- Initialize Input Source ---
-        if input_mode == "Live":
-            print("Initializing camera...")
-            data_queue.put(("status", "Initializing camera..."))
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                print("Error: Could not open camera.")
-                data_queue.put(("error", "Could not open camera."))
-                return
-            is_video = True
-            frame_source_name = "Live Camera"
-            video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
-            print("Camera initialized.")
-            data_queue.put(("status", "Camera initialized."))
-        elif input_mode == "File" and input_filepath and os.path.exists(input_filepath):
-            frame_source_name = os.path.basename(input_filepath)
-            if os.path.isdir(input_filepath):
-                # --- Load GLB Sequence ---
-                print(f"Scanning directory for GLB files: {input_filepath}")
-                data_queue.put(("status", f"Scanning directory: {frame_source_name}..."))
-                # Scan for .glb files instead of .ply
-                glb_files = sorted(glob.glob(os.path.join(input_filepath, "*.glb")),
-                                   key=lambda x: int(re.search(r'(\d+)', os.path.basename(x)).group(1)) if re.search(r'(\d+)', os.path.basename(x)) else -1) # Sort numerically
-                if not glb_files:
-                    print(f"Error: No .glb files found in directory: {input_filepath}")
-                    data_queue.put(("error", f"No .glb files found in: {frame_source_name}"))
-                    return
-                is_glb_sequence = True # Set GLB flag
-                input_mode = "GLB Sequence" # Update mode explicitly
-                video_total_frames = len(glb_files)
-                video_fps = 30 # Assume 30 FPS for GLB sequences for now
-                playback_state_ref["total_frames"] = video_total_frames
-                playback_state_ref["current_frame"] = 0
-                print(f"GLB sequence loaded successfully ({video_total_frames} frames).")
-                data_queue.put(("status", f"Loaded GLB sequence: {frame_source_name}"))
-            else:
-                # --- Load Video or Image File ---
-                print(f"Initializing video capture for file: {input_filepath}")
-                data_queue.put(("status", f"Opening file: {frame_source_name}..."))
-                cap = cv2.VideoCapture(input_filepath)
-                if cap.isOpened():
-                    is_video = True
-                    video_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
-                    playback_state_ref["total_frames"] = video_total_frames
-                    playback_state_ref["current_frame"] = 0
-                    print(f"Video file opened successfully ({video_total_frames} frames @ {video_fps:.2f} FPS).")
-                    data_queue.put(("status", f"Opened video: {frame_source_name}"))
-                else:
-                    print("Failed to open as video, trying as image...")
-                    try:
-                        image_frame = cv2.imread(input_filepath) # Load image frame here
-                        if image_frame is not None:
-                            is_image = True
-                            print("Image file loaded successfully.")
-                            data_queue.put(("status", f"Loaded image: {frame_source_name}"))
-                        else:
-                            print(f"Error: Could not read file as video or image: {input_filepath}")
-                            data_queue.put(("error", f"Cannot open file: {frame_source_name}"))
-                            return
-                    except Exception as e_img:
-                        print(f"Error reading file as image: {input_filepath} - {e_img}")
-                        data_queue.put(("error", f"Error reading file: {frame_source_name}"))
-                        return
-        else:
-            print(f"Error: Invalid input mode or file path: {input_mode}, {input_filepath}")
-            data_queue.put(("error", "Invalid input source specified."))
-            return
+        cap, image_frame, is_video, is_image, is_glb_sequence, glb_files, \
+        frame_source_name, video_total_frames, video_fps, input_mode, error_message = \
+            _initialize_input_source(input_mode, input_filepath, data_queue, playback_state) # Use renamed variable
 
-        # --- Start of main loop logic ---
-        frame_count = 0 # Overall frames processed by thread
-        sequence_frame_index = 0 # Current frame index for video/GLB sequence
-        last_inference_time = time.time()
-        last_frame_read_time = time.time() # For playback speed control
+        if error_message:
+            return # Error already queued by helper
+
+        # --- Main Loop ---
+        frame_count = 0
+        sequence_frame_index = 0
+        # last_inference_time = time.time() # Replaced by depth_processed_time
+        last_frame_read_time_ref = [time.time()] # Use mutable list/ref for helper function
+        recorded_frame_counter = 0
         smoothed_points_xyz = None
-        depth_motion_threshold = 0.1
         prev_depth_map = None
         smoothed_mean_depth = None
-        prev_scale_factor = None
-        min_alpha_scale = 0.0
-        max_alpha_scale = 1.0
+        prev_scale_factor = None # For detecting scale changes
+        last_depth_processed_time = time.time() # For depth/processing FPS calculation
 
-        while not exit_event.is_set(): # Check exit event at start of loop
+        while not exit_event.is_set():
             t_capture = time.time()
-            frame = None # Frame from video/camera
-            ret = False # Frame read success
-            points_xyz_np = None # Loaded from GLB
-            colors_np = None # Loaded from GLB or generated from frame
-            num_vertices = 0 # Number of points for current frame
 
-            # --- Playback Control & Frame Reading/Loading ---
-            is_playing = playback_state_ref.get("is_playing", True)
-            playback_speed = playback_state_ref.get("speed", 1.0)
-            loop_video = playback_state_ref.get("loop", True) # Applies to GLB sequence too
-            restart_video = playback_state_ref.get("restart", False)
+            # --- Read/Load Frame ---
+            frame, points_xyz_np_loaded, colors_np_loaded, ret, \
+            sequence_frame_index, frame_read_delta_t, end_of_stream = \
+                _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index,
+                                   playback_state, last_frame_read_time_ref, video_fps, # Pass renamed playback_state dict
+                                   is_video, is_image, is_glb_sequence, image_frame,
+                                   frame_count, data_queue, frame_source_name)
+            # Check if sequence looped or restarted (index reset by _read_or_load_frame)
+            # Reset recorder counter accordingly
+            # Use frame_count > 1 to avoid resetting on the very first frame
+            if frame_count > 1 and sequence_frame_index <= 1:
+                 if recorded_frame_counter > 0: # Only reset if it was actually counting
+                    print("DEBUG: Resetting recorded frame counter due to loop/restart.")
+                    recorded_frame_counter = 0
 
-            if restart_video:
-                if (is_video and cap) or is_glb_sequence:
-                    if cap: cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    sequence_frame_index = 0
-                    playback_state_ref["current_frame"] = 0
-                    recorded_frame_counter = 0 # Reset recording counter on restart
-                    print("DEBUG: Input restarted.")
-                playback_state_ref["restart"] = False # Consume restart flag
+            if end_of_stream:
+                break # Exit loop if end of file/sequence and not looping
 
-            read_next_frame = is_playing or is_image # Read if playing or if it's the first image frame
-
-            if is_video and cap and read_next_frame:
-                target_delta = (1.0 / video_fps) / playback_speed if video_fps > 0 and playback_speed > 0 else 0.1
-                time_since_last_read = time.time() - last_frame_read_time
-                if time_since_last_read >= target_delta:
-                    if exit_event.is_set(): break
-                    ret, frame = cap.read()
-                    last_frame_read_time = time.time()
-                    if ret:
-                        sequence_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                        playback_state_ref["current_frame"] = sequence_frame_index
-                    else:
-                        if loop_video:
-                            print("Looping video.")
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            sequence_frame_index = 0
-                            playback_state_ref["current_frame"] = 0
-                            recorded_frame_counter = 0
-                            if exit_event.is_set(): break
-                            ret, frame = cap.read()
-                            if not ret: break
-                        else:
-                            print("End of video file.")
-                            data_queue.put(("status", f"Finished processing: {frame_source_name}"))
-                            break
-                else:
-                    sleep_time = target_delta - time_since_last_read
-                    time.sleep(max(0.001, sleep_time))
-                    continue
-            elif is_glb_sequence and read_next_frame: # Changed from is_ply_sequence
-                target_delta = (1.0 / video_fps) / playback_speed if video_fps > 0 and playback_speed > 0 else 0.1
-                time_since_last_read = time.time() - last_frame_read_time
-                if time_since_last_read >= target_delta:
-                    if sequence_frame_index >= len(glb_files): # End of sequence
-                        if loop_video:
-                            print("Looping GLB sequence.")
-                            sequence_frame_index = 0
-                            playback_state_ref["current_frame"] = 0
-                            recorded_frame_counter = 0
-                        else:
-                            print("End of GLB sequence.")
-                            data_queue.put(("status", f"Finished processing: {frame_source_name}"))
-                            break
-
-                    current_glb_path = glb_files[sequence_frame_index]
-                    points_xyz_np, colors_np = load_glb(current_glb_path) # Load GLB data
-                    last_frame_read_time = time.time()
-
-                    if points_xyz_np is not None:
-                        ret = True # Indicate success
-                        playback_state_ref["current_frame"] = sequence_frame_index + 1
-                        sequence_frame_index += 1
-                    else:
-                        print(f"Error loading GLB frame: {current_glb_path}")
-                        break # Stop on error
-                else:
-                    sleep_time = target_delta - time_since_last_read
-                    time.sleep(max(0.001, sleep_time))
-                    continue
-
-            elif is_image:
-                if frame_count == 0:
-                    frame = image_frame
-                    ret = True if frame is not None else False
-                else:
-                    data_queue.put(("status", f"Finished processing image: {frame_source_name}"))
-                    while not exit_event.is_set(): time.sleep(0.1)
-                    break
-            elif not is_playing and (is_video or is_glb_sequence):
-                 time.sleep(0.05)
-                 continue
-            else:
-                print("Error: No valid input source or state.")
-                break
-
-            if not ret: # Check if frame/GLB reading failed
-                if (is_video or is_glb_sequence) and not loop_video: break
-                time.sleep(0.1)
+            if not ret: # If no frame was read (e.g., paused or waiting for next frame time)
                 continue
 
-            # --- Process Frame (Inference or GLB Load) ---
+            # --- Process Frame ---
             frame_count += 1
-            run_inference_this_frame = (is_video or is_image) # Only run inference for non-GLB
-            process_glb_this_frame = is_glb_sequence # Flag to process loaded GLB data
+            print(f"Processing frame {frame_count} (Seq Idx: {sequence_frame_index})")
+            # last_inference_time = time.time() # Replaced by depth_processed_time
 
-            if run_inference_this_frame or process_glb_this_frame:
-                if exit_event.is_set(): break
+            # Reset per-frame data
+            rgb_frame_orig = None
+            points_xyz_np_processed = None
+            colors_np_processed = None
+            num_vertices = 0
+            scaled_depth_map_for_queue = None
+            edge_map_viz = None
+            smoothing_map_viz = None
 
-                current_scale = scale_factor_ref[0]
-                if prev_scale_factor is not None and abs(current_scale - prev_scale_factor) > 1e-3:
-                    print(f"Scale factor changed ({prev_scale_factor:.2f} -> {current_scale:.2f}). Resetting smoothing state.")
-                    smoothed_points_xyz = None
-                    prev_depth_map = None
-                    smoothed_mean_depth = None
-                prev_scale_factor = current_scale
+            # --- Timing & State Reset ---
+            depth_process_delta_t = 0.0 # Time since last successful depth processing
+            # Check for scale factor changes to reset smoothing
+            current_scale = scale_factor_ref[0]
+            if prev_scale_factor is not None and abs(current_scale - prev_scale_factor) > 1e-3:
+                print(f"Scale factor changed ({prev_scale_factor:.2f} -> {current_scale:.2f}). Resetting smoothing state.")
+                smoothed_points_xyz = None
+                prev_depth_map = None
+                smoothed_mean_depth = None
+            prev_scale_factor = current_scale
 
+
+            if is_glb_sequence:
+                # --- Process Loaded GLB Data ---
+                if points_xyz_np_loaded is not None:
+                    points_xyz_np_processed = points_xyz_np_loaded
+                    colors_np_processed = colors_np_loaded
+                    num_vertices = points_xyz_np_processed.shape[0]
+                    # Transform loaded GLB data to OpenGL standard (+X Right, +Y Up, -Z Forward)
+                    if points_xyz_np_processed.ndim >= 2 and points_xyz_np_processed.shape[-1] == 3:
+                         points_xyz_np_processed[..., 1] *= -1.0 # Flip Y
+                         points_xyz_np_processed[..., 2] *= -1.0 # Flip Z
+                    # Create dummy frame for debug view consistency
+                    frame_h, frame_w = (100, 100) if num_vertices == 0 else (int(np.sqrt(num_vertices)), int(np.sqrt(num_vertices))) # Guess dims
+                    rgb_frame_orig = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+                else:
+                    continue # Skip if GLB load failed
+                # Mark depth processed time for GLB
                 current_time = time.time()
-                print(f"Processing frame {frame_count} (Seq Idx: {sequence_frame_index}) (Time since last: {current_time - last_inference_time:.2f}s)")
-                last_inference_time = current_time
+                depth_process_delta_t = current_time - last_depth_processed_time
+                last_depth_processed_time = current_time
 
-                # Reset per-frame data
-                rgb_frame_orig = None
-                scaled_depth_map_for_queue = None
-                edge_map_viz = None
-                smoothing_map_viz = None
-                points_xyz_np_processed = None # Use this for queuing
-                colors_np_processed = None # Use this for queuing
-                num_vertices = 0
+            else: # Live, Video File, or Image File
+                # --- Preprocess Frame (Scale, Sharpen) ---
+                if current_scale > 0.1:
+                    new_width = int(frame.shape[1] * current_scale)
+                    new_height = int(frame.shape[0] * current_scale)
+                    interpolation = cv2.INTER_AREA if current_scale < 1.0 else cv2.INTER_LINEAR
+                    scaled_frame = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
+                else:
+                    scaled_frame = frame
 
-                try:
-                    if is_glb_sequence:
-                        # --- Process Loaded GLB Data ---
-                        if points_xyz_np is not None:
-                            num_vertices = points_xyz_np.shape[0]
-                            points_xyz_np[:, 1] *= -1.0 # Invert Y for display
-                            points_xyz_np_processed = points_xyz_np
-                            colors_np_processed = colors_np # Already loaded or None
-                            # Create placeholders for other maps
-                            frame_h, frame_w = (100, 100) if num_vertices == 0 else (int(np.sqrt(num_vertices)), int(np.sqrt(num_vertices))) # Guess dims
-                            rgb_frame_orig = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
-                            scaled_depth_map_for_queue = None
-                            edge_map_viz = None
-                            smoothing_map_viz = None
-                        else:
-                            continue # Skip if GLB load failed earlier
+                rgb_frame_orig = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
+                rgb_frame_processed = _apply_sharpening(rgb_frame_orig, edge_params_ref)
+                frame_h, frame_w, _ = rgb_frame_processed.shape
 
-                    else: # Live, Video File, or Image File -> Run Inference
-                        # --- Run Inference and Process ---
-                        data_queue.put(("status", f"Preprocessing frame {frame_count}..."))
+                # --- Run Inference ---
+                data_queue.put(("status", f"Running inference on frame {frame_count}..."))
+                predictions = _run_model_inference(model, rgb_frame_processed, device) # Use processed frame for inference
 
-                        # Perform scaling here, inside the else block
-                        if current_scale > 0.1:
-                            new_width = int(frame.shape[1] * current_scale)
-                            new_height = int(frame.shape[0] * current_scale)
-                            interpolation = cv2.INTER_AREA if current_scale < 1.0 else cv2.INTER_LINEAR
-                            scaled_frame = cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
-                        else:
-                            scaled_frame = frame
-
-                        rgb_frame_orig = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
-
-                        enable_sharpening = edge_params_ref.get("enable_sharpening", False)
-                        sharpness_amount = edge_params_ref.get("sharpness", 1.5)
-                        if enable_sharpening and sharpness_amount > 0:
-                            blurred = cv2.GaussianBlur(rgb_frame_orig, (0, 0), 3)
-                            sharpened = cv2.addWeighted(rgb_frame_orig, 1.0 + sharpness_amount, blurred, -sharpness_amount, 0)
-                            rgb_frame_processed = np.clip(sharpened, 0, 255).astype(np.uint8)
-                        else:
-                            rgb_frame_processed = rgb_frame_orig
-
-                        frame_h, frame_w, _ = rgb_frame_processed.shape
-                        frame_tensor = torch.from_numpy(rgb_frame_orig).permute(2, 0, 1).float().to(device)
-                        frame_tensor = frame_tensor.unsqueeze(0)
-
-                        data_queue.put(("status", f"Running inference on frame {frame_count}..."))
-                        with torch.no_grad():
-                            predictions = model.infer(frame_tensor)
-
-                        points_xyz = None
-                        if 'rays' in predictions and 'depth' in predictions:
-                            current_depth_map = predictions['depth'].squeeze()
-
-                            # --- Edge Detection ---
-                            combined_edge_map = None
-                            depth_gradient_map = None
-                            if current_depth_map is not None:
-                                try:
-                                    depth_thresh1 = edge_params_ref["depth_threshold1"]
-                                    depth_thresh2 = edge_params_ref["depth_threshold2"]
-                                    rgb_thresh1 = edge_params_ref["rgb_threshold1"]
-                                    rgb_thresh2 = edge_params_ref["rgb_threshold2"]
-
-                                    depth_np_u8 = (torch.clamp(current_depth_map / 10.0, 0.0, 1.0) * 255).byte().cpu().numpy()
-                                    depth_edge_map = cv2.Canny(depth_np_u8, depth_thresh1, depth_thresh2)
-
-                                    grad_x = cv2.Sobel(depth_np_u8, cv2.CV_64F, 1, 0, ksize=3)
-                                    grad_y = cv2.Sobel(depth_np_u8, cv2.CV_64F, 0, 1, ksize=3)
-                                    depth_gradient_map = cv2.magnitude(grad_x, grad_y)
-                                    if np.max(depth_gradient_map) > 1e-6:
-                                        depth_gradient_map = depth_gradient_map / np.max(depth_gradient_map)
-
-                                    gray_frame = cv2.cvtColor(rgb_frame_processed, cv2.COLOR_RGB2GRAY)
-                                    rgb_edge_map = cv2.Canny(gray_frame, rgb_thresh1, rgb_thresh2)
-
-                                    combined_edge_map = cv2.bitwise_or(depth_edge_map, rgb_edge_map)
-                                    edge_map_viz = cv2.cvtColor(combined_edge_map, cv2.COLOR_GRAY2RGB)
-                                except Exception as e_edge:
-                                    print(f"Error during edge detection: {e_edge}")
-                                    combined_edge_map = None
-                                    edge_map_viz = None
-                                    depth_gradient_map = None
-                            # ---------------------
-
-                            per_pixel_depth_motion_map = None
-                            per_pixel_depth_motion = None
-                            if prev_depth_map is not None and current_depth_map.shape == prev_depth_map.shape:
-                                depth_diff = torch.abs(current_depth_map - prev_depth_map)
-                                per_pixel_depth_motion = torch.clamp(depth_diff / depth_motion_threshold, 0.0, 1.0)
-                                normalized_depth = torch.clamp(current_depth_map / 10.0, 0.0, 1.0)
-                                distance_modulated_motion = per_pixel_depth_motion * (1.0 - normalized_depth)
-                                per_pixel_depth_motion_map = distance_modulated_motion
-
-                            prev_depth_map = current_depth_map.clone()
-
-                            global_motion_unmodulated = 0.0
-                            if per_pixel_depth_motion is not None:
-                                global_motion_unmodulated = per_pixel_depth_motion.mean().item()
-
-                            scaled_depth_map = current_depth_map
-                            current_mean_depth = current_depth_map.mean().item()
-                            min_alpha_scale = edge_params_ref.get("min_alpha_scale", 0.0)
-                            max_alpha_scale = edge_params_ref.get("max_alpha_scale", 1.0)
-                            motion_factor_scale = global_motion_unmodulated ** 2.0
-                            adaptive_alpha_scale = min_alpha_scale + (max_alpha_scale - min_alpha_scale) * motion_factor_scale
-
-                            if smoothed_mean_depth is None:
-                                smoothed_mean_depth = current_mean_depth
-                            else:
-                                smoothed_mean_depth = adaptive_alpha_scale * current_mean_depth + (1.0 - adaptive_alpha_scale) * smoothed_mean_depth
-
-                            if current_mean_depth > 1e-6:
-                                scale_factor = smoothed_mean_depth / current_mean_depth
-                                scaled_depth_map = current_depth_map * scale_factor
-
-                            scaled_depth_map_for_queue = scaled_depth_map
-
-                            rays = predictions['rays'].squeeze()
-                            if rays.shape[0] == 3 and rays.ndim == 3:
-                                rays = rays.permute(1, 2, 0)
-                            depth_to_multiply = scaled_depth_map.unsqueeze(-1)
-                            points_xyz = rays * depth_to_multiply
-                            data_queue.put(("status", f"Calculated points for frame {frame_count}..."))
-
-                        elif "points" in predictions:
-                            data_queue.put(("status", f"Using direct points for frame {frame_count}..."))
-                            points_xyz = predictions["points"]
-                        else:
-                            data_queue.put(("warning", f"No points/depth found for frame {frame_count}"))
-
-                        if points_xyz is not None:
-                            if smoothed_points_xyz is None:
-                                smoothed_points_xyz = points_xyz.clone()
-                            else:
-                                if smoothed_points_xyz.shape == points_xyz.shape:
-                                    # --- Edge-Aware Smoothing ---
-                                    enable_point_smoothing = edge_params_ref["enable_point_smoothing"]
-                                    enable_edge_aware = edge_params_ref["enable_edge_aware"]
-                                    edge_influence = edge_params_ref["influence"]
-                                    min_alpha_points = edge_params_ref["min_alpha_points"]
-                                    max_alpha_points = edge_params_ref["max_alpha_points"]
-                                    grad_influence_scale = edge_params_ref["gradient_influence_scale"]
-
-                                    final_alpha_map = None
-
-                                    if enable_point_smoothing and per_pixel_depth_motion_map is not None:
-                                        if points_xyz.ndim == 3 and points_xyz.shape[:2] == per_pixel_depth_motion_map.shape:
-                                            motion_factor_points = 0.0
-                                            if per_pixel_depth_motion is not None:
-                                                 motion_factor_points = per_pixel_depth_motion ** 2.0
-
-                                            base_alpha_map = min_alpha_points + (max_alpha_points - min_alpha_points) * motion_factor_points
-
-                                            if enable_edge_aware and combined_edge_map is not None and combined_edge_map.shape == base_alpha_map.shape:
-                                                edge_mask_tensor = torch.from_numpy(combined_edge_map / 255.0).float().to(device)
-
-                                                local_influence = edge_influence
-                                                if depth_gradient_map is not None and depth_gradient_map.shape == base_alpha_map.shape:
-                                                    gradient_tensor = torch.from_numpy(depth_gradient_map).float().to(device)
-                                                    local_influence = edge_influence * torch.clamp(gradient_tensor * grad_influence_scale, 0.0, 1.0)
-
-                                                final_alpha_map = torch.lerp(base_alpha_map, torch.ones_like(base_alpha_map), edge_mask_tensor * local_influence)
-                                            else:
-                                                final_alpha_map = base_alpha_map
-
-                                            final_alpha_map_unsqueezed = final_alpha_map.unsqueeze(-1)
-                                            smoothed_points_xyz = final_alpha_map_unsqueezed * points_xyz + (1.0 - final_alpha_map_unsqueezed) * smoothed_points_xyz
-                                        else:
-                                            smoothed_points_xyz = points_xyz
-                                            final_alpha_map = torch.ones_like(points_xyz[:,:,0]) if points_xyz.ndim == 3 else torch.ones(points_xyz.shape[0], device=device)
-                                    else:
-                                        smoothed_points_xyz = points_xyz
-                                        if points_xyz.ndim == 3: final_alpha_map = torch.ones_like(points_xyz[:,:,0])
-                                        elif points_xyz.ndim == 2: final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
-                                    # --- End Edge-Aware Smoothing ---
-
-                                    # --- Create Smoothing Map Visualization ---
-                                    if final_alpha_map is not None:
-                                        try:
-                                            if final_alpha_map.ndim == 1:
-                                                h, w = frame_h, frame_w
-                                                smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
-                                            else:
-                                                smoothing_map_vis_np = (final_alpha_map.cpu().numpy() * 255).astype(np.uint8)
-                                                smoothing_map_viz = cv2.cvtColor(smoothing_map_vis_np, cv2.COLOR_GRAY2RGB)
-                                        except Exception as e_smooth_viz:
-                                            print(f"Error creating smoothing map viz: {e_smooth_viz}")
-                                            smoothing_map_viz = None
-                                    else:
-                                         h, w = frame_h, frame_w
-                                         smoothing_map_viz = np.zeros((h, w, 3), dtype=np.uint8)
+                # --- Process Results ---
+                data_queue.put(("status", f"Processing results for frame {frame_count}..."))
+                points_xyz_np_processed, colors_np_processed, num_vertices, \
+                scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, \
+                prev_depth_map, smoothed_mean_depth, smoothed_points_xyz = \
+                    _process_inference_results(predictions, rgb_frame_processed, device,
+                                               edge_params_ref, prev_depth_map,
+                                               smoothed_mean_depth, smoothed_points_xyz,
+                                               frame_h, frame_w)
+                # Mark depth processed time for inference
+                current_time = time.time()
+                depth_process_delta_t = current_time - last_depth_processed_time
+                last_depth_processed_time = current_time
 
 
-                                else:
-                                    print("Warning: Points tensor shape changed, resetting smoothing.")
-                                    smoothed_points_xyz = points_xyz.clone()
-                            points_xyz_to_process = smoothed_points_xyz
-                        else:
-                            points_xyz_to_process = None
+            # --- Handle Recording ---
+            recorded_frame_counter = _handle_recording(points_xyz_np_processed, colors_np_processed,
+                                                       recording_state_ref, sequence_frame_index,
+                                                       recorded_frame_counter, is_video, is_glb_sequence,
+                                                       data_queue)
 
-                        if points_xyz_to_process is None or points_xyz_to_process.numel() == 0:
-                            continue
+            # --- Calculate Latency & Queue Results ---
+            latency_ms = (time.time() - t_capture) * 1000.0
+            vertices_flat = points_xyz_np_processed.flatten() if points_xyz_np_processed is not None else None
+            colors_flat = colors_np_processed.flatten() if colors_np_processed is not None else None
 
-                        points_xyz_np_processed = points_xyz_to_process.squeeze().cpu().numpy()
+            _queue_results(data_queue, vertices_flat, colors_flat, num_vertices,
+                           rgb_frame_orig, scaled_depth_map_for_queue, edge_map_viz,
+                           smoothing_map_viz, t_capture, sequence_frame_index,
+                           video_total_frames, recorded_frame_counter, frame_count,
+                           frame_read_delta_t, depth_process_delta_t, latency_ms) # Pass timing
 
-                        # --- Invert Y Coordinate ---
-                        points_xyz_np_processed[:, 1] *= -1.0
-                        # -------------------------
-
-                        num_vertices = 0
-                        try:
-                            if points_xyz_np_processed.ndim == 3 and points_xyz_np_processed.shape[0] == 3:
-                                points_xyz_np_processed = np.transpose(points_xyz_np_processed, (1, 2, 0))
-                                num_vertices = points_xyz_np_processed.shape[0] * points_xyz_np_processed.shape[1]
-                                points_xyz_np_processed = points_xyz_np_processed.reshape(num_vertices, 3)
-                            elif points_xyz_np_processed.ndim == 2 and points_xyz_np_processed.shape[1] == 3:
-                                 num_vertices = points_xyz_np_processed.shape[0]
-                            elif points_xyz_np_processed.ndim == 3 and points_xyz_np_processed.shape[2] == 3:
-                                 num_vertices = points_xyz_np_processed.shape[0] * points_xyz_np_processed.shape[1]
-                                 points_xyz_np_processed = points_xyz_np_processed.reshape(num_vertices, 3)
-                            else:
-                                print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np_processed.shape}")
-                        except Exception as e_reshape:
-                                print(f"Error reshaping points_xyz_np: {e_reshape}")
-                                num_vertices = 0
-
-                        colors_np_processed = None
-                        if num_vertices > 0:
-                            try:
-                                # Use the processed (potentially sharpened) frame for colors
-                                if rgb_frame_processed is not None and rgb_frame_processed.ndim == 3:
-                                    if rgb_frame_processed.shape[0] == frame_h and rgb_frame_processed.shape[1] == frame_w:
-                                        colors_np_processed = rgb_frame_processed.reshape(frame_h * frame_w, 3)
-                                        subsample_rate = 1
-                                        if subsample_rate > 1:
-                                            # points_xyz_np_processed = points_xyz_np_processed[::subsample_rate] # Reshaped already
-                                            colors_np_processed = colors_np_processed[::subsample_rate]
-                                        # num_vertices = points_xyz_np_processed.shape[0] # Already set
-
-                                        if colors_np_processed.dtype == np.uint8:
-                                            colors_np_processed = colors_np_processed.astype(np.float32) / 255.0
-                                        elif colors_np_processed.dtype == np.float32:
-                                            colors_np_processed = np.clip(colors_np_processed, 0.0, 1.0)
-                                        else:
-                                            print(f"Warning: Unexpected color dtype {colors_np_processed.dtype}, using white.")
-                                            colors_np_processed = None
-                                    else:
-                                         print(f"Warning: Dimension mismatch between points ({frame_h}x{frame_w}) and processed frame ({rgb_frame_processed.shape[:2]})")
-                                         colors_np_processed = None
-                                else:
-                                    print("Warning: rgb_frame_processed invalid for color extraction.")
-                                    colors_np_processed = None
-
-                            except Exception as e_color_subsample:
-                                print(f"Error processing/subsampling colors: {e_color_subsample}")
-                                colors_np_processed = None
-                                # if num_vertices > 0: # Resampling points here is tricky after reshape
-                                #     # points_xyz_np_processed = points_xyz_np_processed[::subsample_rate]
-                                #     num_vertices = points_xyz_np_processed.shape[0]
-                        # --- End Color Sampling ---
-                    # --- End Inference/Processing Block ---
-
-
-                    # --- Common Post-Processing & Queuing ---
-                    if num_vertices > 0:
-                        vertices_flat = points_xyz_np_processed.flatten()
-                        if colors_np_processed is not None:
-                            colors_flat = colors_np_processed.flatten()
-                        else:
-                            colors_np_white = np.ones((num_vertices, 3), dtype=np.float32)
-                            colors_flat = colors_np_white.flatten()
-
-                        # --- Recording Logic ---
-                        is_recording = recording_state_ref.get("is_recording", False)
-                        output_dir = recording_state_ref.get("output_dir", "recording_output")
-                        current_recorded_count = 0 # Default value
-                        if is_recording:
-                            recorded_frame_counter += 1
-                            # Use sequence_frame_index for GLB naming if available and non-zero, else use recorded_frame_counter
-                            save_index = sequence_frame_index if (is_video or is_glb_sequence) and sequence_frame_index > 0 else recorded_frame_counter
-                            glb_filename = os.path.join(output_dir, f"frame_{save_index:05d}.glb")
-                            # Save points with original Y coordinate
-                            save_glb(glb_filename, points_xyz_np_processed * np.array([1,-1,1]), colors_np_processed)
-                            current_recorded_count = recorded_frame_counter
-                            if recorded_frame_counter % 10 == 0:
-                                data_queue.put(("status", f"Recording frame {recorded_frame_counter}..."))
-                        # ---------------------
-
-                        # Put all data into queue
-                        if not data_queue.full():
-                                data_queue.put((vertices_flat, colors_flat, num_vertices,
-                                                rgb_frame_orig, # Pass original frame for camera feed view
-                                                scaled_depth_map_for_queue,
-                                                edge_map_viz,
-                                                smoothing_map_viz,
-                                                t_capture,
-                                                sequence_frame_index, # Pass sequence playback info
-                                                video_total_frames,
-                                                current_recorded_count)) # Pass recorded count
-                        else:
-                            print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
-                            data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
-                    else:
-                        # If no vertices generated/loaded, still send minimal update for UI
-                         if not data_queue.full():
-                                data_queue.put((None, None, 0,
-                                                rgb_frame_orig if rgb_frame_orig is not None else np.zeros((100,100,3), dtype=np.uint8),
-                                                None, None, None, t_capture,
-                                                sequence_frame_index, video_total_frames,
-                                                recorded_frame_counter if is_recording else 0))
-
-
-                except Exception as e_main_proc:
-                    print(f"Error during main processing loop for frame {frame_count}: {e_main_proc}")
-                    traceback.print_exc()
-
-            # Only sleep if processing live video to avoid busy loop
+            # Short sleep for live mode to prevent busy loop
             if is_video and input_mode == "Live":
                 time.sleep(0.005)
-
-            # If processing an image, exit after the first frame's inference
-            # (Handled earlier in the loop now)
-
 
     except Exception as e_thread:
         print(f"Error in inference thread: {e_thread}")
@@ -868,7 +978,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         data_queue.put(("error", str(e_thread)))
         data_queue.put(("status", "Inference thread error!"))
     finally:
-        if cap and is_video: # Only release if it's a video capture object
+        if cap and is_video:
             cap.release()
         print("Inference thread finished.")
         data_queue.put(("status", "Inference thread finished."))
@@ -923,18 +1033,25 @@ class LiveViewerWindow(pyglet.window.Window):
         self.show_depth_map = None
         self.show_edge_map = None
         self.show_smoothing_map = None
+        # Overlay Toggles
+        self.show_fps_overlay = None
+        self.show_points_overlay = None
+        self.show_input_fps_overlay = None
+        self.show_depth_fps_overlay = None
+        self.show_latency_overlay = None
         self.scale_factor_ref = None # Initialized in load_settings
         self.edge_params_ref = {} # Dictionary to pass edge params to thread
-        self.playback_state_ref = {} # Dictionary for playback control
-        self.recording_state_ref = {} # Dictionary for recording control
+        self.playback_state = {} # Dictionary for playback control
+        self.recording_state = {} # Dictionary for recording control
 
-        # --- Playback State ---
-        self.is_playing = True # Separate from ref for UI interaction
-        self.video_total_frames = 0
-        self.video_current_frame = 0
+        # Local UI state variables (not saved in settings, but needed for immediate UI feedback)
+        self.is_playing = True # Default to playing when starting/loading
+        # Stats values
+        self.input_fps = 0.0
+        self.depth_fps = 0.0
+        self.latency_ms = 0.0
 
-        # --- Recording State ---
-        self.recorded_frame_count = 0 # UI display counter
+        # Redundant state variables removed (now handled by self.playback_state, self.recording_state, and direct attributes like self.is_recording)
 
         # --- Debug View State ---
         self.latest_rgb_frame = None
@@ -951,8 +1068,26 @@ class LiveViewerWindow(pyglet.window.Window):
         self.load_settings()
 
         # --- Status Display ---
-        self.ui_batch = pyglet.graphics.Batch()
+        # self.ui_batch = pyglet.graphics.Batch() # Batch removed, using ImGui now
         self.status_message = "Initializing..."
+        # --- Overlay Stats Setup (Separate Batches) ---
+        # self.overlay_batch = pyglet.graphics.Batch() # Removed single batch
+        label_color = (200, 200, 200, 200) # Semi-transparent white
+        y_pos = self.height - 20
+        self.fps_batch = pyglet.graphics.Batch()
+        self.fps_label = pyglet.text.Label("", x=self.width - 10, y=y_pos, anchor_x='right', anchor_y='top', batch=self.fps_batch, color=label_color)
+        y_pos -= 20
+        self.points_batch = pyglet.graphics.Batch()
+        self.points_label = pyglet.text.Label("", x=self.width - 10, y=y_pos, anchor_x='right', anchor_y='top', batch=self.points_batch, color=label_color)
+        y_pos -= 20
+        self.input_fps_batch = pyglet.graphics.Batch()
+        self.input_fps_label = pyglet.text.Label("", x=self.width - 10, y=y_pos, anchor_x='right', anchor_y='top', batch=self.input_fps_batch, color=label_color)
+        y_pos -= 20
+        self.depth_fps_batch = pyglet.graphics.Batch()
+        self.depth_fps_label = pyglet.text.Label("", x=self.width - 10, y=y_pos, anchor_x='right', anchor_y='top', batch=self.depth_fps_batch, color=label_color)
+        y_pos -= 20
+        self.latency_batch = pyglet.graphics.Batch()
+        self.latency_label = pyglet.text.Label("", x=self.width - 10, y=y_pos, anchor_x='right', anchor_y='top', batch=self.latency_batch, color=label_color)
         # Pyglet labels removed
 
         # --- Camera Setup ---
@@ -1148,12 +1283,12 @@ class LiveViewerWindow(pyglet.window.Window):
         # Ensure refs are initialized
         if not hasattr(self, 'scale_factor_ref') or self.scale_factor_ref is None:
              self.scale_factor_ref = [self.input_scale_factor]
-        if not hasattr(self, 'edge_params_ref') or not self.edge_params_ref:
-             self.update_edge_params_ref()
-        if not hasattr(self, 'playback_state_ref') or not self.playback_state_ref:
-             self.update_playback_state_ref() # Initialize playback ref
-        if not hasattr(self, 'recording_state_ref') or not self.recording_state_ref:
-             self.update_recording_state_ref() # Initialize recording ref
+        if not hasattr(self, 'edge_params_ref') or not self.edge_params_ref: # Keep ref name for dict itself
+             self._update_edge_params()
+        if not hasattr(self, 'playback_state') or not self.playback_state:
+             self.update_playback_state() # Initialize playback state
+        if not hasattr(self, 'recording_state') or not self.recording_state:
+             self.update_recording_state() # Initialize recording state
 
         # Start new thread with current settings
         self.inference_thread = threading.Thread(
@@ -1163,15 +1298,15 @@ class LiveViewerWindow(pyglet.window.Window):
                   self.edge_params_ref,
                   self.input_mode, # Pass current mode
                   self.input_filepath, # Pass current filepath
-                  self.playback_state_ref, # Pass playback state dict
-                  self.recording_state_ref), # Pass recording state dict
+                  self.playback_state, # Pass playback state dict
+                  self.recording_state), # Pass recording state dict
             daemon=True
         )
         self.inference_thread.start()
         print(f"DEBUG: Inference thread started (Mode: {self.input_mode}).")
         self.status_message = f"Starting {self.input_mode}..." # Update status
 
-    def update_edge_params_ref(self):
+    def _update_edge_params(self):
         """Updates the dictionary passed to the inference thread."""
         self.edge_params_ref["enable_point_smoothing"] = self.enable_point_smoothing
         self.edge_params_ref["min_alpha_points"] = self.min_alpha_points
@@ -1186,149 +1321,214 @@ class LiveViewerWindow(pyglet.window.Window):
         self.edge_params_ref["enable_sharpening"] = self.enable_sharpening
         self.edge_params_ref["sharpness"] = self.sharpness
 
-    def update_playback_state_ref(self):
-        """Updates the dictionary passed to the inference thread for playback."""
-        self.playback_state_ref["is_playing"] = self.is_playing
-        self.playback_state_ref["speed"] = self.playback_speed
-        self.playback_state_ref["loop"] = self.loop_video
-        # Restart is set to True by button, consumed by thread
+    def update_playback_state(self):
+        """Updates the playback state dictionary passed to the inference thread."""
+        self.playback_state["is_playing"] = self.is_playing
+        self.playback_state["speed"] = self.playback_speed
+        self.playback_state["loop"] = self.loop_video
+        # Restart flag is set here, consumed by thread
+        # self.playback_state["restart"] = False # Resetting here might cause issues if update is called before thread consumes it
         # self.playback_state_ref["restart"] = False # Don't reset restart flag here
         # Total frames and current frame are updated by the thread
 
-    def update_recording_state_ref(self):
-        """Updates the dictionary passed to the inference thread for recording."""
-        self.recording_state_ref["is_recording"] = self.is_recording
-        self.recording_state_ref["output_dir"] = self.recording_output_dir
+    def update_recording_state(self):
+        """Updates the recording state dictionary passed to the inference thread."""
+        self.recording_state["is_recording"] = self.is_recording
+        self.recording_state["output_dir"] = self.recording_output_dir
 
+
+    def _process_queue_data(self, latest_data):
+        """Unpacks data from queue and updates state, debug images, and timing deltas."""
+        try:
+            # Unpack new data format including timing info
+            vertices_data, colors_data, num_vertices_actual, \
+            rgb_frame_np, depth_map_tensor, edge_map_viz_np, \
+            smoothing_map_viz_np, t_capture, \
+            current_frame_idx, total_frames, \
+            recorded_count, \
+            frame_read_delta_t, depth_process_delta_t, latency_ms = latest_data # Added timing unpack
+
+            # Update state variables
+            self.last_capture_timestamp = t_capture
+            # Update playback state directly in the shared dict for UI consistency
+            self.playback_state["current_frame"] = current_frame_idx
+            self.playback_state["total_frames"] = total_frames
+            # Update recording state directly in the shared dict
+            self.recording_state["frames_saved"] = recorded_count
+
+            # Store latest timing deltas and latency
+            self.frame_read_delta_t = frame_read_delta_t
+            self.depth_process_delta_t = depth_process_delta_t
+            self.latency_ms = latency_ms
+
+            # Update latest debug image arrays
+            self.latest_rgb_frame = rgb_frame_np
+            self.latest_edge_map = edge_map_viz_np
+            self.latest_smoothing_map = smoothing_map_viz_np
+
+            # Process depth map for visualization
+            if depth_map_tensor is not None:
+                try:
+                    depth_np = depth_map_tensor.cpu().numpy()
+                    depth_normalized = np.clip(depth_np / 10.0, 0.0, 1.0)
+                    depth_vis = (depth_normalized * 255).astype(np.uint8)
+                    depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+                    self.latest_depth_map_viz = np.ascontiguousarray(depth_vis_colored)
+                except Exception as e_depth_viz:
+                    print(f"Error processing depth map for viz: {e_depth_viz}")
+                    self.latest_depth_map_viz = None
+            else:
+                self.latest_depth_map_viz = None
+
+            # Return processed data needed for vertex list update
+            return vertices_data, colors_data, num_vertices_actual
+
+        except Exception as e_unpack:
+            print(f"Error unpacking or processing data: {e_unpack}")
+            traceback.print_exc()
+            # Also reset timing deltas on error? Maybe not necessary.
+            return None, None, 0 # Return default values on error
+
+    def _update_debug_textures(self):
+        """Updates OpenGL textures for debug views from latest image arrays."""
+        if not self.debug_textures_initialized:
+            return
+
+        try:
+            # Update Camera Feed Texture
+            if self.latest_rgb_frame is not None and self.camera_texture is not None:
+                h, w, _ = self.latest_rgb_frame.shape
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_rgb_frame.ctypes.data)
+
+            # Update Depth Map Texture
+            if self.latest_depth_map_viz is not None and self.depth_texture is not None:
+                h, w, _ = self.latest_depth_map_viz.shape
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, self.latest_depth_map_viz.ctypes.data) # OpenCV uses BGR
+
+            # Update Edge Map Texture
+            if self.latest_edge_map is not None and self.edge_texture is not None:
+                h, w, _ = self.latest_edge_map.shape
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self.edge_texture)
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_edge_map.ctypes.data) # Edge map viz is RGB
+
+            # Update Smoothing Map Texture
+            if self.latest_smoothing_map is not None and self.smoothing_texture is not None:
+                h, w, _ = self.latest_smoothing_map.shape
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self.smoothing_texture)
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_smoothing_map.ctypes.data) # Smoothing map viz is RGB
+
+            gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
+
+        except Exception as e_tex:
+            print(f"Error updating debug textures: {e_tex}")
+            # Optionally disable debug views on error?
+
+    def _update_vertex_list(self, vertices_data, colors_data, num_vertices):
+        """Updates the main point cloud vertex list."""
+        self.current_point_count = num_vertices # Update point count regardless
+
+        if vertices_data is not None and colors_data is not None and num_vertices > 0:
+            # Y-inversion is done before this method in _process_queue_data
+            # No further transformation needed here for display coordinates
+            vertices_for_display = vertices_data
+
+            # Delete existing list if it exists
+            if self.vertex_list:
+                try: self.vertex_list.delete()
+                except Exception: pass # Ignore error if already deleted
+                self.vertex_list = None
+
+            # Create new vertex list
+            try:
+                self.vertex_list = self.shader_program.vertex_list(
+                    num_vertices,
+                    gl.GL_POINTS,
+                    vertices=('f', vertices_for_display), # Data should already be Y-flipped for display
+                    colors=('f', colors_data)
+                )
+                self.frame_count_display += 1 # Increment display counter on successful update
+            except Exception as e_create:
+                 print(f"Error creating vertex list: {e_create}")
+                 traceback.print_exc()
+                 self.vertex_list = None # Ensure list is None on error
+                 self.current_point_count = 0
+        else:
+            # If no valid vertices, clear the list to avoid drawing stale points
+            if self.vertex_list:
+                try: self.vertex_list.delete()
+                except Exception: pass
+                self.vertex_list = None
+            self.current_point_count = 0
+            # Still increment frame count even if no points? Maybe not.
+            # self.frame_count_display += 1
 
     def update(self, dt):
         """Scheduled function to process data from the inference thread."""
+        ema_alpha=0.1 # Define EMA alpha locally
+        new_data_processed = False
         try:
-            while True:
+            while True: # Process all available data in the queue
                 latest_data = self._data_queue.get_nowait()
+                new_data_processed = True # Mark that we processed something
 
                 if isinstance(latest_data, tuple) and isinstance(latest_data[0], str):
                     # Handle status/error/warning messages
                     if latest_data[0] == "status": self.status_message = latest_data[1]
                     elif latest_data[0] == "error": self.status_message = f"ERROR: {latest_data[1]}"; print(f"ERROR: {latest_data[1]}")
                     elif latest_data[0] == "warning": self.status_message = f"WARN: {latest_data[1]}"; print(f"WARN: {latest_data[1]}")
-                    continue
+                    continue # Process next item in queue
                 else:
-                    # --- Process actual vertex and image data ---
-                    try:
-                        # Unpack new data format including recording info
-                        vertices_data, colors_data, num_vertices_actual, \
-                        rgb_frame_np, depth_map_tensor, edge_map_viz_np, \
-                        smoothing_map_viz_np, t_capture, \
-                        current_frame_idx, total_frames, \
-                        recorded_count = latest_data # Added recording count
+                    # Process actual vertex and image data
+                    vertices_data, colors_data, num_vertices = self._process_queue_data(latest_data)
 
-                        self.last_capture_timestamp = t_capture
-                        self.video_current_frame = current_frame_idx
-                        self.video_total_frames = total_frames
-                        self.recorded_frame_count = recorded_count # Update UI counter
+                    # Update debug textures based on the processed data
+                    self._update_debug_textures()
 
-                        # --- Update Debug Views ---
-                        self.latest_rgb_frame = rgb_frame_np
-                        self.latest_edge_map = edge_map_viz_np
-                        self.latest_smoothing_map = smoothing_map_viz_np
-
-                        if depth_map_tensor is not None:
-                            try:
-                                depth_np = depth_map_tensor.cpu().numpy()
-                                depth_normalized = np.clip(depth_np / 10.0, 0.0, 1.0)
-                                depth_vis = (depth_normalized * 255).astype(np.uint8)
-                                depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-                                self.latest_depth_map_viz = np.ascontiguousarray(depth_vis_colored)
-                            except Exception as e_depth_viz:
-                                print(f"Error processing depth map for viz: {e_depth_viz}")
-                                self.latest_depth_map_viz = None
-                        else:
-                            self.latest_depth_map_viz = None
-
-                        # Update textures if they exist and data is available
-                        if self.debug_textures_initialized:
-                            if self.latest_rgb_frame is not None and self.camera_texture is not None:
-                                try:
-                                    h, w, _ = self.latest_rgb_frame.shape
-                                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
-                                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_rgb_frame.ctypes.data)
-                                except Exception as e_tex_cam:
-                                    print(f"Error updating camera texture: {e_tex_cam}")
-
-
-                            if self.latest_depth_map_viz is not None and self.depth_texture is not None:
-                                try:
-                                    h, w, _ = self.latest_depth_map_viz.shape
-                                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
-                                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, self.latest_depth_map_viz.ctypes.data) # OpenCV uses BGR
-                                except Exception as e_tex_depth:
-                                     print(f"Error updating depth texture: {e_tex_depth}")
-
-                            if self.latest_edge_map is not None and self.edge_texture is not None:
-                                try:
-                                    h, w, _ = self.latest_edge_map.shape
-                                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.edge_texture)
-                                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_edge_map.ctypes.data) # Edge map viz is RGB
-                                except Exception as e_tex_edge:
-                                     print(f"Error updating edge texture: {e_tex_edge}")
-
-                            if self.latest_smoothing_map is not None and self.smoothing_texture is not None:
-                                try:
-                                    h, w, _ = self.latest_smoothing_map.shape
-                                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.smoothing_texture)
-                                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_smoothing_map.ctypes.data) # Smoothing map viz is RGB
-                                except Exception as e_tex_smooth:
-                                     print(f"Error updating smoothing texture: {e_tex_smooth}")
-
-
-                            gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
-
-
-                        # --- Calculate Point Cloud FPS ---
-                        current_time = time.time()
-                        time_delta = current_time - self.last_update_time
-                        if time_delta > 1e-6:
-                            self.point_cloud_fps = 1.0 / time_delta
-                        self.last_update_time = current_time
-                        # -----------------------------
-
-                        self.current_point_count = num_vertices_actual
-
-                        if vertices_data is not None and colors_data is not None and num_vertices_actual > 0:
-                            if self.vertex_list:
-                                try: self.vertex_list.delete()
-                                except Exception: pass # Ignore error if already deleted
-                                self.vertex_list = None
-
-                            try:
-                                self.vertex_list = self.shader_program.vertex_list(
-                                    num_vertices_actual,
-                                    gl.GL_POINTS,
-                                    vertices=('f', vertices_data),
-                                    colors=('f', colors_data)
-                                )
-                                self.frame_count_display += 1
-                            except Exception as e_create:
-                                 print(f"Error creating vertex list: {e_create}")
-                                 traceback.print_exc()
-                        else:
-                            # If no vertices, clear the list to avoid drawing stale points
-                            if self.vertex_list:
-                                try: self.vertex_list.delete()
-                                except Exception: pass
-                                self.vertex_list = None
-                                self.current_point_count = 0
-                            self.frame_count_display += 1 # Still increment frame count
-
-                    except Exception as e_unpack:
-                        print(f"Error unpacking or processing data: {e_unpack}")
-                        traceback.print_exc()
+                    # Update the main vertex list
+                    self._update_vertex_list(vertices_data, colors_data, num_vertices)
 
         except queue.Empty:
-            pass # No new data is fine
+            pass # No more data in the queue
 
+        # Calculate smoothed FPS values and update overlay labels if new data was processed
+        if new_data_processed:
+            # --- Input FPS (from frame read delta) ---
+            if hasattr(self, 'frame_read_delta_t') and self.frame_read_delta_t > 1e-6:
+                current_input_fps = 1.0 / self.frame_read_delta_t
+                # Apply EMA smoothing
+                self.input_fps = ema_alpha * current_input_fps + (1.0 - ema_alpha) * self.input_fps
+            # --- Depth FPS (from depth processing delta) ---
+            if hasattr(self, 'depth_process_delta_t') and self.depth_process_delta_t > 1e-6:
+                current_depth_fps = 1.0 / self.depth_process_delta_t
+                # Apply EMA smoothing
+                self.depth_fps = ema_alpha * current_depth_fps + (1.0 - ema_alpha) * self.depth_fps
+            # --- Render FPS (calculated based on main thread update rate) ---
+            current_time = time.time()
+            time_delta = current_time - self.last_update_time
+            if time_delta > 1e-6:
+                 # Apply EMA smoothing to render FPS as well
+                 current_render_fps = 1.0 / time_delta
+                 self.point_cloud_fps = ema_alpha * current_render_fps + (1.0 - ema_alpha) * self.point_cloud_fps
+            self.last_update_time = current_time
 
+            # --- Update Overlay Label Text & Visibility ---
+            if hasattr(self, 'fps_label'):
+                self.fps_label.visible = self.show_fps_overlay
+                if self.show_fps_overlay: self.fps_label.text = f"Render FPS: {self.point_cloud_fps:.1f}"
+            if hasattr(self, 'points_label'):
+                self.points_label.visible = self.show_points_overlay
+                if self.show_points_overlay: self.points_label.text = f"Points: {self.current_point_count}"
+            if hasattr(self, 'input_fps_label'):
+                self.input_fps_label.visible = self.show_input_fps_overlay
+                if self.show_input_fps_overlay: self.input_fps_label.text = f"Input FPS: {self.input_fps:.1f}"
+            if hasattr(self, 'depth_fps_label'):
+                self.depth_fps_label.visible = self.show_depth_fps_overlay
+                if self.show_depth_fps_overlay: self.depth_fps_label.text = f"Depth FPS: {self.depth_fps:.1f}"
+            if hasattr(self, 'latency_label') and hasattr(self, 'latency_ms'):
+                self.latency_label.visible = self.show_latency_overlay
+                if self.show_latency_overlay: self.latency_label.text = f"Latency: {self.latency_ms:.1f} ms"
     def update_camera(self, dt):
         """Scheduled function to handle camera movement based on key states."""
         io = imgui.get_io()
@@ -1365,12 +1565,12 @@ class LiveViewerWindow(pyglet.window.Window):
             setattr(self, key, value)
         # Always create/update the scale factor reference list
         self.scale_factor_ref = [self.input_scale_factor]
-        # Update edge params ref dictionary
-        self.update_edge_params_ref()
-        # Update playback state ref dictionary
-        self.update_playback_state_ref()
-        # Update recording state ref dictionary
-        self.update_recording_state_ref()
+        # Update state dictionaries
+        self._update_edge_params()
+        # Update playback state dictionary
+        self.update_playback_state()
+        # Update recording state dictionary
+        self.update_recording_state()
 
 
     def save_settings(self, filename="viewer_settings.json"):
@@ -1419,9 +1619,9 @@ class LiveViewerWindow(pyglet.window.Window):
 
         # Ensure reference dicts are updated/created *after* loading/defaults
         self.scale_factor_ref = [self.input_scale_factor]
-        self.update_edge_params_ref()
-        self.update_playback_state_ref()
-        self.update_recording_state_ref() # Initialize recording ref
+        self._update_edge_params()
+        self.update_playback_state()
+        self.update_recording_state() # Initialize recording state
 
 
     def _browse_file(self):
@@ -1457,19 +1657,353 @@ class LiveViewerWindow(pyglet.window.Window):
         root.destroy() # Destroy the tkinter instance
 
         # Reset playback state for new file/directory
-        self.is_playing = True
-        self.video_current_frame = 0
-        self.video_total_frames = 0
-        self.update_playback_state_ref()
+        self.is_playing = True # Reset local UI control state
+        # Reset relevant fields in the shared state dictionary
+        self.playback_state["current_frame"] = 0
+        self.playback_state["total_frames"] = 0
+        self.playback_state["restart"] = False # Ensure restart flag is clear
+        # Update the rest of the shared state from local attributes
+        self.update_playback_state()
         # Restart inference thread with new source
         self.start_inference_thread()
 
 
-    def on_draw(self):
-        # Clear the main window buffer
-        gl.glClearColor(0.1, 0.1, 0.1, 1.0)
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+    def _draw_ui(self):
+        """Draws the ImGui user interface."""
+        # UI drawing logic will be moved here
+        # --- ImGui Frame ---
+        imgui.new_frame()
 
+        # --- Main Controls Window ---
+        imgui.set_next_window_position(10, 10, imgui.ONCE)
+        imgui.set_next_window_size(350, self.height - 20, imgui.ONCE) # Adjust height dynamically
+        imgui.begin("UniK3D Controls")
+
+        # --- Status Display (Always Visible) ---
+        status_text = "Status: Idle"
+        status_color = (0.5, 0.5, 0.5, 1.0) # Gray
+        thread_is_running = self.inference_thread and self.inference_thread.is_alive()
+
+        if thread_is_running:
+            if self.input_mode == "Live":
+                status_text = "Status: Live Feed Active"
+                status_color = (0.1, 1.0, 0.1, 1.0) # Green
+            elif self.input_mode == "File":
+                status_text = f"Status: Processing File ({os.path.basename(self.input_filepath)})"
+                status_color = (0.1, 0.6, 1.0, 1.0) # Blue
+            elif self.input_mode == "GLB Sequence":
+                 status_text = f"Status: Playing GLB Sequence ({os.path.basename(self.input_filepath)})"
+                 status_color = (1.0, 0.6, 0.1, 1.0) # Orange
+        elif "Error" in self.status_message:
+             status_text = f"Status: Error ({self.status_message})"
+             status_color = (1.0, 0.1, 0.1, 1.0) # Red
+        elif "Finished" in self.status_message:
+             status_text = f"Status: Finished"
+             status_color = (0.5, 0.5, 0.5, 1.0) # Gray
+        else:
+             status_text = f"Status: {self.status_message}" # Show initializing etc.
+
+        imgui.text_colored(status_text, *status_color)
+        imgui.separator()
+
+        # --- Tab Bar ---
+        if imgui.begin_tab_bar("MainTabs"):
+
+            # --- Input/Output Tab ---
+            if imgui.begin_tab_item("Input/Output")[0]:
+                imgui.text("Input Source")
+                if imgui.radio_button("Live Camera##InputMode", self.input_mode == "Live"):
+                    if self.input_mode != "Live":
+                        self.input_mode = "Live"
+                        self.input_filepath = "" # Clear filepath for live mode
+                        self.start_inference_thread() # Restart thread
+                imgui.same_line()
+                is_file_mode = self.input_mode == "File" or self.input_mode == "GLB Sequence"
+                if imgui.radio_button("File/Sequence##InputMode", is_file_mode):
+                     if not is_file_mode: # If switching TO file mode from Live
+                        self.input_mode = "File" # Default to generic file initially
+                        # Stop live thread if running, but don't start new one yet
+                        if self.inference_thread and self.inference_thread.is_alive():
+                            self.start_inference_thread() # This stops the old one
+
+                if imgui.button("Browse File/Dir..."):
+                    self._browse_file() # Handles setting mode and restarting thread
+
+                imgui.text("Source Path:")
+                imgui.push_item_width(-1)
+                display_path = self.input_filepath if self.input_filepath else "N/A (Using Live Camera)"
+                if self.input_mode == "GLB Sequence": display_path += " (GLB Sequence)"
+                imgui.text_wrapped(display_path)
+                imgui.pop_item_width()
+
+                imgui.separator()
+                imgui.text("Recording")
+                rec_button_text = " Stop Recording " if self.is_recording else " Start Recording "
+                if imgui.button(rec_button_text):
+                    self.is_recording = not self.is_recording
+                    if self.is_recording:
+                        try:
+                            os.makedirs(self.recording_output_dir, exist_ok=True)
+                            self.recorded_frame_count = 0 # Reset counter
+                            self.status_message = f"Recording started to {self.recording_output_dir}"
+                        except Exception as e_dir:
+                            print(f"Error creating recording directory: {e_dir}")
+                            self.status_message = "Error creating recording dir!"
+                            self.is_recording = False # Abort recording
+                    else:
+                        self.status_message = f"Recording stopped. {self.recorded_frame_count} frames saved."
+                    self.update_recording_state() # Update thread state
+
+                imgui.same_line()
+                # Read recorded frame count from recording_state dict (updated by thread)
+                saved_count = self.recording_state.get("frames_saved", 0)
+                imgui.text(f"({saved_count} frames saved)")
+
+                changed_dir, self.recording_output_dir = imgui.input_text(
+                    "Output Dir", self.recording_output_dir, 256
+                )
+                if changed_dir and not self.recording_state.get("is_recording", False): # Update ref only if not recording
+                     self.update_recording_state()
+
+                imgui.end_tab_item()
+            # --- End Input/Output Tab ---
+
+            # --- Playback Tab (Conditional) ---
+            show_playback_tab = self.input_mode != "Live" and self.playback_state.get("total_frames", 0) > 0
+            if show_playback_tab:
+                if imgui.begin_tab_item("Playback")[0]:
+                    play_button_text = " Pause " if self.is_playing else " Play  "
+                    if imgui.button(play_button_text): # Button text based on self.is_playing
+                        self.is_playing = not self.is_playing # Toggle local UI state variable
+                        self.update_playback_state() # Update the shared state dict
+                    imgui.same_line()
+                    if imgui.button("Restart"): # Button triggers restart flag
+                        self.playback_state["restart"] = True # Signal thread to restart via shared dict
+                        self.is_playing = True # Assume play after restart for UI button state
+                        self.update_playback_state() # Update shared dict (including is_playing)
+                    imgui.same_line()
+                    # Use loop_video attribute for checkbox state, update shared dict on change
+                    loop_changed, self.loop_video = imgui.checkbox("Loop", self.loop_video)
+                    if loop_changed: self.update_playback_state()
+
+                    # Use playback_speed attribute for slider state, update shared dict on change
+                    speed_changed, self.playback_speed = imgui.slider_float("Speed", self.playback_speed, 0.1, 4.0, "%.1fx")
+                    if speed_changed: self.update_playback_state()
+
+                    # Read current/total frames directly from playback_state dict (updated by thread)
+                    current_f = self.playback_state.get("current_frame", 0)
+                    total_f = self.playback_state.get("total_frames", 0)
+                    imgui.text(f"Frame: {current_f} / {total_f}")
+                    progress = float(current_f) / total_f if total_f > 0 else 0.0
+                    imgui.progress_bar(progress, (-1, 0), f"{current_f}/{total_f}")
+
+                    imgui.end_tab_item()
+            # --- End Playback Tab ---
+
+            # --- Processing Tab ---
+            if imgui.begin_tab_item("Processing")[0]:
+                # Smoothing Section
+                imgui.text("Temporal Smoothing")
+                changed_smooth, self.enable_point_smoothing = imgui.checkbox("Enable##SmoothEnable", self.enable_point_smoothing)
+                if changed_smooth: self._update_edge_params()
+
+                imgui.indent()
+                changed_min_alpha, self.min_alpha_points = imgui.slider_float("Min Alpha", self.min_alpha_points, 0.0, 1.0)
+                if changed_min_alpha: self._update_edge_params()
+                changed_max_alpha, self.max_alpha_points = imgui.slider_float("Max Alpha", self.max_alpha_points, 0.0, 1.0)
+                if changed_max_alpha: self._update_edge_params()
+                if imgui.button("Reset##SmoothAlpha"):
+                    self.min_alpha_points = DEFAULT_SETTINGS["min_alpha_points"]
+                    self.max_alpha_points = DEFAULT_SETTINGS["max_alpha_points"]
+                    self.update_edge_params_ref()
+                imgui.unindent()
+
+                imgui.separator()
+                imgui.text("Edge-Aware Smoothing")
+                changed_edge_smooth, self.enable_edge_aware_smoothing = imgui.checkbox("Enable##EdgeAwareEnable", self.enable_edge_aware_smoothing)
+                if changed_edge_smooth: self._update_edge_params()
+
+                if self.enable_edge_aware_smoothing:
+                    imgui.indent()
+                    imgui.columns(2, "edge_thresholds", border=False)
+                    changed_d_thresh1, self.depth_edge_threshold1 = imgui.slider_float("Depth Thresh 1", self.depth_edge_threshold1, 1.0, 255.0)
+                    if changed_d_thresh1: self._update_edge_params()
+                    changed_d_thresh2, self.depth_edge_threshold2 = imgui.slider_float("Depth Thresh 2", self.depth_edge_threshold2, 1.0, 255.0)
+                    if changed_d_thresh2: self._update_edge_params()
+                    imgui.next_column()
+                    changed_rgb_thresh1, self.rgb_edge_threshold1 = imgui.slider_float("RGB Thresh 1", self.rgb_edge_threshold1, 1.0, 255.0)
+                    if changed_rgb_thresh1: self._update_edge_params()
+                    changed_rgb_thresh2, self.rgb_edge_threshold2 = imgui.slider_float("RGB Thresh 2", self.rgb_edge_threshold2, 1.0, 255.0)
+                    if changed_rgb_thresh2: self._update_edge_params()
+                    imgui.columns(1)
+
+                    changed_edge_inf, self.edge_smoothing_influence = imgui.slider_float("Edge Influence", self.edge_smoothing_influence, 0.0, 1.0)
+                    if changed_edge_inf: self._update_edge_params()
+
+                    changed_grad_inf, self.gradient_influence_scale = imgui.slider_float("Gradient Scale", self.gradient_influence_scale, 0.0, 5.0)
+                    if changed_grad_inf: self._update_edge_params()
+
+                    if imgui.button("Reset##EdgeParams"):
+                        self.depth_edge_threshold1 = DEFAULT_SETTINGS["depth_edge_threshold1"]
+                        self.depth_edge_threshold2 = DEFAULT_SETTINGS["depth_edge_threshold2"]
+                        self.rgb_edge_threshold1 = DEFAULT_SETTINGS["rgb_edge_threshold1"]
+                        self.rgb_edge_threshold2 = DEFAULT_SETTINGS["rgb_edge_threshold2"]
+                        self.edge_smoothing_influence = DEFAULT_SETTINGS["edge_smoothing_influence"]
+                        self.gradient_influence_scale = DEFAULT_SETTINGS["gradient_influence_scale"]
+                        self._update_edge_params()
+                    imgui.unindent()
+
+                imgui.separator()
+                imgui.text("Image Sharpening")
+                changed_sharp_enable, self.enable_sharpening = imgui.checkbox("Enable##SharpEnable", self.enable_sharpening)
+                if changed_sharp_enable: self._update_edge_params()
+                if self.enable_sharpening:
+                    imgui.indent()
+                    changed_sharp_amt, self.sharpness = imgui.slider_float("Amount", self.sharpness, 0.1, 5.0)
+                    if changed_sharp_amt: self._update_edge_params()
+                    if imgui.button("Reset##Sharpness"):
+                        self.sharpness = DEFAULT_SETTINGS["sharpness"]
+                        self._update_edge_params()
+                    imgui.unindent()
+
+                imgui.end_tab_item()
+            # --- End Processing Tab ---
+
+            # --- Rendering Tab ---
+            if imgui.begin_tab_item("Rendering")[0]:
+                imgui.text("Point Style")
+                if imgui.radio_button("Square##RenderMode", self.render_mode == 0): self.render_mode = 0
+                imgui.same_line()
+                if imgui.radio_button("Circle##RenderMode", self.render_mode == 1): self.render_mode = 1
+                imgui.same_line()
+                if imgui.radio_button("Gaussian##RenderMode", self.render_mode == 2): self.render_mode = 2
+
+                if self.render_mode == 2: # Gaussian Params
+                    imgui.indent()
+                    changed_falloff, self.falloff_factor = imgui.slider_float("Falloff", self.falloff_factor, 0.1, 20.0)
+                    if imgui.button("Reset##Falloff"): self.falloff_factor = DEFAULT_SETTINGS["falloff_factor"]
+                    imgui.unindent()
+
+                imgui.separator()
+                imgui.text("Point Size & Scale")
+                changed_boost, self.point_size_boost = imgui.slider_float("Size Boost", self.point_size_boost, 0.1, 10.0)
+                if imgui.button("Reset##PointSize"): self.point_size_boost = DEFAULT_SETTINGS["point_size_boost"]
+
+                changed_scale, self.input_scale_factor = imgui.slider_float("Input Scale", self.input_scale_factor, 0.1, 1.0)
+                if changed_scale: self.scale_factor_ref[0] = self.input_scale_factor # Update shared ref for thread
+                if imgui.button("Reset##InputScale"):
+                    self.input_scale_factor = DEFAULT_SETTINGS["input_scale_factor"]
+                    self.scale_factor_ref[0] = self.input_scale_factor
+
+                imgui.separator()
+                imgui.text("Color Adjustments")
+                changed_sat, self.saturation = imgui.slider_float("Saturation", self.saturation, 0.0, 3.0)
+                if imgui.button("Reset##Saturation"): self.saturation = DEFAULT_SETTINGS["saturation"]
+
+                changed_brt, self.brightness = imgui.slider_float("Brightness", self.brightness, 0.0, 2.0)
+                if imgui.button("Reset##Brightness"): self.brightness = DEFAULT_SETTINGS["brightness"]
+
+                changed_con, self.contrast = imgui.slider_float("Contrast", self.contrast, 0.1, 3.0)
+                if imgui.button("Reset##Contrast"): self.contrast = DEFAULT_SETTINGS["contrast"]
+
+                imgui.end_tab_item()
+            # --- End Rendering Tab ---
+
+            # --- Debug Tab ---
+            if imgui.begin_tab_item("Debug")[0]:
+                imgui.text("Show Debug Views:")
+                _, self.show_camera_feed = imgui.checkbox("Camera Feed", self.show_camera_feed)
+                _, self.show_depth_map = imgui.checkbox("Depth Map", self.show_depth_map)
+                _, self.show_edge_map = imgui.checkbox("Edge Map", self.show_edge_map)
+                _, self.show_smoothing_map = imgui.checkbox("Smoothing Map", self.show_smoothing_map)
+
+                imgui.separator()
+                imgui.text("Performance Info:")
+                # Display all stats here
+                imgui.text(f"Points Rendered: {self.current_point_count}")
+                imgui.text(f"Render FPS: {self.point_cloud_fps:.1f}")
+                imgui.text(f"Input FPS: {self.input_fps:.1f}")
+                imgui.text(f"Depth FPS: {self.depth_fps:.1f}")
+                imgui.text(f"Latency: {self.latency_ms:.1f} ms")
+
+                imgui.separator()
+                imgui.text("Show Stats in Overlay:")
+                # Individual toggles for overlay stats
+                _, self.show_fps_overlay = imgui.checkbox("Render FPS##Overlay", self.show_fps_overlay)
+                _, self.show_points_overlay = imgui.checkbox("Points##Overlay", self.show_points_overlay)
+                _, self.show_input_fps_overlay = imgui.checkbox("Input FPS##Overlay", self.show_input_fps_overlay)
+                _, self.show_depth_fps_overlay = imgui.checkbox("Depth FPS##Overlay", self.show_depth_fps_overlay)
+                _, self.show_latency_overlay = imgui.checkbox("Latency##Overlay", self.show_latency_overlay)
+                # Add more debug info if needed
+
+                imgui.end_tab_item()
+            # --- End Debug Tab ---
+
+            # --- Settings Tab ---
+            if imgui.begin_tab_item("Settings")[0]:
+                if imgui.button("Load Settings"): self.load_settings()
+                imgui.same_line()
+                if imgui.button("Save Settings"): self.save_settings()
+                imgui.same_line()
+                if imgui.button("Reset All Defaults"): self.reset_settings()
+                imgui.text(f"Settings File: viewer_settings.json")
+                # Could add more settings-related info here if needed
+                imgui.end_tab_item()
+            # --- End Settings Tab ---
+
+            imgui.end_tab_bar()
+        # --- End Tab Bar ---
+
+        imgui.end() # End main controls window
+
+        # --- Debug View Windows (Rendered as separate windows now) ---
+        if self.show_camera_feed and self.camera_texture and self.latest_rgb_frame is not None:
+            imgui.set_next_window_size(320, 240, imgui.ONCE)
+            imgui.set_next_window_position(10, self.height - 250, imgui.ONCE) # Position top-leftish
+            is_open, self.show_camera_feed = imgui.begin("Camera Feed", closable=True)
+            if is_open:
+                imgui.image(self.camera_texture, self.latest_rgb_frame.shape[1], self.latest_rgb_frame.shape[0])
+            imgui.end()
+
+        if self.show_depth_map and self.depth_texture and self.latest_depth_map_viz is not None:
+            imgui.set_next_window_size(320, 240, imgui.ONCE)
+            imgui.set_next_window_position(340, self.height - 250, imgui.ONCE) # Position next to camera feed
+            is_open, self.show_depth_map = imgui.begin("Depth Map", closable=True)
+            if is_open:
+                imgui.image(self.depth_texture, self.latest_depth_map_viz.shape[1], self.latest_depth_map_viz.shape[0])
+            imgui.end()
+
+        if self.show_edge_map and self.edge_texture and self.latest_edge_map is not None:
+            imgui.set_next_window_size(320, 240, imgui.ONCE)
+            imgui.set_next_window_position(10, self.height - 500, imgui.ONCE) # Position below camera feed
+            is_open, self.show_edge_map = imgui.begin("Edge Map", closable=True)
+            if is_open:
+                imgui.image(self.edge_texture, self.latest_edge_map.shape[1], self.latest_edge_map.shape[0])
+            imgui.end()
+
+        if self.show_smoothing_map and self.smoothing_texture and self.latest_smoothing_map is not None:
+             imgui.set_next_window_size(320, 240, imgui.ONCE)
+             imgui.set_next_window_position(340, self.height - 500, imgui.ONCE) # Position below depth map
+             is_open, self.show_smoothing_map = imgui.begin("Smoothing Alpha Map", closable=True)
+             if is_open:
+                 imgui.image(self.smoothing_texture, self.latest_smoothing_map.shape[1], self.latest_smoothing_map.shape[0])
+             imgui.end()
+        # --- End Debug View Windows ---
+
+
+        # Render ImGui
+        # Ensure correct GL state for ImGui rendering (standard alpha blend)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glDisable(gl.GL_DEPTH_TEST) # ImGui draws in 2D
+
+        imgui.render()
+        self.imgui_renderer.render(imgui.get_draw_data())
+        # --- End ImGui Frame ---
+
+    def _render_scene(self):
+        """Renders the 3D point cloud scene."""
+        # 3D rendering logic will be moved here
         # --- Draw 3D Splats ---
         if self.vertex_list:
             projection, current_view = self.get_camera_matrices()
@@ -1485,7 +2019,8 @@ class LiveViewerWindow(pyglet.window.Window):
             self.shader_program['saturation'] = self.saturation
             self.shader_program['brightness'] = self.brightness
             self.shader_program['contrast'] = self.contrast
-            self.shader_program['sharpness'] = self.sharpness
+            # Sharpness is applied in inference thread, but shader still has uniform
+            self.shader_program['sharpness'] = self.sharpness if self.enable_sharpening else 1.0
 
             # Set GL state based on render mode
             if self.render_mode == 0: # Square (Opaque)
@@ -1516,285 +2051,54 @@ class LiveViewerWindow(pyglet.window.Window):
                 self.shader_program.stop()
         # --- End Draw 3D Splats ---
 
-        # --- ImGui Frame ---
-        imgui.new_frame()
+    def on_draw(self):
+        # Clear the main window buffer
+        gl.glClearColor(0.1, 0.1, 0.1, 1.0)
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
 
-        # --- Debug Views ---
-        if self.show_camera_feed and self.camera_texture and self.latest_rgb_frame is not None:
-            imgui.set_next_window_size(320, 240, imgui.ONCE)
-            imgui.begin("Camera Feed")
-            imgui.image(self.camera_texture, self.latest_rgb_frame.shape[1], self.latest_rgb_frame.shape[0])
-            imgui.end()
-
-        if self.show_depth_map and self.depth_texture and self.latest_depth_map_viz is not None:
-            imgui.set_next_window_size(320, 240, imgui.ONCE)
-            imgui.begin("Depth Map")
-            imgui.image(self.depth_texture, self.latest_depth_map_viz.shape[1], self.latest_depth_map_viz.shape[0])
-            imgui.end()
-
-        if self.show_edge_map and self.edge_texture and self.latest_edge_map is not None:
-            imgui.set_next_window_size(320, 240, imgui.ONCE)
-            imgui.begin("Edge Map")
-            imgui.image(self.edge_texture, self.latest_edge_map.shape[1], self.latest_edge_map.shape[0])
-            imgui.end()
-
-        if self.show_smoothing_map and self.smoothing_texture and self.latest_smoothing_map is not None:
-             imgui.set_next_window_size(320, 240, imgui.ONCE)
-             imgui.begin("Smoothing Alpha Map")
-             imgui.image(self.smoothing_texture, self.latest_smoothing_map.shape[1], self.latest_smoothing_map.shape[0])
-             imgui.end()
-        # --- End Debug Views ---
-
-
-        # --- Controls Panel ---
-        imgui.set_next_window_position(self.width - 310, 10, imgui.ONCE) # Position bottom-rightish once
-        imgui.set_next_window_size(300, 750, imgui.ONCE) # Increased height further
-        imgui.begin("Controls", True) # True = closable window
-
-        # --- Presets ---
-        if imgui.button("Load Settings"): self.load_settings()
-        imgui.same_line()
-        if imgui.button("Save Settings"): self.save_settings()
-        imgui.same_line()
-        if imgui.button("Reset All"): self.reset_settings()
-        imgui.separator()
-
-        # --- Input Source Section ---
-        if imgui.collapsing_header("Input Source", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-            # Determine current status text and color
-            status_text = "Status: Idle"
-            status_color = (0.5, 0.5, 0.5, 1.0) # Gray
-            thread_is_running = self.inference_thread and self.inference_thread.is_alive()
-
-            if thread_is_running:
-                if self.input_mode == "Live":
-                    status_text = "Status: Live Feed Active"
-                    status_color = (0.1, 1.0, 0.1, 1.0) # Green
-                elif self.input_mode == "File":
-                    status_text = f"Status: Processing File ({os.path.basename(self.input_filepath)})"
-                    status_color = (0.1, 0.6, 1.0, 1.0) # Blue
-                elif self.input_mode == "GLB Sequence":
-                     status_text = f"Status: Playing GLB Sequence ({os.path.basename(self.input_filepath)})"
-                     status_color = (1.0, 0.6, 0.1, 1.0) # Orange
-            elif "Error" in self.status_message:
-                 status_text = f"Status: Error"
-                 status_color = (1.0, 0.1, 0.1, 1.0) # Red
-            elif "Finished" in self.status_message:
-                 status_text = f"Status: Finished"
-                 status_color = (0.5, 0.5, 0.5, 1.0) # Gray
-
-            imgui.text_colored(status_text, *status_color)
-
-            if imgui.radio_button("Live Camera##InputMode", self.input_mode == "Live"):
-                if self.input_mode != "Live":
-                    self.input_mode = "Live"
-                    self.input_filepath = "" # Clear filepath for live mode
-                    self.start_inference_thread() # Restart thread
-            imgui.same_line()
-            # Combined File/Sequence button logic
-            is_file_mode = self.input_mode == "File" or self.input_mode == "GLB Sequence"
-            if imgui.radio_button("File/Sequence##InputMode", is_file_mode):
-                 if not is_file_mode: # If switching TO file mode from Live
-                    self.input_mode = "File" # Default to generic file initially
-                    # Stop live thread if running, but don't start new one yet
-                    if self.inference_thread and self.inference_thread.is_alive():
-                        self.start_inference_thread()
-
-            imgui.text("Source:")
-            imgui.same_line()
-            display_path = self.input_filepath if self.input_filepath else "None (Using Live Camera)"
-            if self.input_mode == "GLB Sequence": display_path += " (GLB Sequence)"
-            imgui.text_disabled(display_path)
-
-            if imgui.button("Browse File/Dir..."):
-                self._browse_file() # Handles setting mode and restarting thread
-
-            # --- Playback Controls (Visible only for File mode video/GLB) ---
-            if self.input_mode != "Live" and self.video_total_frames > 0:
-                imgui.separator()
-                imgui.text("Playback:")
-                play_button_text = " Pause " if self.is_playing else " Play  "
-                if imgui.button(play_button_text):
-                    self.is_playing = not self.is_playing
-                    self.update_playback_state_ref()
-                imgui.same_line()
-                if imgui.button("Restart"):
-                    self.playback_state_ref["restart"] = True # Signal thread to restart
-                imgui.same_line()
-                loop_changed, self.loop_video = imgui.checkbox("Loop", self.loop_video)
-                if loop_changed: self.update_playback_state_ref()
-
-                speed_changed, self.playback_speed = imgui.slider_float("Speed", self.playback_speed, 0.1, 4.0)
-                if speed_changed: self.update_playback_state_ref()
-
-                # Simple frame display
-                imgui.text(f"Frame: {self.video_current_frame} / {self.video_total_frames}")
-
-        # --- Recording Section ---
-        if imgui.collapsing_header("Recording", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-            rec_button_text = " Stop Recording " if self.is_recording else " Start Recording "
-            if imgui.button(rec_button_text):
-                self.is_recording = not self.is_recording
-                if self.is_recording:
-                    # Create directory if it doesn't exist
-                    try:
-                        os.makedirs(self.recording_output_dir, exist_ok=True)
-                        self.recorded_frame_count = 0 # Reset counter
-                        self.status_message = f"Recording started to {self.recording_output_dir}"
-                    except Exception as e_dir:
-                        print(f"Error creating recording directory: {e_dir}")
-                        self.status_message = "Error creating recording dir!"
-                        self.is_recording = False # Abort recording
-                else:
-                    self.status_message = f"Recording stopped. {self.recorded_frame_count} frames saved."
-                self.update_recording_state_ref() # Update thread state
-
-            imgui.same_line()
-            imgui.text(f"({self.recorded_frame_count} frames)")
-
-            # Use input_text for directory path
-            changed_dir, self.recording_output_dir = imgui.input_text(
-                "Output Dir", self.recording_output_dir, 256
-            )
-            if changed_dir and not self.is_recording: # Update ref only if not recording
-                 self.update_recording_state_ref()
-
-
-        # --- Rendering Section ---
-        if imgui.collapsing_header("Rendering", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-            imgui.text("Render Mode:")
-            if imgui.radio_button("Square##RenderMode", self.render_mode == 0): self.render_mode = 0
-            imgui.same_line()
-            if imgui.radio_button("Circle##RenderMode", self.render_mode == 1): self.render_mode = 1
-            imgui.same_line()
-            if imgui.radio_button("Gaussian##RenderMode", self.render_mode == 2): self.render_mode = 2
-
-            # Gaussian Params (only relevant if Gaussian mode)
-            if self.render_mode == 2:
-                imgui.indent()
-                changed_falloff, self.falloff_factor = imgui.slider_float("Falloff", self.falloff_factor, 0.1, 20.0)
-                if imgui.button("Reset##Falloff"): self.falloff_factor = DEFAULT_SETTINGS["falloff_factor"]
-                imgui.unindent()
-
-        # --- View Section ---
-        if imgui.collapsing_header("View", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-            changed_boost, self.point_size_boost = imgui.slider_float("Point Size Boost", self.point_size_boost, 0.1, 10.0)
-            if imgui.button("Reset##PointSize"): self.point_size_boost = DEFAULT_SETTINGS["point_size_boost"]
-
-            changed_scale, self.input_scale_factor = imgui.slider_float("Input Scale", self.input_scale_factor, 0.1, 1.0)
-            if changed_scale: self.scale_factor_ref[0] = self.input_scale_factor # Update shared ref for thread
-            if imgui.button("Reset##InputScale"):
-                self.input_scale_factor = DEFAULT_SETTINGS["input_scale_factor"]
-                self.scale_factor_ref[0] = self.input_scale_factor
-
-        # --- Image Processing Section ---
-        if imgui.collapsing_header("Image Processing", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-            changed_sat, self.saturation = imgui.slider_float("Saturation", self.saturation, 0.0, 3.0)
-            if imgui.button("Reset##Saturation"): self.saturation = DEFAULT_SETTINGS["saturation"]
-
-            changed_brt, self.brightness = imgui.slider_float("Brightness", self.brightness, 0.0, 2.0)
-            if imgui.button("Reset##Brightness"): self.brightness = DEFAULT_SETTINGS["brightness"]
-
-            changed_con, self.contrast = imgui.slider_float("Contrast", self.contrast, 0.1, 3.0)
-            if imgui.button("Reset##Contrast"): self.contrast = DEFAULT_SETTINGS["contrast"]
-
-            changed_sharp_enable, self.enable_sharpening = imgui.checkbox("Enable Sharpening", self.enable_sharpening)
-            if changed_sharp_enable: self.update_edge_params_ref()
-            if self.enable_sharpening:
-                imgui.indent()
-                changed_sharp_amt, self.sharpness = imgui.slider_float("Sharpness Amount", self.sharpness, 0.1, 5.0)
-                if changed_sharp_amt: self.update_edge_params_ref()
-                if imgui.button("Reset##Sharpness"):
-                    self.sharpness = DEFAULT_SETTINGS["sharpness"]
-                    self.update_edge_params_ref()
-                imgui.unindent()
-
-
-        # --- Smoothing Section ---
-        if imgui.collapsing_header("Smoothing", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-             changed_smooth, self.enable_point_smoothing = imgui.checkbox("Enable Point Smoothing", self.enable_point_smoothing)
-             if changed_smooth: self.update_edge_params_ref() # Update ref dict
-
-             imgui.indent()
-             changed_min_alpha, self.min_alpha_points = imgui.slider_float("Min Alpha", self.min_alpha_points, 0.0, 1.0)
-             if changed_min_alpha: self.update_edge_params_ref()
-             changed_max_alpha, self.max_alpha_points = imgui.slider_float("Max Alpha", self.max_alpha_points, 0.0, 1.0)
-             if changed_max_alpha: self.update_edge_params_ref()
-             if imgui.button("Reset##SmoothAlpha"):
-                 self.min_alpha_points = DEFAULT_SETTINGS["min_alpha_points"]
-                 self.max_alpha_points = DEFAULT_SETTINGS["max_alpha_points"]
-                 self.update_edge_params_ref()
-             imgui.unindent()
-
-             imgui.separator()
-             changed_edge_smooth, self.enable_edge_aware_smoothing = imgui.checkbox("Enable Edge-Aware Smoothing", self.enable_edge_aware_smoothing)
-             if changed_edge_smooth: self.update_edge_params_ref()
-
-             if self.enable_edge_aware_smoothing:
-                 imgui.indent()
-                 changed_d_thresh1, self.depth_edge_threshold1 = imgui.slider_float("Depth Thresh 1", self.depth_edge_threshold1, 1.0, 255.0)
-                 if changed_d_thresh1: self.update_edge_params_ref()
-                 changed_d_thresh2, self.depth_edge_threshold2 = imgui.slider_float("Depth Thresh 2", self.depth_edge_threshold2, 1.0, 255.0)
-                 if changed_d_thresh2: self.update_edge_params_ref()
-
-                 changed_rgb_thresh1, self.rgb_edge_threshold1 = imgui.slider_float("RGB Thresh 1", self.rgb_edge_threshold1, 1.0, 255.0)
-                 if changed_rgb_thresh1: self.update_edge_params_ref()
-                 changed_rgb_thresh2, self.rgb_edge_threshold2 = imgui.slider_float("RGB Thresh 2", self.rgb_edge_threshold2, 1.0, 255.0)
-                 if changed_rgb_thresh2: self.update_edge_params_ref()
-
-                 changed_edge_inf, self.edge_smoothing_influence = imgui.slider_float("Edge Influence", self.edge_smoothing_influence, 0.0, 1.0)
-                 if changed_edge_inf: self.update_edge_params_ref()
-
-                 changed_grad_inf, self.gradient_influence_scale = imgui.slider_float("Gradient Scale", self.gradient_influence_scale, 0.0, 5.0)
-                 if changed_grad_inf: self.update_edge_params_ref()
-
-
-                 if imgui.button("Reset##EdgeParams"):
-                     self.depth_edge_threshold1 = DEFAULT_SETTINGS["depth_edge_threshold1"]
-                     self.depth_edge_threshold2 = DEFAULT_SETTINGS["depth_edge_threshold2"]
-                     self.rgb_edge_threshold1 = DEFAULT_SETTINGS["rgb_edge_threshold1"]
-                     self.rgb_edge_threshold2 = DEFAULT_SETTINGS["rgb_edge_threshold2"]
-                     self.edge_smoothing_influence = DEFAULT_SETTINGS["edge_smoothing_influence"]
-                     self.gradient_influence_scale = DEFAULT_SETTINGS["gradient_influence_scale"]
-                     self.update_edge_params_ref()
-                 imgui.unindent()
-
-
-        # --- Debug Views Section ---
-        if imgui.collapsing_header("Debug Views")[0]:
-            _, self.show_camera_feed = imgui.checkbox("Show Camera Feed", self.show_camera_feed)
-            _, self.show_depth_map = imgui.checkbox("Show Depth Map", self.show_depth_map)
-            _, self.show_edge_map = imgui.checkbox("Show Edge Map", self.show_edge_map)
-            _, self.show_smoothing_map = imgui.checkbox("Show Smoothing Map", self.show_smoothing_map)
-
-
-        # --- Info Section ---
-        if imgui.collapsing_header("Info")[0]:
-            imgui.text(f"Points: {self.current_point_count}")
-            imgui.text(f"FPS: {self.point_cloud_fps:.1f}")
-            imgui.text_wrapped(f"Status: {self.status_message}")
-
-        imgui.end()
-        # --- End Controls Panel ---
-
-        # Render ImGui
-        # Ensure correct GL state for ImGui rendering (standard alpha blend)
+        # Render the 3D scene
+        self._render_scene()
+        # --- Draw Stats Overlay (Individual Labels) ---
+        # Set GL state for drawing text overlay
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-        gl.glDisable(gl.GL_DEPTH_TEST) # ImGui draws in 2D
+        gl.glDisable(gl.GL_DEPTH_TEST) # Draw text on top
 
-        imgui.render()
-        self.imgui_renderer.render(imgui.get_draw_data())
-        # --- End ImGui Frame ---
+        # Draw labels individually based on toggles
+        # Draw batches individually based on toggles
+        if self.show_fps_overlay and hasattr(self, 'fps_batch'): self.fps_batch.draw()
+        if self.show_points_overlay and hasattr(self, 'points_batch'): self.points_batch.draw()
+        if self.show_input_fps_overlay and hasattr(self, 'input_fps_batch'): self.input_fps_batch.draw()
+        if self.show_depth_fps_overlay and hasattr(self, 'depth_fps_batch'): self.depth_fps_batch.draw()
+        if self.show_latency_overlay and hasattr(self, 'latency_batch'): self.latency_batch.draw()
 
-        # Restore GL state needed for next 3D frame
+        # Restore depth test before drawing ImGui (which might disable it again)
         gl.glEnable(gl.GL_DEPTH_TEST)
+        # --- End Stats Overlay ---
+
+        # Draw the ImGui UI using the helper method
+        self._draw_ui()
+
+        # Final GL state restoration (if needed, though ImGui usually handles its own)
+        # gl.glEnable(gl.GL_DEPTH_TEST) # Already enabled after overlay
 
 
     # --- Input Handlers ---
     def on_resize(self, width, height):
         gl.glViewport(0, 0, max(1, width), max(1, height))
         self._aspect_ratio = float(width) / height if height > 0 else 1.0 # Update renamed variable
+        # Update overlay label positions on resize
+        y_pos = height - 20
+        if hasattr(self, 'fps_label'):
+            self.fps_label.x = width - 10; self.fps_label.y = y_pos; y_pos -= 20
+        if hasattr(self, 'points_label'):
+            self.points_label.x = width - 10; self.points_label.y = y_pos; y_pos -= 20
+        if hasattr(self, 'input_fps_label'):
+            self.input_fps_label.x = width - 10; self.input_fps_label.y = y_pos; y_pos -= 20
+        if hasattr(self, 'depth_fps_label'):
+            self.depth_fps_label.x = width - 10; self.depth_fps_label.y = y_pos; y_pos -= 20
+        if hasattr(self, 'latency_label'):
+            self.latency_label.x = width - 10; self.latency_label.y = y_pos; y_pos -= 20
         # Recreate debug textures on resize
         self.create_debug_textures()
 
