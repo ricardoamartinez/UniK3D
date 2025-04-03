@@ -313,11 +313,22 @@ def _initialize_input_source(input_mode, input_filepath, data_queue, playback_st
     error_message = None
 
     if input_mode == "Live":
-        print("Initializing camera...")
-        data_queue.put(("status", "Initializing camera..."))
-        cap = cv2.VideoCapture(0)
+        print("Initializing camera via GStreamer (nvarguscamerasrc)...")
+        data_queue.put(("status", "Initializing camera (GStreamer)..."))
+        # GStreamer pipeline using nvarguscamerasrc (sensor mode 6 for stability)
+        # Outputting BGR for OpenCV compatibility
+        pipeline = (
+            "nvarguscamerasrc sensor-id=0 sensor-mode=6 ! "
+            "video/x-raw(memory:NVMM), width=2028, height=1112, format=NV12, framerate=60/1 ! "
+            "nvvidconv ! "
+            "video/x-raw, format=BGRx ! "
+            "videoconvert ! "
+            "video/x-raw, format=BGR ! "
+            "appsink drop=true max-buffers=1"
+        )
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         if not cap.isOpened():
-            error_message = "Could not open camera."
+            error_message = "Could not open camera via GStreamer pipeline."
         else:
             is_video = True
             frame_source_name = "Live Camera"
