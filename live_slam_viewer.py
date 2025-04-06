@@ -5,6 +5,14 @@ import os
 import argparse
 import math
 import threading
+import mss
+import numpy as np
+import glob
+import re
+import tkinter as tk
+from tkinter import filedialog
+import win32gui # Added for window enumeration
+import win32con # Added for window enumeration constants
 import time
 import queue # For thread-safe communication
 import cv2 # For camera capture
@@ -297,6 +305,25 @@ texture_fragment_source = """#version 150 core
     }
 """
 
+# --- Window Enumeration Helper (Windows Only) ---
+def _get_window_list():
+    """Enumerates visible windows with titles."""
+    windows = []
+    def callback(hwnd, _):
+        # Check if window is visible and has a title
+        if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+            # Optional: Filter out certain window types if needed
+            # style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+            # if style & win32con.WS_DISABLED == 0: # Example: exclude disabled windows
+            windows.append((hwnd, win32gui.GetWindowText(hwnd)))
+    try:
+        win32gui.EnumWindows(callback, None)
+    except Exception as e:
+        print(f"Error enumerating windows: {e}") # Catch potential errors
+    # Sort by title for easier selection
+    return sorted(windows, key=lambda x: x[1])
+
+
 # --- Inference Thread Helper Functions ---
 
 def _initialize_input_source(input_mode, input_filepath, data_queue, playback_state_ref):
@@ -312,39 +339,26 @@ def _initialize_input_source(input_mode, input_filepath, data_queue, playback_st
     image_frame = None
     error_message = None
 
-    if input_mode == "Live":
+    # --- Initialize based on input_mode ---
+    if input_mode == "Live Camera": # Use exact name from UI
         print("Initializing camera...")
         data_queue.put(("status", "Initializing camera..."))
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            error_message = "Could not open camera."
-        else:
-            is_video = True
+        cap = cv2.VideoCapture(0) # TODO: Allow selecting camera index
+        if cap.isOpened():
+            is_video = True # Treat live feed as video
             frame_source_name = "Live Camera"
             video_fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
             print("Camera initialized.")
-            data_queue.put(("status", "Camera initialized."))
-    elif input_mode == "File" and input_filepath and os.path.exists(input_filepath):
-        frame_source_name = os.path.basename(input_filepath)
-        if os.path.isdir(input_filepath):
-            # --- Load GLB Sequence ---
-            print(f"Scanning directory for GLB files: {input_filepath}")
-            data_queue.put(("status", f"Scanning directory: {frame_source_name}..."))
-            glb_files = sorted(glob.glob(os.path.join(input_filepath, "*.glb")),
-                               key=lambda x: int(re.search(r'(\d+)', os.path.basename(x)).group(1)) if re.search(r'(\d+)', os.path.basename(x)) else -1)
-            if not glb_files:
-                error_message = f"No .glb files found in: {frame_source_name}"
-            else:
-                is_glb_sequence = True
-                input_mode = "GLB Sequence" # Update mode explicitly
-                video_total_frames = len(glb_files)
-                video_fps = 30 # Assume 30 FPS
-                playback_state_ref["total_frames"] = video_total_frames
-                playback_state_ref["current_frame"] = 0
-                print(f"GLB sequence loaded successfully ({video_total_frames} frames).")
-                data_queue.put(("status", f"Loaded GLB sequence: {frame_source_name}"))
+            data_queue.put(("status", "Camera ready."))
         else:
-            # --- Load Video or Image File ---
+            error_message = "Cannot open camera."
+            cap = None # Ensure cap is None on error
+
+    elif input_mode == "File (Video/Image)": # Use exact name from UI
+        if not input_filepath or not os.path.isfile(input_filepath):
+             error_message = f"Invalid or missing file path: {input_filepath}"
+        else:
+            frame_source_name = os.path.basename(input_filepath)
             print(f"Initializing video capture for file: {input_filepath}")
             data_queue.put(("status", f"Opening file: {frame_source_name}..."))
             cap = cv2.VideoCapture(input_filepath)
@@ -357,19 +371,55 @@ def _initialize_input_source(input_mode, input_filepath, data_queue, playback_st
                 print(f"Video file opened successfully ({video_total_frames} frames @ {video_fps:.2f} FPS).")
                 data_queue.put(("status", f"Opened video: {frame_source_name}"))
             else:
+                cap = None # Ensure cap is None
                 print("Failed to open as video, trying as image...")
                 try:
                     image_frame = cv2.imread(input_filepath)
                     if image_frame is not None:
                         is_image = True
+                        video_total_frames = 1 # Single frame
+                        video_fps = 1 # N/A for image
+                        playback_state_ref["total_frames"] = video_total_frames
+                        playback_state_ref["current_frame"] = 0
                         print("Image file loaded successfully.")
                         data_queue.put(("status", f"Loaded image: {frame_source_name}"))
                     else:
-                        error_message = f"Cannot open file: {frame_source_name}"
+                        error_message = f"Cannot open file as video or image: {frame_source_name}"
                 except Exception as e_img:
                     error_message = f"Error reading file: {frame_source_name} ({e_img})"
+
+    elif input_mode == "GLB Sequence": # Use exact name from UI
+        if not input_filepath or not os.path.isdir(input_filepath):
+             error_message = f"Invalid or missing directory path: {input_filepath}"
+        else:
+            frame_source_name = os.path.basename(input_filepath)
+            print(f"Scanning directory for GLB files: {input_filepath}")
+            data_queue.put(("status", f"Scanning directory: {frame_source_name}..."))
+            glb_files = sorted(glob.glob(os.path.join(input_filepath, "*.glb")),
+                               key=lambda x: int(re.search(r'(\d+)', os.path.basename(x)).group(1)) if re.search(r'(\d+)', os.path.basename(x)) else -1)
+            if not glb_files:
+                error_message = f"No .glb files found in: {frame_source_name}"
+            else:
+                is_glb_sequence = True
+                # Don't reassign input_mode here
+                video_total_frames = len(glb_files)
+                video_fps = 30 # Assume 30 FPS
+                playback_state_ref["total_frames"] = video_total_frames
+                playback_state_ref["current_frame"] = 0
+                print(f"GLB sequence loaded successfully ({video_total_frames} frames).")
+                data_queue.put(("status", f"Loaded GLB sequence: {frame_source_name}"))
+
+    elif input_mode == "Screen Capture": # Use exact name from UI
+        # No specific initialization needed here, capture happens per-frame
+        is_video = True # Treat screen capture like a video feed
+        frame_source_name = "Screen Capture"
+        video_fps = 30 # Assume target FPS
+        print("Screen Capture mode initialized.")
+        data_queue.put(("status", "Screen Capture ready."))
+
     else:
-        error_message = "Invalid input source specified."
+        # This case handles None or any other invalid string
+        error_message = f"Invalid input mode selected for initialization: {input_mode}"
 
     if error_message:
         print(f"Error: {error_message}")
@@ -380,7 +430,7 @@ def _initialize_input_source(input_mode, input_filepath, data_queue, playback_st
     return cap, image_frame, is_video, is_image, is_glb_sequence, glb_files, frame_source_name, video_total_frames, video_fps, input_mode, None
 
 
-def _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index, playback_state_ref, last_frame_read_time_ref, video_fps, is_video, is_image, is_glb_sequence, image_frame, frame_count, data_queue, frame_source_name):
+def _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index, playback_state_ref, last_frame_read_time_ref, video_fps, is_video, is_image, is_glb_sequence, image_frame, frame_count, data_queue, frame_source_name, selected_monitor_index, selected_window_hwnd): # Added screen capture args
     """Reads the next frame/GLB based on playback state. Returns timing delta."""
     frame = None
     points_xyz_np = None
@@ -418,7 +468,17 @@ def _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index, playba
     # Check if it's time to read the next frame or if it's the first image frame
     if time_since_last_read >= target_delta or (is_image and frame_count == 0):
         # --- Attempt to read/load based on input mode ---
-        if is_video and cap:
+        # --- Read/Load based on input_mode ---
+        if input_mode == "Live Camera" and cap:
+            ret, frame = cap.read()
+            if ret:
+                read_successful = True
+                new_sequence_frame_index = 0 # No sequence index for live camera
+                playback_state_ref["current_frame"] = frame_count # Use frame_count for live?
+            else:
+                print("Warning: Failed to read frame from live camera.")
+                ret = False # Indicate failure
+        elif input_mode == "File (Video/Image)" and cap:
             ret, frame = cap.read()
             if ret:
                 new_sequence_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
@@ -437,7 +497,7 @@ def _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index, playba
                         end_of_stream = True # Failed to read after loop
                 else:
                     end_of_stream = True # Not looping, end of stream
-        elif is_glb_sequence:
+        elif input_mode == "GLB Sequence":
             if new_sequence_frame_index >= len(glb_files): # End of sequence
                 if loop_video:
                     print("Looping GLB sequence.")
@@ -448,8 +508,10 @@ def _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index, playba
 
             if not end_of_stream:
                 current_glb_path = glb_files[new_sequence_frame_index]
-                points_xyz_np, colors_np = load_glb(current_glb_path)
+                points_xyz_np, colors_np = load_glb(current_glb_path) # Assume load_glb returns points, colors
                 if points_xyz_np is not None:
+                    frame = points_xyz_np # Use points as 'frame' data for GLB
+                    # colors_np are also available if needed later
                     ret = True
                     playback_state_ref["current_frame"] = new_sequence_frame_index + 1
                     new_sequence_frame_index += 1
@@ -457,7 +519,46 @@ def _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index, playba
                 else:
                     print(f"Error loading GLB frame: {current_glb_path}")
                     end_of_stream = True # Stop on error
-        elif is_image:
+        elif input_mode == "Screen Capture":
+            try:
+                with mss.mss() as sct:
+                    capture_area = None
+                    if selected_window_hwnd != 0:
+                        # Capture specific window using HWND
+                        # Get window rect (left, top, right, bottom)
+                        rect = win32gui.GetWindowRect(selected_window_hwnd)
+                        # Check if window is minimized (rect might be off-screen)
+                        if rect[0] < -1000 or rect[1] < -1000:
+                             print(f"Warning: Target window (HWND {selected_window_hwnd}) might be minimized. Capturing monitor instead.")
+                             capture_area = sct.monitors[selected_monitor_index]
+                        else:
+                             # Adjust for potential DWM composition offsets if needed (usually not necessary with GetWindowRect)
+                             capture_area = {'left': rect[0], 'top': rect[1], 'width': rect[2] - rect[0], 'height': rect[3] - rect[1]}
+                             # Basic validation
+                             if capture_area['width'] <= 0 or capture_area['height'] <= 0:
+                                 print(f"Warning: Invalid window dimensions for HWND {selected_window_hwnd}. Capturing monitor.")
+                                 capture_area = sct.monitors[selected_monitor_index]
+
+                    else:
+                        # Capture selected monitor (index 0 is 'all', 1+ are physical)
+                        if selected_monitor_index < len(sct.monitors):
+                             capture_area = sct.monitors[selected_monitor_index]
+                        else:
+                             print(f"Warning: Invalid monitor index {selected_monitor_index}, defaulting to primary (1).")
+                             capture_area = sct.monitors[1] # Fallback to primary
+
+                    sct_img = sct.grab(capture_area)
+                    img_bgra = np.array(sct_img)
+                    frame = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2BGR)
+                    ret = True
+                    read_successful = True
+                    new_sequence_frame_index = 0
+                    playback_state_ref["current_frame"] = frame_count
+            except Exception as e_screen:
+                print(f"Error capturing screen: {e_screen}")
+                traceback.print_exc() # Print full traceback for debugging
+                ret = False
+        elif input_mode == "File (Video/Image)" and is_image: # Handle single image case
              if frame_count == 0:
                  frame = image_frame
                  if frame is not None:
@@ -795,7 +896,8 @@ def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices, rgb_fra
 def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
                           scale_factor_ref, edge_params_ref,
                           input_mode, input_filepath, playback_state,
-                          recording_state, live_processing_mode): # Corrected params
+                          recording_state, live_processing_mode,
+                          selected_monitor_index, selected_window_hwnd): # Added screen capture args
     """Loads model, captures/loads data, runs inference, processes, and queues results."""
     print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}")
     data_queue.put(("status", f"Inference thread started ({input_mode})..."))
@@ -889,14 +991,16 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                         _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index,
                                            playback_state, last_frame_read_time_ref, video_fps,
                                            is_video, is_image, is_glb_sequence, image_frame,
-                                           frame_count, data_queue, frame_source_name)
+                                           frame_count, data_queue, frame_source_name,
+                                           selected_monitor_index, selected_window_hwnd) # Pass screen capture args
             else: # File, GLB Sequence, or Image mode
                  frame, points_xyz_np_loaded, colors_np_loaded, ret, \
                  sequence_frame_index, frame_read_delta_t, end_of_stream = \
                      _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index,
                                         playback_state, last_frame_read_time_ref, video_fps,
                                         is_video, is_image, is_glb_sequence, image_frame,
-                                        frame_count, data_queue, frame_source_name)
+                                        frame_count, data_queue, frame_source_name,
+                                        selected_monitor_index, selected_window_hwnd) # Pass screen capture args
 
             # --- Loop/End/Skip Checks ---
             # Check if sequence looped or restarted (index reset by _read_or_load_frame)
@@ -994,7 +1098,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
             # --- Handle Recording ---
             recorded_frame_counter = _handle_recording(points_xyz_np_processed, colors_np_processed,
-                                                       recording_state_ref, sequence_frame_index,
+                                                       recording_state, sequence_frame_index, # Changed recording_state_ref to recording_state
                                                        recorded_frame_counter, is_video, is_glb_sequence,
                                                        data_queue)
 
@@ -1042,6 +1146,8 @@ class LiveViewerWindow(pyglet.window.Window):
         # self._initial_disable_point_smoothing = disable_point_smoothing # No longer needed
 
         super().__init__(*args, **kwargs)
+
+        self.selected_model_name = self._model_name # Initialize UI selection state
 
         self.vertex_list = None
         self.frame_count_display = 0
@@ -1114,6 +1220,10 @@ class LiveViewerWindow(pyglet.window.Window):
 
         # Load initial settings (this initializes control variables and refs)
         self.load_settings()
+        # Ensure default input mode is set correctly after loading settings
+        if self.input_mode not in ["Live Camera", "File (Video/Image)", "GLB Sequence", "Screen Capture"]:
+            print(f"DEBUG: Input mode '{self.input_mode}' from settings invalid or missing, defaulting to 'Live Camera'.")
+            self.input_mode = "Live Camera"
 
         # --- Status Display ---
         # self.ui_batch = pyglet.graphics.Batch() # Batch removed, using ImGui now
@@ -1223,7 +1333,7 @@ class LiveViewerWindow(pyglet.window.Window):
         pyglet.clock.schedule_interval(self.update_camera, 1.0 / 60.0)
 
         # --- Threading Setup ---
-        self._data_queue = queue.Queue(maxsize=5)
+        self._data_queue = queue.Queue(maxsize=30) # Increased queue size
         self._exit_event = threading.Event()
         self.inference_thread = None
 
@@ -1348,7 +1458,9 @@ class LiveViewerWindow(pyglet.window.Window):
                   self.input_filepath, # Pass current filepath
                   self.playback_state, # Pass playback state dict
                   self.recording_state, # Pass recording state dict
-                  self.live_processing_mode), # Pass live processing mode
+                  self.live_processing_mode, # Pass live processing mode
+                  getattr(self, 'selected_monitor_index', 1), # Pass screen capture args w/ defaults
+                  getattr(self, 'selected_window_hwnd', 0)),
             daemon=True
         )
         self.inference_thread.start()
@@ -1673,19 +1785,22 @@ class LiveViewerWindow(pyglet.window.Window):
         self.update_recording_state() # Initialize recording state
 
 
-    def _browse_file(self):
-        """Opens a file dialog to select a video, image, or directory."""
+    def _browse_file(self, browse_type="file"): # Add browse_type argument
+        """Opens a file or directory dialog based on browse_type."""
         root = tk.Tk()
         root.withdraw() # Hide the main tkinter window
-        # Ask for directory first
-        dir_path = filedialog.askdirectory(title="Select GLB Sequence Directory")
-        if dir_path:
-             file_path = dir_path # Treat directory as the selection
-             print(f"DEBUG: Directory selected: {file_path}")
-             self.input_filepath = file_path
-             self.input_mode = "GLB Sequence" # Explicitly set mode
-             self.status_message = f"Directory selected: {os.path.basename(file_path)}"
-        else: # If directory selection cancelled, ask for file
+        file_path = None # Initialize file_path
+
+        if browse_type == "directory":
+            file_path = filedialog.askdirectory(title="Select GLB Sequence Directory")
+            if file_path:
+                print(f"DEBUG: Directory selected: {file_path}")
+                self.input_filepath = file_path
+                # self.input_mode = "GLB Sequence" # Mode is already set by UI combo
+                self.status_message = f"Directory selected: {os.path.basename(file_path)}"
+            else:
+                print("DEBUG: Directory selection cancelled.")
+        elif browse_type == "file":
             file_path = filedialog.askopenfilename(
                 title="Select Video or Image File",
                 filetypes=[("Media Files", "*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp"),
@@ -1696,25 +1811,29 @@ class LiveViewerWindow(pyglet.window.Window):
             if file_path:
                 print(f"DEBUG: File selected: {file_path}")
                 self.input_filepath = file_path
-                self.input_mode = "File" # Set mode to generic File
+                # self.input_mode = "File (Video/Image)" # Mode is already set by UI combo
                 self.status_message = f"File selected: {os.path.basename(file_path)}"
             else:
                 print("DEBUG: File selection cancelled.")
-                root.destroy()
-                return # Exit if no file/dir selected
+        else:
+             print(f"Warning: Unknown browse_type '{browse_type}'")
 
         root.destroy() # Destroy the tkinter instance
 
-        # Reset playback state for new file/directory
-        self.is_playing = True # Reset local UI control state
-        # Reset relevant fields in the shared state dictionary
-        self.playback_state["current_frame"] = 0
-        self.playback_state["total_frames"] = 0
-        self.playback_state["restart"] = False # Ensure restart flag is clear
-        # Update the rest of the shared state from local attributes
-        self.update_playback_state()
-        # Restart inference thread with new source
-        self.start_inference_thread()
+        if file_path: # Only reset playback if a path was actually selected
+            # Reset playback state for new file/directory
+            self.is_playing = True # Reset local UI control state
+            # Reset relevant fields in the shared state dictionary
+            self.playback_state["current_frame"] = 0
+            self.playback_state["total_frames"] = 0
+            self.playback_state["restart"] = False # Ensure restart flag is clear
+            # Update the rest of the shared state from local attributes
+            self.update_playback_state()
+            # DO NOT Restart inference thread here - user clicks "Start Source"
+            # self.start_inference_thread()
+         # --- Removed old logic below ---
+
+
 
 
     def _draw_ui(self):
@@ -1761,29 +1880,177 @@ class LiveViewerWindow(pyglet.window.Window):
             # --- Input/Output Tab ---
             if imgui.begin_tab_item("Input/Output")[0]:
                 imgui.text("Input Source")
-                if imgui.radio_button("Live Camera##InputMode", self.input_mode == "Live"):
-                    if self.input_mode != "Live":
-                        self.input_mode = "Live"
-                        self.input_filepath = "" # Clear filepath for live mode
-                        self.start_inference_thread() # Restart thread
-                imgui.same_line()
-                is_file_mode = self.input_mode == "File" or self.input_mode == "GLB Sequence"
-                if imgui.radio_button("File/Sequence##InputMode", is_file_mode):
-                     if not is_file_mode: # If switching TO file mode from Live
-                        self.input_mode = "File" # Default to generic file initially
-                        # Stop live thread if running, but don't start new one yet
+
+                # --- Collapsing Headers for Input Modes ---
+
+                # --- Live Camera Section ---
+                live_flags = imgui.TREE_NODE_DEFAULT_OPEN if self.input_mode == "Live Camera" else 0
+                header_live_open, _ = imgui.collapsing_header("Live Camera", flags=live_flags)
+                if header_live_open:
+                    imgui.indent()
+                    # Camera Index Input
+                    changed_cam_idx, self.live_camera_index = imgui.input_int("Camera Index", self.live_camera_index if hasattr(self, 'live_camera_index') else 0, 1)
+                    # Activate Button
+                    is_active = self.input_mode == "Live Camera" and self.inference_thread and self.inference_thread.is_alive()
+                    if imgui.button("Activate##Live" if not is_active else "Stop##Live"):
+                        if is_active:
+                            print("DEBUG: Stopping Live Camera source...")
+                            self.start_inference_thread() # Stops current thread
+                        else:
+                            print("DEBUG: Activating Live Camera...")
+                            self.input_mode = "Live Camera"
+                            self.input_filepath = "" # Clear path
+                            # TODO: Pass self.live_camera_index to start_inference_thread/init
+                            self.start_inference_thread()
+                    imgui.unindent()
+
+                # --- File Section ---
+                file_flags = imgui.TREE_NODE_DEFAULT_OPEN if self.input_mode == "File (Video/Image)" else 0
+                header_file_open, _ = imgui.collapsing_header("File (Video/Image)", flags=file_flags)
+                if header_file_open:
+                    imgui.indent()
+                    if imgui.button("Browse File...##File"):
+                        self._browse_file(browse_type="file")
+                    imgui.same_line()
+                    imgui.text(f"Path: {self.input_filepath if self.input_filepath else 'None selected'}")
+                    # Activate Button
+                    activate_disabled = not self.input_filepath
+                    is_active = self.input_mode == "File (Video/Image)" and self.inference_thread and self.inference_thread.is_alive()
+                    if activate_disabled:
+                        imgui.internal.push_item_flag(imgui.internal.ITEM_DISABLED, True)
+                        imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.5)
+                    if imgui.button("Activate##File" if not is_active else "Stop##File"):
+                         if is_active:
+                            print("DEBUG: Stopping File source...")
+                            self.start_inference_thread() # Stops current thread
+                         elif not activate_disabled:
+                            print("DEBUG: Activating File source...")
+                            self.input_mode = "File (Video/Image)"
+                            self.start_inference_thread()
+                    if activate_disabled:
+                        imgui.pop_style_var()
+                        imgui.internal.pop_item_flag()
+                    imgui.unindent()
+
+                # --- GLB Sequence Section ---
+                glb_flags = imgui.TREE_NODE_DEFAULT_OPEN if self.input_mode == "GLB Sequence" else 0
+                header_glb_open, _ = imgui.collapsing_header("GLB Sequence", flags=glb_flags)
+                if header_glb_open:
+                    imgui.indent()
+                    if imgui.button("Browse Directory...##GLB"):
+                        self._browse_file(browse_type="directory")
+                    imgui.same_line()
+                    imgui.text(f"Path: {self.input_filepath if self.input_filepath else 'None selected'}")
+                    # Activate Button
+                    activate_disabled = not self.input_filepath
+                    is_active = self.input_mode == "GLB Sequence" and self.inference_thread and self.inference_thread.is_alive()
+                    if activate_disabled:
+                        imgui.internal.push_item_flag(imgui.internal.ITEM_DISABLED, True)
+                        imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.5)
+                    if imgui.button("Activate##GLB" if not is_active else "Stop##GLB"):
+                         if is_active:
+                            print("DEBUG: Stopping GLB Sequence source...")
+                            self.start_inference_thread() # Stops current thread
+                         elif not activate_disabled:
+                            print("DEBUG: Activating GLB Sequence...")
+                            self.input_mode = "GLB Sequence"
+                            self.start_inference_thread()
+                    if activate_disabled:
+                        imgui.pop_style_var()
+                        imgui.internal.pop_item_flag()
+                    imgui.unindent()
+
+                # --- Screen Capture Section ---
+                screen_flags = imgui.TREE_NODE_DEFAULT_OPEN if self.input_mode == "Screen Capture" else 0
+                header_screen_open, _ = imgui.collapsing_header("Screen Capture", flags=screen_flags)
+                if header_screen_open:
+                    imgui.indent()
+                    # Monitor Selection
+                    monitors = mss.mss().monitors
+                    monitor_names = [f"Monitor {i}: {m['width']}x{m['height']} @ ({m['left']},{m['top']})" for i, m in enumerate(monitors)]
+                    if not hasattr(self, 'selected_monitor_index'): self.selected_monitor_index = 1 # Default to primary
+                    if self.selected_monitor_index >= len(monitors): self.selected_monitor_index = 1 # Ensure valid index
+                    changed_monitor, self.selected_monitor_index = imgui.combo("Monitor", self.selected_monitor_index, monitor_names)
+
+                    # Window Selection (Windows Only)
+                    windows = _get_window_list()
+                    window_names = ["Entire Selected Monitor"] + [f"{title} (HWND:{hwnd})" for hwnd, title in windows]
+                    if not hasattr(self, 'selected_window_hwnd'): self.selected_window_hwnd = 0 # 0 means entire monitor
+                    current_window_index = 0
+                    if self.selected_window_hwnd != 0:
+                        try: current_window_index = next(i for i, (hwnd, _) in enumerate(windows, 1) if hwnd == self.selected_window_hwnd)
+                        except StopIteration: self.selected_window_hwnd = 0 # Reset if window not found
+                    changed_window, current_window_index = imgui.combo("Target Window", current_window_index, window_names)
+                    if changed_window: self.selected_window_hwnd = 0 if current_window_index == 0 else windows[current_window_index - 1][0]
+
+                    # Activate Button
+                    is_active = self.input_mode == "Screen Capture" and self.inference_thread and self.inference_thread.is_alive()
+                    if imgui.button("Activate##Screen" if not is_active else "Stop##Screen"):
+                         if is_active:
+                            print("DEBUG: Stopping Screen Capture source...")
+                            self.start_inference_thread() # Stops current thread
+                         else:
+                            print("DEBUG: Activating Screen Capture...")
+                            self.input_mode = "Screen Capture"
+                            self.input_filepath = "" # Clear path
+                            # TODO: Pass self.selected_monitor_index and self.selected_window_hwnd
+                            self.start_inference_thread()
+                    imgui.unindent()
+
+                # --- Old Start/Stop Button Removed ---
+
+                # --- Live Processing Mode (Only show if Live Camera is selected) ---
+                # (Keep existing logic for this, but maybe move it under the conditional display)
+                if self.input_mode == "Live Camera": # Use self.input_mode
+                    imgui.separator()
+                    imgui.text("Live Processing Mode:")
+                    mode_changed = False
+                    if imgui.radio_button("Real-time (Low Latency)", self.live_processing_mode == "Real-time"):
+                        if self.live_processing_mode != "Real-time":
+                            self.live_processing_mode = "Real-time"
+                            mode_changed = True
+                    imgui.same_line()
+                    if imgui.radio_button("Buffered (Process All Frames)", self.live_processing_mode == "Buffered"):
+                         if self.live_processing_mode != "Buffered":
+                            self.live_processing_mode = "Buffered"
+                            mode_changed = True
+                    if mode_changed:
+                        # Restart thread with new mode if it's currently running
                         if self.inference_thread and self.inference_thread.is_alive():
-                            self.start_inference_thread() # This stops the old one
+                            print(f"Switching live processing mode to {self.live_processing_mode}, restarting thread...")
+                            self.start_inference_thread()
+                    # Duplicate radio button logic removed here
 
-                if imgui.button("Browse File/Dir..."):
-                    self._browse_file() # Handles setting mode and restarting thread
+                imgui.separator()
+                imgui.text("Recording") # Keep recording section
+                rec_button_text = " Stop Recording " if self.is_recording else " Start Recording "
+                if imgui.button(rec_button_text):
+                    self.is_recording = not self.is_recording
+                    if self.is_recording:
+                        try:
+                            os.makedirs(self.recording_output_dir, exist_ok=True)
+                            self.recorded_frame_count = 0 # Reset counter
+                            self.status_message = f"Recording started to {self.recording_output_dir}"
+                        except Exception as e_dir:
+                            print(f"Error creating recording directory: {e_dir}")
+                            self.status_message = "Error creating recording dir!"
+                            self.is_recording = False # Abort recording
+                    else:
+                        self.status_message = f"Recording stopped. {self.recorded_frame_count} frames saved."
+                    self.update_recording_state() # Update thread state
 
-                imgui.text("Source Path:")
-                imgui.push_item_width(-1)
-                display_path = self.input_filepath if self.input_filepath else "N/A (Using Live Camera)"
-                if self.input_mode == "GLB Sequence": display_path += " (GLB Sequence)"
-                imgui.text_wrapped(display_path)
-                imgui.pop_item_width()
+                imgui.same_line()
+                # Read recorded frame count from recording_state dict (updated by thread)
+                saved_count = self.recording_state.get("frames_saved", 0)
+                imgui.text(f"({saved_count} frames saved)")
+
+                changed_dir, self.recording_output_dir = imgui.input_text(
+                    "Output Dir", self.recording_output_dir, 256
+                )
+                if changed_dir and not self.recording_state.get("is_recording", False): # Update ref only if not recording
+                     self.update_recording_state()
+
+                # Model Selection moved here earlier
 
                 # Live Processing Mode (Only show if Live Camera is selected)
                 if self.input_mode == "Live":
@@ -1843,6 +2110,32 @@ class LiveViewerWindow(pyglet.window.Window):
                 if changed_dir and not self.recording_state.get("is_recording", False): # Update ref only if not recording
                      self.update_recording_state()
 
+                imgui.separator()
+                imgui.text("Model Selection")
+                # --- Model Selection Combo ---
+                model_names = ["unik3d-vits", "unik3d-vitb", "unik3d-vitl"]
+                try:
+                    current_model_index = model_names.index(self.selected_model_name)
+                except ValueError:
+                    current_model_index = model_names.index(self._model_name) # Fallback to initial if current selection invalid
+                    self.selected_model_name = self._model_name
+
+                changed_model, current_model_index = imgui.combo(
+                    "Model", current_model_index, model_names
+                )
+                if changed_model:
+                    self.selected_model_name = model_names[current_model_index]
+
+                imgui.same_line()
+                if imgui.button("Apply Model"):
+                    if self.selected_model_name != self._model_name:
+                        print(f"Switching model to {self.selected_model_name}...")
+                        self._model_name = self.selected_model_name # Update the name used by thread start
+                        self.start_inference_thread() # Restart thread with new model
+                    else:
+                        print("DEBUG: Selected model is already active.")
+                # --- End Model Selection ---
+
                 imgui.end_tab_item()
             # --- End Input/Output Tab ---
 
@@ -1898,6 +2191,35 @@ class LiveViewerWindow(pyglet.window.Window):
 
                 imgui.separator()
                 imgui.text("Edge-Aware Smoothing")
+                changed_edge_aware, self.enable_edge_aware_smoothing = imgui.checkbox("Enable##EdgeAware", self.enable_edge_aware_smoothing)
+                if changed_edge_aware: self._update_edge_params()
+                imgui.indent()
+                changed_edge_influence, self.edge_smoothing_influence = imgui.slider_float("Edge Influence", self.edge_smoothing_influence, 0.0, 1.0)
+                if changed_edge_influence: self._update_edge_params()
+                changed_grad_influence, self.gradient_influence_scale = imgui.slider_float("Gradient Scale", self.gradient_influence_scale, 0.0, 5.0)
+                if changed_grad_influence: self._update_edge_params()
+                if imgui.button("Reset##EdgeAwareParams"):
+                    self.edge_smoothing_influence = DEFAULT_SETTINGS["edge_smoothing_influence"]
+                    self.gradient_influence_scale = DEFAULT_SETTINGS["gradient_influence_scale"]
+                    self._update_edge_params()
+                imgui.unindent()
+
+                imgui.separator()
+                imgui.text("Input Preprocessing")
+                changed_sharpen, self.enable_sharpening = imgui.checkbox("Sharpen Input", self.enable_sharpening)
+                if changed_sharpen: self._update_edge_params()
+                imgui.indent()
+                changed_sharp_amount, self.sharpness = imgui.slider_float("Sharpness Amount", self.sharpness, 0.0, 3.0)
+                if changed_sharp_amount: self._update_edge_params()
+                imgui.unindent()
+
+                changed_scale, self.input_scale_factor = imgui.slider_float("Input Scale", self.input_scale_factor, 0.1, 1.0, "%.2f")
+                if changed_scale:
+                    self.scale_factor_ref[0] = self.input_scale_factor # Update ref immediately
+
+                # --- Model Selection Moved to Input/Output Tab ---
+
+                imgui.separator()
                 changed_edge_smooth, self.enable_edge_aware_smoothing = imgui.checkbox("Enable##EdgeAwareEnable", self.enable_edge_aware_smoothing)
                 if changed_edge_smooth: self._update_edge_params()
 
