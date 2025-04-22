@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 from torch.nn import functional as F
@@ -402,7 +402,7 @@ def rays2angles(rays: torch.Tensor) -> torch.Tensor:
 
 
 @torch.jit.script
-def dilate(image, kernel_size: int | tuple[int, int]):
+def dilate(image, kernel_size: Union[int, tuple[int, int]]):
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     device, dtype = image.device, image.dtype
@@ -418,7 +418,7 @@ def dilate(image, kernel_size: int | tuple[int, int]):
 
 
 @torch.jit.script
-def erode(image, kernel_size: int | tuple[int, int]):
+def erode(image, kernel_size: Union[int, tuple[int, int]]):
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     device, dtype = image.device, image.dtype

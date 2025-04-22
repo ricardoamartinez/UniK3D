@@ -994,7 +994,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 
             # --- Handle Recording ---
             recorded_frame_counter = _handle_recording(points_xyz_np_processed, colors_np_processed,
-                                                       recording_state_ref, sequence_frame_index,
+                                                       recording_state, sequence_frame_index, # Corrected variable name
                                                        recorded_frame_counter, is_video, is_glb_sequence,
                                                        data_queue)
 
