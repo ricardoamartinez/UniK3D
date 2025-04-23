@@ -142,18 +142,19 @@ vertex_source = """#version 150 core
     uniform mat4 view;
     uniform float inputScaleFactor; // Controlled via ImGui
     uniform float pointSizeBoost;   // Controlled via ImGui
+    uniform vec2 viewportSize;      // Width, height of viewport in pixels
 
     void main() {
-        gl_Position = projection * view * vec4(vertices, 1.0);
-        vertex_colors = colors; // Pass color data through
+        vec4 clipPos = projection * view * vec4(vertices, 1.0);
+        gl_Position = clipPos;
+        vertex_colors = colors;
 
-        // --- Point Size based ONLY on distance from Origin ---
-        float originDist = length(vertices);
-        float baseScalingFactor = 1.0;
-        float effectiveScaleFactor = max(0.1, inputScaleFactor);
-        float pointSizePixels = (baseScalingFactor * originDist) / effectiveScaleFactor;
-        float clampedSize = max(1.0, min(30.0, pointSizePixels));
-        gl_PointSize = clampedSize * pointSizeBoost;
+        // --- Point Size based on world-space size and perspective projection ---
+        float worldSize = max(0.0001, inputScaleFactor);
+        float halfHeight = viewportSize.y * 0.5;
+        float pixelSize = (worldSize * projection[1][1] * halfHeight) / clipPos.w;
+        float clampedSize = clamp(pixelSize * pointSizeBoost, 1.0, 30.0);
+        gl_PointSize = clampedSize;
         // --- End Point Size Calculation ---
     }
 """
