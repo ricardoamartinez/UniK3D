@@ -15,6 +15,7 @@ from tkinter import filedialog
 import glob # For finding files
 import re # For sorting files numerically
 import trimesh # For GLB saving/loading
+import mss  # For screen capture (virtual camera)
 
 # Assuming unik3d is installed and importable
 from unik3d.models import UniK3D
@@ -368,6 +369,15 @@ def _initialize_input_source(input_mode, input_filepath, data_queue, playback_st
                         error_message = f"Cannot open file: {frame_source_name}"
                 except Exception as e_img:
                     error_message = f"Error reading file: {frame_source_name} ({e_img})"
+    elif input_mode == "Screen":
+        # Initialize screen capture as virtual camera
+        print("Initializing screen capture...")
+        data_queue.put(("status", "Initializing screen capture..."))
+        is_video = True
+        frame_source_name = "Screen Share"
+        video_fps = 30
+        playback_state_ref["total_frames"] = 0
+        playback_state_ref["current_frame"] = 0
     else:
         error_message = "Invalid input source specified."
 
@@ -890,6 +900,22 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                            playback_state, last_frame_read_time_ref, video_fps,
                                            is_video, is_image, is_glb_sequence, image_frame,
                                            frame_count, data_queue, frame_source_name)
+            elif input_mode == "Screen" and is_video:
+                # Capture screen as virtual camera
+                try:
+                    with mss.mss() as sct:
+                        sct_img = sct.grab(sct.monitors[1])
+                    frame = np.array(sct_img)[:, :, :3]
+                    ret = True
+                    current_time = time.time()
+                    frame_read_delta_t = current_time - last_frame_read_time_ref[0]
+                    last_frame_read_time_ref[0] = current_time
+                    sequence_frame_index = frame_count + 1
+                    playback_state["current_frame"] = sequence_frame_index
+                except Exception as e_screen:
+                    print(f"Error capturing screen: {e_screen}")
+                    time.sleep(0.005)
+                    continue
             else: # File, GLB Sequence, or Image mode
                  frame, points_xyz_np_loaded, colors_np_loaded, ret, \
                  sequence_frame_index, frame_read_delta_t, end_of_stream = \
@@ -1312,25 +1338,35 @@ class LiveViewerWindow(pyglet.window.Window):
         # Stop existing thread first if running
         if self.inference_thread and self.inference_thread.is_alive():
             print("DEBUG: Stopping existing inference thread...")
-            self.status_message = "Stopping previous source..." # Update status
+            self.status_message = "Stopping previous source..."  # Update status
+            # Signal the old thread to exit
             self._exit_event.set()
-            self.inference_thread.join(timeout=2.0) # Increase timeout slightly
+            # Wait for the old thread to finish
+            self.inference_thread.join(timeout=5.0)
             if self.inference_thread.is_alive():
-                 print("Warning: Inference thread did not stop quickly.")
-                 # Optionally force kill? Risky.
+                print("Warning: Inference thread did not stop in time.")
+            # Clear the old thread reference
             self.inference_thread = None
-            self._exit_event.clear() # Reset event for new thread
+            # Flush any pending data to drop stale frames
+            try:
+                while True:
+                    self._data_queue.get_nowait()
+            except queue.Empty:
+                pass
             # Clear vertex list when source changes
             if self.vertex_list:
-                try: self.vertex_list.delete()
-                except: pass
+                try:
+                    self.vertex_list.delete()
+                except:
+                    pass
                 self.vertex_list = None
                 self.current_point_count = 0
-
+        # Create a fresh exit event for the new thread to use
+        self._exit_event = threading.Event()
 
         # Ensure refs are initialized
         if not hasattr(self, 'scale_factor_ref') or self.scale_factor_ref is None:
-             self.scale_factor_ref = [self.input_scale_factor]
+            self.scale_factor_ref = [self.input_scale_factor]
         if not hasattr(self, 'edge_params_ref') or not self.edge_params_ref: # Keep ref name for dict itself
              self._update_edge_params()
         if not hasattr(self, 'playback_state') or not self.playback_state:
@@ -1716,6 +1752,71 @@ class LiveViewerWindow(pyglet.window.Window):
         # Restart inference thread with new source
         self.start_inference_thread()
 
+    def _browse_media_file(self):
+        """Opens a dialog to select a video or image file."""
+        root = tk.Tk()
+        root.withdraw()
+        file_path = filedialog.askopenfilename(
+            title="Select Video or Image File",
+            filetypes=[("Media Files", "*.mp4 *.avi *.mov *.mkv *.jpg *.jpeg *.png *.bmp"),
+                       ("Video Files", "*.mp4 *.avi *.mov *.mkv"),
+                       ("Image Files", "*.jpg *.jpeg *.png *.bmp"),
+                       ("All Files", "*.*")]
+        )
+        if not file_path:
+            print("DEBUG: File selection cancelled.")
+            root.destroy()
+            return
+        print(f"DEBUG: File selected: {file_path}")
+        self.input_filepath = file_path
+        self.input_mode = "File"
+        self.status_message = f"File selected: {os.path.basename(file_path)}"
+        root.destroy()
+
+        # Reset playback state for new file
+        self.is_playing = True
+        self.playback_state["current_frame"] = 0
+        self.playback_state["total_frames"] = 0
+        self.playback_state["restart"] = False
+        self.update_playback_state()
+        self.start_inference_thread()
+
+    def _browse_glb_sequence(self):
+        """Opens a dialog to select a directory of GLB sequence."""
+        root = tk.Tk()
+        root.withdraw()
+        dir_path = filedialog.askdirectory(title="Select GLB Sequence Directory")
+        if not dir_path:
+            print("DEBUG: Directory selection cancelled.")
+            root.destroy()
+            return
+        print(f"DEBUG: Directory selected: {dir_path}")
+        self.input_filepath = dir_path
+        self.input_mode = "GLB Sequence"
+        self.status_message = f"Directory selected: {os.path.basename(dir_path)}"
+        root.destroy()
+
+        # Reset playback state for new sequence
+        self.is_playing = True
+        self.playback_state["current_frame"] = 0
+        self.playback_state["total_frames"] = 0
+        self.playback_state["restart"] = False
+        self.update_playback_state()
+        self.start_inference_thread()
+
+    def _switch_input_source(self, mode, filepath):
+        """Switches to the given input mode (Live or Screen), resets playback state, and restarts inference."""
+        self.input_mode = mode
+        self.input_filepath = filepath
+        self.status_message = f"{mode} selected"
+        # Reset playback state for new source
+        self.is_playing = True
+        self.playback_state["current_frame"] = 0
+        self.playback_state["total_frames"] = 0
+        self.playback_state["restart"] = False
+        self.update_playback_state()
+        # Restart the inference thread with the new source
+        self.start_inference_thread()
 
     def _draw_ui(self):
         """Draws the ImGui user interface."""
@@ -1760,89 +1861,26 @@ class LiveViewerWindow(pyglet.window.Window):
 
             # --- Input/Output Tab ---
             if imgui.begin_tab_item("Input/Output")[0]:
-                imgui.text("Input Source")
-                if imgui.radio_button("Live Camera##InputMode", self.input_mode == "Live"):
-                    if self.input_mode != "Live":
-                        self.input_mode = "Live"
-                        self.input_filepath = "" # Clear filepath for live mode
-                        self.start_inference_thread() # Restart thread
-                imgui.same_line()
-                is_file_mode = self.input_mode == "File" or self.input_mode == "GLB Sequence"
-                if imgui.radio_button("File/Sequence##InputMode", is_file_mode):
-                     if not is_file_mode: # If switching TO file mode from Live
-                        self.input_mode = "File" # Default to generic file initially
-                        # Stop live thread if running, but don't start new one yet
-                        if self.inference_thread and self.inference_thread.is_alive():
-                            self.start_inference_thread() # This stops the old one
-
-                if imgui.button("Browse File/Dir..."):
-                    self._browse_file() # Handles setting mode and restarting thread
-
-                imgui.text("Source Path:")
-                imgui.push_item_width(-1)
-                display_path = self.input_filepath if self.input_filepath else "N/A (Using Live Camera)"
-                if self.input_mode == "GLB Sequence": display_path += " (GLB Sequence)"
-                imgui.text_wrapped(display_path)
-                imgui.pop_item_width()
-
-                # Live Processing Mode (Only show if Live Camera is selected)
-                if self.input_mode == "Live":
-                    imgui.separator()
-                    imgui.text("Live Processing Mode:")
-                    mode_changed = False
-                    if imgui.radio_button("Real-time (Low Latency)", self.live_processing_mode == "Real-time"):
-                        if self.live_processing_mode != "Real-time":
-                            self.live_processing_mode = "Real-time"
-                            mode_changed = True
-                    imgui.same_line()
-                    if imgui.radio_button("Buffered (Process All Frames)", self.live_processing_mode == "Buffered"):
-                         if self.live_processing_mode != "Buffered":
-                            self.live_processing_mode = "Buffered"
-                            mode_changed = True
-                    if mode_changed:
-                        # Restart thread with new mode if it's currently running
-                        if self.inference_thread and self.inference_thread.is_alive():
-                            print(f"Switching live processing mode to {self.live_processing_mode}, restarting thread...")
-                            self.start_inference_thread()
-                    if imgui.radio_button("Buffered (Process All Frames)", self.live_processing_mode == "Buffered"):
-                         if self.live_processing_mode != "Buffered":
-                            self.live_processing_mode = "Buffered"
-                            mode_changed = True
-                    if mode_changed:
-                        # Restart thread with new mode if it's currently running
-                        if self.inference_thread and self.inference_thread.is_alive():
-                            print(f"Switching live processing mode to {self.live_processing_mode}, restarting thread...")
-                            self.start_inference_thread()
-
-                imgui.separator()
-                imgui.text("Recording")
-                rec_button_text = " Stop Recording " if self.is_recording else " Start Recording "
-                if imgui.button(rec_button_text):
-                    self.is_recording = not self.is_recording
-                    if self.is_recording:
-                        try:
-                            os.makedirs(self.recording_output_dir, exist_ok=True)
-                            self.recorded_frame_count = 0 # Reset counter
-                            self.status_message = f"Recording started to {self.recording_output_dir}"
-                        except Exception as e_dir:
-                            print(f"Error creating recording directory: {e_dir}")
-                            self.status_message = "Error creating recording dir!"
-                            self.is_recording = False # Abort recording
+                imgui.text("Select Input Source:")
+                # Combo selection for input source
+                options = ["Live", "File", "GLB Sequence", "Screen"]
+                labels = ["Live Camera", "Media File", "GLB Sequence", "Screen Share"]
+                current_idx = options.index(self.input_mode) if self.input_mode in options else 0
+                changed, idx = imgui.combo("Input Source", current_idx, labels)
+                if changed and idx != current_idx:
+                    mode = options[idx]
+                    if mode == "Live":
+                        self._switch_input_source("Live", None)
+                    elif mode == "File":
+                        self._browse_media_file()
+                    elif mode == "GLB Sequence":
+                        self._browse_glb_sequence()
                     else:
-                        self.status_message = f"Recording stopped. {self.recorded_frame_count} frames saved."
-                    self.update_recording_state() # Update thread state
-
-                imgui.same_line()
-                # Read recorded frame count from recording_state dict (updated by thread)
-                saved_count = self.recording_state.get("frames_saved", 0)
-                imgui.text(f"({saved_count} frames saved)")
-
-                changed_dir, self.recording_output_dir = imgui.input_text(
-                    "Output Dir", self.recording_output_dir, 256
-                )
-                if changed_dir and not self.recording_state.get("is_recording", False): # Update ref only if not recording
-                     self.update_recording_state()
-
+                        self._switch_input_source("Screen", None)
+                # Show selected path for file or sequence
+                if self.input_mode in ["File", "GLB Sequence"]:
+                    imgui.text("Path: " + (self.input_filepath or "None"))
+                imgui.separator()
                 imgui.end_tab_item()
             # --- End Input/Output Tab ---
 
