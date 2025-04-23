@@ -145,16 +145,28 @@ vertex_source = """#version 150 core
     uniform vec2 viewportSize;      // Width, height of viewport in pixels
 
     void main() {
-        vec4 clipPos = projection * view * vec4(vertices, 1.0);
+        // Transform to view and clip space
+        vec4 viewPos = view * vec4(vertices, 1.0);
+        vec4 clipPos = projection * viewPos;
         gl_Position = clipPos;
         vertex_colors = colors;
 
-        // --- Point Size based on world-space size and perspective projection ---
+        // --- Projection-based point sizing for any projection ---
+        // World-space radius of the point
         float worldSize = max(0.0001, inputScaleFactor);
-        float halfHeight = viewportSize.y * 0.5;
-        float pixelSize = (worldSize * projection[1][1] * halfHeight) / clipPos.w;
-        float clampedSize = clamp(pixelSize * pointSizeBoost, 1.0, 30.0);
-        gl_PointSize = clampedSize;
+        // Project a neighboring point offset along camera right axis by worldSize
+        vec4 viewPosOffset = viewPos + vec4(worldSize, 0.0, 0.0, 0.0);
+        vec4 clipOffset = projection * viewPosOffset;
+        // Convert to normalized device coords
+        vec2 ndc = clipPos.xy / clipPos.w;
+        vec2 ndcOff = clipOffset.xy / clipOffset.w;
+        // Map NDC to screen pixels
+        vec2 screen = (ndc * 0.5 + 0.5) * viewportSize;
+        vec2 screenOff = (ndcOff * 0.5 + 0.5) * viewportSize;
+        // Radius in pixels
+        float pixelRadius = length(screenOff - screen);
+        // Diameter times boost
+        gl_PointSize = max(1.0, pixelRadius * 2.0 * pointSizeBoost);
         // --- End Point Size Calculation ---
     }
 """
