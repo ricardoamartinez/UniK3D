@@ -144,7 +144,7 @@ vertex_source = """#version 150 core
     uniform float inputScaleFactor; // Controlled via ImGui
     uniform float pointSizeBoost;   // Controlled via ImGui
     uniform vec2 viewportSize;      // Width, height of viewport in pixels
-    uniform float inputFocal;  // Focal length of input camera in pixel units
+    uniform float inputFocal;       // Focal length of input camera in pixel units
 
     void main() {
         // Transform to view and clip space
@@ -153,18 +153,18 @@ vertex_source = """#version 150 core
         gl_Position = clipPos;
         vertex_colors = colors;
 
-        // --- Projection-based point sizing using input camera focal ---
-        // Compute world radius
-        float worldSize = max(0.0001, inputScaleFactor);
-        // Depth from input camera = -viewPos.z
-        float depth = max(-viewPos.z, 0.0001);
-        // Pixel radius = worldSize * inputFocal / depth
-        float pixelRadius = worldSize * inputFocal / depth;
-        // Diameter = 2 * radius
-        float diameter = pixelRadius * 2.0 * pointSizeBoost;
-        // Clamp between 1px and half viewport height
-        float size = clamp(diameter, 1.0, viewportSize.y * 0.5);
-        gl_PointSize = size;
+        // --- Input-camera-based point sizing (viewer frustum independent) ---
+        float worldRadius = max(0.0001, inputScaleFactor);
+        // Depth relative to input camera = -vertices.z
+        float depth = max(-vertices.z, 0.0001);
+        // Pixel radius proportional to depth squared (z^2) for flipped inverse-square feel
+        float radius_z_squared = inputFocal * worldRadius * (depth * depth);
+        // Add a scaling factor because z^2 grows quickly (tune this value)
+        float scale_factor = 0.001;
+        float diameter = 2.0 * radius_z_squared * scale_factor * pointSizeBoost;
+
+        // Enforce minimum size
+        gl_PointSize = max(diameter, 1.0);
         // --- End Point Size Calculation ---
     }
 """
@@ -2194,6 +2194,15 @@ class LiveViewerWindow(pyglet.window.Window):
             # Sharpness is applied in inference thread, but shader still has uniform
             self.shader_program['sharpness'] = self.sharpness if self.enable_sharpening else 1.0
 
+            # Compute and pass input camera focal length (pixel units) for sizing
+            if self.latest_rgb_frame is not None:
+                input_h = float(self.latest_rgb_frame.shape[0])
+            else:
+                input_h = float(self.height) # Fallback if no frame yet
+            fov_rad = math.radians(self.input_camera_fov)
+            input_focal = (input_h * 0.5) / math.tan(fov_rad * 0.5)
+            self.shader_program['inputFocal'] = input_focal
+
             # Set GL state based on render mode
             if self.render_mode == 0: # Square (Opaque)
                 gl.glEnable(gl.GL_DEPTH_TEST)
@@ -2222,11 +2231,6 @@ class LiveViewerWindow(pyglet.window.Window):
                 gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
                 self.shader_program.stop()
         # --- End Draw 3D Splats ---
-
-        # Compute input camera focal length in pixels: (viewportHeight/2) / tan(FOV/2)
-        fov_rad = radians(self.input_camera_fov)
-        inputFocal = (self.height * 0.5) / tan(fov_rad * 0.5)
-        self.shader_program['inputFocal'] = inputFocal
 
     def on_draw(self):
         # Clear the main window buffer
