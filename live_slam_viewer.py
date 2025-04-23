@@ -65,6 +65,7 @@ DEFAULT_SETTINGS = {
     "show_depth_fps_overlay": False,
     "show_latency_overlay": False,
     "live_processing_mode": "Real-time", # "Real-time" or "Buffered"
+    "input_camera_fov": 60.0,  # FOV of the input camera in degrees
 }
 
 # --- GLB Saving Helper ---
@@ -143,6 +144,7 @@ vertex_source = """#version 150 core
     uniform float inputScaleFactor; // Controlled via ImGui
     uniform float pointSizeBoost;   // Controlled via ImGui
     uniform vec2 viewportSize;      // Width, height of viewport in pixels
+    uniform float inputFocal;  // Focal length of input camera in pixel units
 
     void main() {
         // Transform to view and clip space
@@ -151,22 +153,18 @@ vertex_source = """#version 150 core
         gl_Position = clipPos;
         vertex_colors = colors;
 
-        // --- Projection-based point sizing for any projection ---
-        // World-space radius of the point
+        // --- Projection-based point sizing using input camera focal ---
+        // Compute world radius
         float worldSize = max(0.0001, inputScaleFactor);
-        // Project a neighboring point offset along camera right axis by worldSize
-        vec4 viewPosOffset = viewPos + vec4(worldSize, 0.0, 0.0, 0.0);
-        vec4 clipOffset = projection * viewPosOffset;
-        // Convert to normalized device coords
-        vec2 ndc = clipPos.xy / clipPos.w;
-        vec2 ndcOff = clipOffset.xy / clipOffset.w;
-        // Map NDC to screen pixels
-        vec2 screen = (ndc * 0.5 + 0.5) * viewportSize;
-        vec2 screenOff = (ndcOff * 0.5 + 0.5) * viewportSize;
-        // Radius in pixels
-        float pixelRadius = length(screenOff - screen);
-        // Diameter times boost
-        gl_PointSize = max(1.0, pixelRadius * 2.0 * pointSizeBoost);
+        // Depth from input camera = -viewPos.z
+        float depth = max(-viewPos.z, 0.0001);
+        // Pixel radius = worldSize * inputFocal / depth
+        float pixelRadius = worldSize * inputFocal / depth;
+        // Diameter = 2 * radius
+        float diameter = pixelRadius * 2.0 * pointSizeBoost;
+        // Clamp between 1px and half viewport height
+        float size = clamp(diameter, 1.0, viewportSize.y * 0.5);
+        gl_PointSize = size;
         // --- End Point Size Calculation ---
     }
 """
@@ -2224,6 +2222,11 @@ class LiveViewerWindow(pyglet.window.Window):
                 gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
                 self.shader_program.stop()
         # --- End Draw 3D Splats ---
+
+        # Compute input camera focal length in pixels: (viewportHeight/2) / tan(FOV/2)
+        fov_rad = radians(self.input_camera_fov)
+        inputFocal = (self.height * 0.5) / tan(fov_rad * 0.5)
+        self.shader_program['inputFocal'] = inputFocal
 
     def on_draw(self):
         # Clear the main window buffer
