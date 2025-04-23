@@ -844,6 +844,9 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         frame_source_name, video_total_frames, video_fps, input_mode, error_message = \
             _initialize_input_source(input_mode, input_filepath, data_queue, playback_state) # Use renamed variable
 
+        # Start timestamp for virtual live playback (File/GLB)
+        media_start_time = time.time()
+
         if error_message:
             return # Error already queued by helper
 
@@ -916,13 +919,55 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     print(f"Error capturing screen: {e_screen}")
                     time.sleep(0.005)
                     continue
-            else: # File, GLB Sequence, or Image mode
-                 frame, points_xyz_np_loaded, colors_np_loaded, ret, \
-                 sequence_frame_index, frame_read_delta_t, end_of_stream = \
-                     _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index,
-                                        playback_state, last_frame_read_time_ref, video_fps,
-                                        is_video, is_image, is_glb_sequence, image_frame,
-                                        frame_count, data_queue, frame_source_name)
+            elif input_mode in ["File", "GLB Sequence"] and not is_image:
+                # Virtual live mode: drop frames based on real-time timing
+                # Handle restart flag by resetting the media start time
+                if playback_state.get("restart", False):
+                    media_start_time = time.time()
+                    playback_state["restart"] = False
+
+                elapsed = time.time() - media_start_time
+                frame_idx = int(elapsed * video_fps)
+                total_frames = video_total_frames
+                loop_video = playback_state.get("loop", True)
+                
+                if total_frames > 0:
+                    # Apply looping or end-of-stream logic
+                    if frame_idx >= total_frames:
+                        if loop_video:
+                            frame_idx = frame_idx % total_frames
+                        else:
+                            end_of_stream = True
+
+                    if not end_of_stream:
+                        # Seek and read video frames
+                        if is_video and cap:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                            ret, frame = cap.read()
+                        # Load GLB sequence frames
+                        elif is_glb_sequence:
+                            if frame_idx < len(glb_files):
+                                points_xyz_np_loaded, colors_np_loaded = load_glb(glb_files[frame_idx])
+                                ret = points_xyz_np_loaded is not None
+                            else:
+                                end_of_stream = True
+
+                        # Update frame index and shared state (1-based for display)
+                        sequence_frame_index = frame_idx + 1
+                        playback_state["current_frame"] = sequence_frame_index
+
+                        # Update timing reference for frame read delta
+                        current_time = time.time()
+                        frame_read_delta_t = current_time - last_frame_read_time_ref[0]
+                        last_frame_read_time_ref[0] = current_time
+            else:
+                # Image or fallback file handling
+                frame, points_xyz_np_loaded, colors_np_loaded, ret, \
+                sequence_frame_index, frame_read_delta_t, end_of_stream = \
+                    _read_or_load_frame(input_mode, cap, glb_files, sequence_frame_index,
+                                       playback_state, last_frame_read_time_ref, video_fps,
+                                       is_video, is_image, is_glb_sequence, image_frame,
+                                       frame_count, data_queue, frame_source_name)
 
             # --- Loop/End/Skip Checks ---
             # Check if sequence looped or restarted (index reset by _read_or_load_frame)
