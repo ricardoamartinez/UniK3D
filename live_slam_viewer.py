@@ -1566,14 +1566,54 @@ class LiveViewerWindow(pyglet.window.Window):
             print(f"Error updating debug textures: {e_tex}")
             # Optionally disable debug views on error?
 
-    def _update_vertex_list(self, vertices_data, colors_data, num_vertices):
-        """Updates the main point cloud vertex list."""
+    def _update_vertex_list(self, vertices_data, colors_data, num_vertices, view_matrix):
+        """Updates the main point cloud vertex list, sorting if needed for Gaussian render mode."""
         self.current_point_count = num_vertices # Update point count regardless
 
         if vertices_data is not None and colors_data is not None and num_vertices > 0:
-            # Y-inversion is done before this method in _process_queue_data
-            # No further transformation needed here for display coordinates
-            vertices_for_display = vertices_data
+
+            # --- Depth Sorting for Gaussian Splats --- 
+            if self.render_mode == 2:
+                try:
+                    # Reshape flat arrays back to N x 3
+                    vertices_np = vertices_data.reshape((num_vertices, 3))
+                    colors_np = colors_data.reshape((num_vertices, 3))
+
+                    # Transform world vertices to view space to get depth
+                    # Pyglet Mat4 can multiply Vec3s directly, but slower for large arrays.
+                    # Convert to numpy for faster batch transformation.
+                    # Add homogeneous coordinate (w=1)
+                    vertices_homogeneous = np.hstack((vertices_np, np.ones((num_vertices, 1))))
+                    # Convert pyglet Mat4 to numpy array (column-major to row-major if needed? Test)
+                    # Pyglet matrices are column-major, numpy expects row-major for standard @ op
+                    view_np = np.array(view_matrix).reshape((4, 4), order='F') # 'F' for Fortran/Column-major
+                    view_space_points = vertices_homogeneous @ view_np.T # Transpose view_np for correct multiplication
+
+                    # Extract Z depth (larger Z is farther in OpenGL view space)
+                    view_space_depths = view_space_points[:, 2]
+
+                    # Get indices to sort by depth, ascending (nearest first) - FLIPPED
+                    sort_indices = np.argsort(view_space_depths)
+
+                    # Sort vertices and colors
+                    vertices_sorted = vertices_np[sort_indices]
+                    colors_sorted = colors_np[sort_indices]
+
+                    # Flatten back for vertex list
+                    vertices_for_display = vertices_sorted.flatten()
+                    colors_for_display = colors_sorted.flatten()
+
+                except Exception as e_sort:
+                    print(f"Error during point sorting: {e_sort}")
+                    traceback.print_exc()
+                    # Fallback to unsorted data if sorting fails
+                    vertices_for_display = vertices_data
+                    colors_for_display = colors_data
+            else:
+                # Use original data if not Gaussian mode
+                vertices_for_display = vertices_data
+                colors_for_display = colors_data
+            # --- End Sorting ---
 
             # Delete existing list if it exists
             if self.vertex_list:
@@ -1581,13 +1621,13 @@ class LiveViewerWindow(pyglet.window.Window):
                 except Exception: pass # Ignore error if already deleted
                 self.vertex_list = None
 
-            # Create new vertex list
+            # Create new vertex list with potentially sorted data
             try:
                 self.vertex_list = self.shader_program.vertex_list(
                     num_vertices,
                     gl.GL_POINTS,
-                    vertices=('f', vertices_for_display), # Data should already be Y-flipped for display
-                    colors=('f', colors_data)
+                    vertices=('f', vertices_for_display),
+                    colors=('f', colors_for_display)
                 )
                 self.frame_count_display += 1 # Increment display counter on successful update
             except Exception as e_create:
@@ -1596,14 +1636,12 @@ class LiveViewerWindow(pyglet.window.Window):
                  self.vertex_list = None # Ensure list is None on error
                  self.current_point_count = 0
         else:
-            # If no valid vertices, clear the list to avoid drawing stale points
+            # If no valid vertices, clear the list
             if self.vertex_list:
                 try: self.vertex_list.delete()
                 except Exception: pass
                 self.vertex_list = None
             self.current_point_count = 0
-            # Still increment frame count even if no points? Maybe not.
-            # self.frame_count_display += 1
 
     def update(self, dt):
         """Scheduled function to process data from the inference thread."""
@@ -1627,8 +1665,11 @@ class LiveViewerWindow(pyglet.window.Window):
                     # Update debug textures based on the processed data
                     self._update_debug_textures()
 
-                    # Update the main vertex list
-                    self._update_vertex_list(vertices_data, colors_data, num_vertices)
+                    # Get current view matrix for sorting
+                    _, current_view = self.get_camera_matrices()
+
+                    # Update the main vertex list (pass view matrix)
+                    self._update_vertex_list(vertices_data, colors_data, num_vertices, current_view)
 
         except queue.Empty:
             pass # No more data in the queue
