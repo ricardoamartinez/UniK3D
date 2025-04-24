@@ -40,6 +40,7 @@ DEFAULT_SETTINGS = {
     "enable_sharpening": False,
     "point_size_boost": 2.5,
     "input_scale_factor": 0.9,
+    "size_scale_factor": 0.001, # Scale factor for z^2 point sizing
     "enable_point_smoothing": True,
     "min_alpha_points": 0.0,
     "max_alpha_points": 1.0,
@@ -66,6 +67,9 @@ DEFAULT_SETTINGS = {
     "show_latency_overlay": False,
     "live_processing_mode": "Real-time", # "Real-time" or "Buffered"
     "input_camera_fov": 60.0,  # FOV of the input camera in degrees
+    "min_point_size": 1.0,        # Min pixel size
+    "enable_max_size_clamp": False, # Enable max size clamp?
+    "max_point_size": 50.0,       # Max pixel size (if clamped)
 }
 
 # --- GLB Saving Helper ---
@@ -145,6 +149,10 @@ vertex_source = """#version 150 core
     uniform float pointSizeBoost;   // Controlled via ImGui
     uniform vec2 viewportSize;      // Width, height of viewport in pixels
     uniform float inputFocal;       // Focal length of input camera in pixel units
+    uniform float sizeScaleFactor;  // Tunable scale factor for z^2 sizing
+    uniform float minPointSize;     // Minimum point size in pixels
+    uniform float maxPointSize;     // Maximum point size in pixels (if clamp enabled)
+    uniform bool enableMaxSizeClamp;// Toggle for max size clamp
 
     void main() {
         // Transform to view and clip space
@@ -157,14 +165,16 @@ vertex_source = """#version 150 core
         float worldRadius = max(0.0001, inputScaleFactor);
         // Depth relative to input camera = -vertices.z
         float depth = max(-vertices.z, 0.0001);
-        // Pixel radius proportional to depth squared (z^2) for flipped inverse-square feel
+        // Pixel radius proportional to depth squared (z^2)
         float radius_z_squared = inputFocal * worldRadius * (depth * depth);
-        // Add a scaling factor because z^2 grows quickly (tune this value)
-        float scale_factor = 0.001;
-        float diameter = 2.0 * radius_z_squared * scale_factor * pointSizeBoost;
+        float diameter = 2.0 * radius_z_squared * sizeScaleFactor * pointSizeBoost;
 
-        // Enforce minimum size
-        gl_PointSize = max(diameter, 1.0);
+        // Apply minimum and optional maximum size clamp
+        float finalSize = max(diameter, minPointSize);
+        if (enableMaxSizeClamp) {
+            finalSize = min(finalSize, maxPointSize);
+        }
+        gl_PointSize = finalSize;
         // --- End Point Size Calculation ---
     }
 """
@@ -1144,6 +1154,7 @@ class LiveViewerWindow(pyglet.window.Window):
         self.enable_sharpening = None
         self.point_size_boost = None
         self.input_scale_factor = None
+        self.size_scale_factor = None # Added
         self.enable_point_smoothing = None
         self.min_alpha_points = None
         self.max_alpha_points = None
@@ -1732,13 +1743,14 @@ class LiveViewerWindow(pyglet.window.Window):
         if self.keys[key.Q]: self.camera_position -= up * move_amount
 
     def get_camera_matrices(self):
-        rot_y = -math.radians(self.camera_rotation_y)
-        rot_x = -math.radians(self.camera_rotation_x)
-        forward = Vec3(math.sin(rot_y) * math.cos(rot_x), -math.sin(rot_x), -math.cos(rot_y) * math.cos(rot_x)).normalize()
-        target = self.camera_position + forward
-        view = Mat4.look_at(self.camera_position, target, self.world_up_vector)
-        projection = Mat4.perspective_projection(self._aspect_ratio, z_near=0.1, z_far=1000.0, fov=60.0) # Use renamed variable
-        return projection, view
+         rot_y = -math.radians(self.camera_rotation_y)
+         rot_x = -math.radians(self.camera_rotation_x)
+         forward = Vec3(math.sin(rot_y) * math.cos(rot_x), -math.sin(rot_x), -math.cos(rot_y) * math.cos(rot_x)).normalize()
+         target = self.camera_position + forward
+         view = Mat4.look_at(self.camera_position, target, self.world_up_vector)
+         # Adjust near/far planes to minimize clipping
+         projection = Mat4.perspective_projection(self._aspect_ratio, z_near=0.001, z_far=10000.0, fov=60.0)
+         return projection, view
 
     def reset_settings(self):
         """Resets settings to default values."""
@@ -2093,20 +2105,28 @@ class LiveViewerWindow(pyglet.window.Window):
 
                 if self.render_mode == 2: # Gaussian Params
                     imgui.indent()
-                    changed_falloff, self.falloff_factor = imgui.slider_float("Falloff", self.falloff_factor, 0.1, 20.0)
+                    changed_falloff, self.falloff_factor = imgui.slider_float("Gaussian Falloff", self.falloff_factor, 0.1, 50.0)
                     if imgui.button("Reset##Falloff"): self.falloff_factor = DEFAULT_SETTINGS["falloff_factor"]
                     imgui.unindent()
 
                 imgui.separator()
-                imgui.text("Point Size & Scale")
-                changed_boost, self.point_size_boost = imgui.slider_float("Size Boost", self.point_size_boost, 0.1, 10.0)
+                imgui.text("Point Sizing (Input Camera Relative)")
+
+                changed_boost, self.point_size_boost = imgui.slider_float("Base Size Boost", self.point_size_boost, 0.1, 50.0)
                 if imgui.button("Reset##PointSize"): self.point_size_boost = DEFAULT_SETTINGS["point_size_boost"]
 
-                changed_scale, self.input_scale_factor = imgui.slider_float("Input Scale", self.input_scale_factor, 0.1, 1.0)
+                changed_scale, self.input_scale_factor = imgui.slider_float("World Radius Scale", self.input_scale_factor, 0.01, 5.0, "%.2f")
                 if changed_scale: self.scale_factor_ref[0] = self.input_scale_factor # Update shared ref for thread
                 if imgui.button("Reset##InputScale"):
                     self.input_scale_factor = DEFAULT_SETTINGS["input_scale_factor"]
                     self.scale_factor_ref[0] = self.input_scale_factor
+
+                # Changed to SliderFloat with larger range
+                size_scale_changed, self.size_scale_factor = imgui.slider_float(
+                    "Size Scale (z^2)", self.size_scale_factor, 0.0, 1.0, "%.4f"
+                )
+                if imgui.button("Reset##SizeScale"):
+                    self.size_scale_factor = DEFAULT_SETTINGS["size_scale_factor"]
 
                 imgui.separator()
                 imgui.text("Color Adjustments")
@@ -2243,6 +2263,14 @@ class LiveViewerWindow(pyglet.window.Window):
             fov_rad = math.radians(self.input_camera_fov)
             input_focal = (input_h * 0.5) / math.tan(fov_rad * 0.5)
             self.shader_program['inputFocal'] = input_focal
+
+            # Pass the tunable size scale factor
+            self.shader_program['sizeScaleFactor'] = self.size_scale_factor
+
+            # Pass new min/max size clamp uniforms
+            self.shader_program['minPointSize'] = self.min_point_size
+            self.shader_program['enableMaxSizeClamp'] = self.enable_max_size_clamp
+            self.shader_program['maxPointSize'] = self.max_point_size
 
             # Set GL state based on render mode
             if self.render_mode == 0: # Square (Opaque)
