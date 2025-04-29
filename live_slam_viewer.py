@@ -70,6 +70,13 @@ DEFAULT_SETTINGS = {
     "min_point_size": 1.0,        # Min pixel size
     "enable_max_size_clamp": False, # Enable max size clamp?
     "max_point_size": 50.0,       # Max pixel size (if clamped)
+    # --- Point Thickening --- 
+    "enable_point_thickening": False,
+    "thickening_duplicates": 4,     # Num duplicates per point (total points = original * (1 + duplicates))
+    "thickening_variance": 0.01,   # StdDev of random perturbation
+    "thickening_depth_bias": 0.5,   # Strength of backward push along ray (0=none)
+    "depth_exponent": 2.0,        # Exponent for depth-based sizing (2.0=z^2, 1.0=z, -2.0=1/z^2)
+    "screen_capture_monitor_index": 0, # 0 for entire desktop, 1+ for specific monitors
 }
 
 # --- GLB Saving Helper ---
@@ -135,6 +142,22 @@ def load_glb(filepath):
         print(f"Error loading GLB file {filepath}: {e}")
         return None, None
 
+# Helper function to convert hex color codes to ImGui Vec4
+def hex_to_imvec4(hex_color, alpha=1.0):
+    """Converts a hex color string (e.g., "#RRGGBB") to an imgui.Vec4."""
+    hex_color = hex_color.lstrip('#')
+    lv = len(hex_color)
+    # Handle RGB or RGBA hex strings
+    if lv == 6: # RGB
+        rgb = tuple(int(hex_color[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+        return imgui.Vec4(rgb[0], rgb[1], rgb[2], alpha)
+    elif lv == 8: # RGBA
+        rgba = tuple(int(hex_color[i:i + 2], 16) / 255.0 for i in (0, 2, 4, 6))
+        return imgui.Vec4(rgba[0], rgba[1], rgba[2], rgba[3])
+    else: # Invalid format, return default (e.g., gray)
+        print(f"Warning: Invalid hex color format '{hex_color}'. Using gray.")
+        return imgui.Vec4(0.5, 0.5, 0.5, 1.0)
+
 
 # Simple shaders (Using 'vertices' instead of 'position')
 vertex_source = """#version 150 core
@@ -153,6 +176,7 @@ vertex_source = """#version 150 core
     uniform float minPointSize;     // Minimum point size in pixels
     uniform float maxPointSize;     // Maximum point size in pixels (if clamp enabled)
     uniform bool enableMaxSizeClamp;// Toggle for max size clamp
+    uniform float depthExponent;    // Exponent applied to depth for sizing
 
     void main() {
         // Transform to view and clip space
@@ -165,9 +189,9 @@ vertex_source = """#version 150 core
         float worldRadius = max(0.0001, inputScaleFactor);
         // Depth relative to input camera = -vertices.z
         float depth = max(-vertices.z, 0.0001);
-        // Pixel radius proportional to depth squared (z^2)
-        float radius_z_squared = inputFocal * worldRadius * (depth * depth);
-        float diameter = 2.0 * radius_z_squared * sizeScaleFactor * pointSizeBoost;
+        // Pixel radius proportional to depth^exponent
+        float radius_scaled = inputFocal * worldRadius * pow(depth, depthExponent);
+        float diameter = 2.0 * radius_scaled * sizeScaleFactor * pointSizeBoost;
 
         // Apply minimum and optional maximum size clamp
         float finalSize = max(diameter, minPointSize);
@@ -557,7 +581,7 @@ def _run_model_inference(model, frame, device):
         return None
 
 
-def _process_inference_results(predictions, rgb_frame_processed, device, edge_params_ref, prev_depth_map, smoothed_mean_depth, smoothed_points_xyz, frame_h, frame_w):
+def _process_inference_results(predictions, rgb_frame_processed, device, edge_params_ref, prev_depth_map, smoothed_mean_depth, smoothed_points_xyz, frame_h, frame_w, input_mode):
     """Processes model predictions to generate point clouds, colors, and debug maps."""
     points_xyz_np_processed = None
     colors_np_processed = None
@@ -594,7 +618,7 @@ def _process_inference_results(predictions, rgb_frame_processed, device, edge_pa
         print("Warning: No valid points generated.")
         return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
 
-    # --- Edge Detection & Depth Processing (if depth map available) ---
+    # --- Edge Detection & Depth Processing (Run for all modes now) ---
     combined_edge_map = None
     depth_gradient_map = None
     per_pixel_depth_motion_map = None
@@ -697,85 +721,135 @@ def _process_inference_results(predictions, rgb_frame_processed, device, edge_pa
         if points_xyz.ndim == 3: final_alpha_map = torch.ones_like(points_xyz[:,:,0])
         elif points_xyz.ndim == 2: final_alpha_map = torch.ones(points_xyz.shape[0], device=device)
 
+    # --- Point Thickening (Operates on smoothed points, BEFORE coord flip) ---
+    points_to_thicken = new_smoothed_points_xyz # Use smoothed points as base
+    enable_thickening = edge_params_ref.get("enable_point_thickening", False)
+    num_duplicates = edge_params_ref.get("thickening_duplicates", 0)
+    variance = edge_params_ref.get("thickening_variance", 0.0)
+    depth_bias = edge_params_ref.get("thickening_depth_bias", 0.0)
 
-    # --- Create Smoothing Map Visualization ---
-    if final_alpha_map is not None:
+    if enable_thickening and num_duplicates > 0 and points_to_thicken.numel() > 0:
         try:
-            smoothing_map_vis_np = (final_alpha_map.cpu().numpy() * 255).astype(np.uint8)
-            if smoothing_map_vis_np.ndim == 2: # Ensure it's 3 channels for texture
-                 smoothing_map_viz = cv2.cvtColor(smoothing_map_vis_np, cv2.COLOR_GRAY2RGB)
-            elif smoothing_map_vis_np.ndim == 1: # Handle potential 1D case (unlikely)
-                 smoothing_map_viz = np.zeros((frame_h, frame_w, 3), dtype=np.uint8) # Placeholder
-            else: smoothing_map_viz = smoothing_map_vis_np # Assume already RGB
-        except Exception as e_smooth_viz:
-            print(f"Error creating smoothing map viz: {e_smooth_viz}")
-            smoothing_map_viz = None
-    else: smoothing_map_viz = None
+            # Ensure points_to_thicken is on CPU and NumPy for processing
+            if points_to_thicken.is_cuda:
+                points_np = points_to_thicken.squeeze().cpu().numpy()
+            else:
+                points_np = points_to_thicken.squeeze().numpy()
 
+            # Handle potential different shapes from model output
+            if points_np.ndim == 3: # H, W, C
+                 N = points_np.shape[0] * points_np.shape[1]
+                 points_np = points_np.reshape(N, 3)
+            elif points_np.ndim == 2 and points_np.shape[1] == 3: # N, C
+                 N = points_np.shape[0]
+            else:
+                 raise ValueError(f"Unexpected points shape for thickening: {points_np.shape}")
 
-    # --- Prepare Output Point Cloud ---
-    points_xyz_to_process = new_smoothed_points_xyz
-    if points_xyz_to_process is None or points_xyz_to_process.numel() == 0:
-        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+            # Get original colors (needs similar reshape logic)
+            # Assuming rgb_frame_processed matches dimensions if points were HxWxC
+            if rgb_frame_processed is not None and rgb_frame_processed.ndim == 3:
+                colors_np = (rgb_frame_processed.reshape(N, 3).astype(np.float32) / 255.0)
+            else: # Fallback: Use white if no color frame or mismatch
+                colors_np = np.ones((N, 3), dtype=np.float32)
 
-    points_xyz_np_processed = points_xyz_to_process.squeeze().cpu().numpy()
+            # Calculate ray directions (vector from origin to point)
+            norms = np.linalg.norm(points_np, axis=1, keepdims=True)
+            norms[norms < 1e-6] = 1e-6 # Avoid division by zero
+            ray_directions = points_np / norms
+
+            # Generate duplicates
+            num_new_points = N * num_duplicates
+            duplicate_points = np.zeros((num_new_points, 3), dtype=np.float32)
+            duplicate_colors = np.zeros((num_new_points, 3), dtype=np.float32)
+
+            # Random offsets (Gaussian noise)
+            random_offsets = np.random.normal(0.0, variance, size=(num_new_points, 3)).astype(np.float32)
+
+            # Biased offsets along ray direction (positive Z is 'forward'/'away' here)
+            # Use positive ray direction for backward push in this coord system
+            bias_magnitudes = np.random.uniform(0.0, depth_bias, size=(num_new_points, 1)).astype(np.float32)
+            # Repeat ray directions for each duplicate
+            repeated_ray_dirs = np.repeat(ray_directions, num_duplicates, axis=0)
+            biased_offsets = repeated_ray_dirs * bias_magnitudes
+
+            # Calculate final duplicate positions
+            repeated_original_points = np.repeat(points_np, num_duplicates, axis=0)
+            duplicate_points = repeated_original_points + random_offsets + biased_offsets
+
+            # Assign colors to duplicates
+            duplicate_colors = np.repeat(colors_np, num_duplicates, axis=0)
+
+            # Combine original and duplicates
+            points_xyz_np_thickened = np.vstack((points_np, duplicate_points))
+            colors_np_thickened = np.vstack((colors_np, duplicate_colors))
+
+        except Exception as e_thicken:
+            print(f"Error during point thickening: {e_thicken}")
+            traceback.print_exc()
+            # Fallback to original smoothed points if thickening fails
+            if new_smoothed_points_xyz.is_cuda:
+                 points_xyz_np_thickened = new_smoothed_points_xyz.squeeze().cpu().numpy()
+            else:
+                 points_xyz_np_thickened = new_smoothed_points_xyz.squeeze().numpy()
+            # Recalculate colors_np_thickened based on potentially reshaped points_xyz_np_thickened
+            N_fallback = points_xyz_np_thickened.shape[0]
+            if rgb_frame_processed is not None and rgb_frame_processed.ndim == 3 and rgb_frame_processed.size == N_fallback*3:
+                 colors_np_thickened = (rgb_frame_processed.reshape(N_fallback, 3).astype(np.float32) / 255.0)
+            else: colors_np_thickened = np.ones((N_fallback, 3), dtype=np.float32)
+
+    else:
+        # Thickening disabled or no duplicates requested, use smoothed points
+        if new_smoothed_points_xyz.is_cuda:
+             points_xyz_np_thickened = new_smoothed_points_xyz.squeeze().cpu().numpy()
+        else:
+             points_xyz_np_thickened = new_smoothed_points_xyz.squeeze().numpy()
+        # Reshape/get colors for non-thickened points
+        if points_xyz_np_thickened.ndim == 3: # H, W, C
+            N_orig = points_xyz_np_thickened.shape[0] * points_xyz_np_thickened.shape[1]
+            points_xyz_np_thickened = points_xyz_np_thickened.reshape(N_orig, 3)
+        elif points_xyz_np_thickened.ndim == 2: # N, C
+            N_orig = points_xyz_np_thickened.shape[0]
+        else: N_orig = 0
+
+        if N_orig > 0 and rgb_frame_processed is not None and rgb_frame_processed.ndim == 3 and rgb_frame_processed.size == N_orig * 3:
+            colors_np_thickened = (rgb_frame_processed.reshape(N_orig, 3).astype(np.float32) / 255.0)
+        else: colors_np_thickened = np.ones((N_orig, 3), dtype=np.float32)
+
+    # Ensure points are reshaped correctly before transform if they came directly from smoothing
+    if points_xyz_np_thickened.ndim == 3: # H, W, C format?
+        num_vertices_final = points_xyz_np_thickened.shape[0] * points_xyz_np_thickened.shape[1]
+        points_xyz_np_processed = points_xyz_np_thickened.reshape(num_vertices_final, 3)
+    elif points_xyz_np_thickened.ndim == 2: # N, C format
+        num_vertices_final = points_xyz_np_thickened.shape[0]
+        points_xyz_np_processed = points_xyz_np_thickened # Already correct shape
+    else:
+        print(f"Warning: Unexpected points shape after thickening/smoothing: {points_xyz_np_thickened.shape}")
+        num_vertices_final = 0
+        points_xyz_np_processed = np.array([], dtype=np.float32).reshape(0,3)
+        colors_np_processed = np.array([], dtype=np.float32).reshape(0,3)
+
+    # Assign processed colors (already calculated in thickening or fallback)
+    colors_np_processed = colors_np_thickened if num_vertices_final > 0 else np.array([], dtype=np.float32).reshape(0,3)
+    num_vertices = num_vertices_final # Update final vertex count
 
     # --- Transform Coordinates for OpenGL/GLB standard (+X Right, +Y Up, -Z Forward) ---
+    # Apply this AFTER thickening/smoothing
     if points_xyz_np_processed.ndim >= 2 and points_xyz_np_processed.shape[-1] == 3:
         points_xyz_np_processed[..., 1] *= -1.0 # Flip Y (Down -> Up)
         points_xyz_np_processed[..., 2] *= -1.0 # Flip Z (Forward -> -Forward)
     # ------------------------------------
 
-    # Reshape and get vertex count
-    try:
-        if points_xyz_np_processed.ndim == 3 and points_xyz_np_processed.shape[0] == 3: # C, H, W format?
-            points_xyz_np_processed = np.transpose(points_xyz_np_processed, (1, 2, 0)) # H, W, C
-            num_vertices = points_xyz_np_processed.shape[0] * points_xyz_np_processed.shape[1]
-            points_xyz_np_processed = points_xyz_np_processed.reshape(num_vertices, 3)
-        elif points_xyz_np_processed.ndim == 2 and points_xyz_np_processed.shape[1] == 3: # N, C format
-             num_vertices = points_xyz_np_processed.shape[0]
-        elif points_xyz_np_processed.ndim == 3 and points_xyz_np_processed.shape[2] == 3: # H, W, C format
-             num_vertices = points_xyz_np_processed.shape[0] * points_xyz_np_processed.shape[1]
-             points_xyz_np_processed = points_xyz_np_processed.reshape(num_vertices, 3)
-        else:
-            print(f"Warning: Unexpected points_xyz_np shape after processing: {points_xyz_np_processed.shape}")
-            num_vertices = 0
-    except Exception as e_reshape:
-            print(f"Error reshaping points_xyz_np: {e_reshape}")
-            num_vertices = 0
+    # Reshape and get vertex count (This block seems redundant now)
+    # ... (Remove the reshape block here as points_xyz_np_processed is now guaranteed N x 3) ...
 
-    # --- Sample Colors ---
-    if num_vertices > 0 and rgb_frame_processed is not None:
-        try:
-            if rgb_frame_processed.shape[0] == frame_h and rgb_frame_processed.shape[1] == frame_w:
-                colors_np_processed = rgb_frame_processed.reshape(frame_h * frame_w, 3)
-                # Ensure colors match potentially reshaped points (this assumes points correspond to pixels)
-                if colors_np_processed.shape[0] == num_vertices:
-                    if colors_np_processed.dtype == np.uint8:
-                        colors_np_processed = colors_np_processed.astype(np.float32) / 255.0
-                    elif colors_np_processed.dtype == np.float32:
-                        colors_np_processed = np.clip(colors_np_processed, 0.0, 1.0)
-                    else:
-                        print(f"Warning: Unexpected color dtype {colors_np_processed.dtype}, using white.")
-                        colors_np_processed = None
-                else:
-                     print(f"Warning: Point count ({num_vertices}) mismatch with color pixels ({colors_np_processed.shape[0]}). No colors.")
-                     colors_np_processed = None # Mismatch after reshape
-            else:
-                 print(f"Warning: Dimension mismatch between points ({frame_h}x{frame_w}) and processed frame ({rgb_frame_processed.shape[:2]})")
-                 colors_np_processed = None
-        except Exception as e_color:
-            print(f"Error processing colors: {e_color}")
-            colors_np_processed = None
-    else:
-        colors_np_processed = None # No vertices or no frame
+    # --- Sample Colors --- (This block seems redundant now)
+    # ... (Remove color sampling block here as colors_np_processed is now set)
 
-    # Use white if colors failed
-    if colors_np_processed is None and num_vertices > 0:
-        colors_np_processed = np.ones((num_vertices, 3), dtype=np.float32)
+    # Use white if colors failed (Should be handled by fallback logic now)
+    # ... (Remove this fallback) ...
 
-
-    return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+    # Return processed points, colors, counts, and debug maps
+    return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz # Note: returning original smoothed points for next frame's smoothing
 
 
 def _handle_recording(points_xyz_np, colors_np, recording_state_ref, sequence_frame_index, recorded_frame_counter, is_video, is_glb_sequence, data_queue):
@@ -823,13 +897,17 @@ def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices, rgb_fra
 # --- Main Inference Thread Function ---
 # --- Inference Thread Function ---
 # --- Main Inference Thread Function (Refactored) ---
-def inference_thread_func(data_queue, exit_event, model_name, inference_interval,
+def inference_thread_func(data_queue, exit_event,
+                          model, device, # Accept model and device as arguments
+                          inference_interval,
                           scale_factor_ref, edge_params_ref,
                           input_mode, input_filepath, playback_state,
-                          recording_state, live_processing_mode): # Corrected params
-    """Loads model, captures/loads data, runs inference, processes, and queues results."""
-    print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}")
-    data_queue.put(("status", f"Inference thread started ({input_mode})..."))
+                          recording_state, live_processing_mode,
+                          screen_capture_monitor_index):
+    """Captures/loads data, runs inference, processes, and queues results."""
+    # Model loading is now done in the main thread
+    print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}, Monitor Idx: {screen_capture_monitor_index if input_mode=='Screen' else 'N/A'}")
+    data_queue.put(("status", f"Inference thread started ({input_mode}) using pre-loaded model."))
 
     cap = None
     image_frame = None
@@ -841,29 +919,25 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
     video_total_frames = 0
     video_fps = 30
     error_message = None
-    model = None
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # model = None # Removed
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Removed
 
     try:
-        # --- Load Model (if needed) ---
-        if input_mode != "GLB Sequence":
-            print(f"Loading UniK3D model: {model_name}...")
-            data_queue.put(("status", f"Loading model: {model_name}..."))
-            print(f"Using device: {device}")
-            model = UniK3D.from_pretrained(f"lpiccinelli/{model_name}")
-            model = model.to(device)
-            model.eval()
-            print("Model loaded.")
-            data_queue.put(("status", "Model loaded."))
-        else:
-            print("GLB Sequence mode: Skipping model load.")
-            data_queue.put(("status", "GLB Sequence mode: Skipping model load."))
-
+        # --- Skip Model Loading (already loaded) ---
+        if input_mode == "GLB Sequence":
+            print("GLB Sequence mode: Skipping inference.")
+            # data_queue.put(("status", "GLB Sequence mode: Skipping inference.")) # Status already sent
 
         # --- Initialize Input Source ---
         cap, image_frame, is_video, is_image, is_glb_sequence, glb_files, \
-        frame_source_name, video_total_frames, video_fps, input_mode, error_message = \
-            _initialize_input_source(input_mode, input_filepath, data_queue, playback_state) # Use renamed variable
+        frame_source_name, video_total_frames, video_fps, input_mode_returned, error_message = \
+            _initialize_input_source(input_mode, input_filepath, data_queue, playback_state)
+
+        # If initialization changed the mode (e.g., File->GLB Sequence), update local var
+        if input_mode_returned != input_mode:
+            print(f"Input mode auto-detected as: {input_mode_returned}")
+            input_mode = input_mode_returned
+
 
         # Start timestamp for virtual live playback (File/GLB)
         media_start_time = time.time()
@@ -925,21 +999,74 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                            is_video, is_image, is_glb_sequence, image_frame,
                                            frame_count, data_queue, frame_source_name)
             elif input_mode == "Screen" and is_video:
-                # Capture screen as virtual camera
+                # Capture screen as virtual camera using the selected monitor index
                 try:
                     with mss.mss() as sct:
-                        sct_img = sct.grab(sct.monitors[1])
-                    frame = np.array(sct_img)[:, :, :3]
-                    ret = True
-                    current_time = time.time()
-                    frame_read_delta_t = current_time - last_frame_read_time_ref[0]
-                    last_frame_read_time_ref[0] = current_time
-                    sequence_frame_index = frame_count + 1
-                    playback_state["current_frame"] = sequence_frame_index
+                        # Ensure monitor index is valid before using it
+                        monitor_to_capture = sct.monitors[screen_capture_monitor_index] if screen_capture_monitor_index < len(sct.monitors) else sct.monitors[0] # Fallback to monitor 0
+                        sct_img = sct.grab(monitor_to_capture)
+                    
+                    # Ensure frame is BGR (convert from BGRA if needed)
+                    img_arr = np.array(sct_img)
+                    if img_arr.shape[2] == 4:
+                        frame = img_arr[:, :, :3] # Take only BGR channels
+                    elif img_arr.shape[2] == 3:
+                        frame = img_arr # Assume it's already BGR
+                    else:
+                        print(f"ERROR: Screen capture has unexpected shape {img_arr.shape}")
+                        ret = False
+                        frame = None
+
+                    if frame is not None:
+                        ret = True
+                        current_time = time.time()
+                        frame_read_delta_t = current_time - last_frame_read_time_ref[0]
+                        last_frame_read_time_ref[0] = current_time
+                        sequence_frame_index = frame_count + 1
+                        playback_state["current_frame"] = sequence_frame_index
                 except Exception as e_screen:
-                    print(f"Error capturing screen: {e_screen}")
-                    time.sleep(0.005)
-                    continue
+                    print(f"Error capturing screen (Monitor {screen_capture_monitor_index}): {e_screen}")
+                    # Attempt fallback to primary monitor (index 1 if exists, else 0) on error?
+                    try:
+                        # Fallback logic needs sct instance! Re-initialize mss here.
+                        print(f"Attempting fallback capture...")
+                        with mss.mss() as sct_fallback: # Re-initialize mss
+                            fallback_index = 1 if len(sct_fallback.monitors) > 1 else 0
+                            print(f"Attempting fallback capture on monitor {fallback_index}...")
+                            # Ensure fallback index is valid too
+                            fallback_monitor = sct_fallback.monitors[fallback_index] if fallback_index < len(sct_fallback.monitors) else sct_fallback.monitors[0]
+                            sct_img = sct_fallback.grab(fallback_monitor) # Use fallback_monitor
+                        
+                        # Ensure frame is BGR (convert from BGRA if needed)
+                        img_arr = np.array(sct_img)
+                        if img_arr.shape[2] == 4:
+                            frame = img_arr[:, :, :3] # Take only BGR channels
+                        elif img_arr.shape[2] == 3:
+                            frame = img_arr # Assume it's already BGR
+                        else:
+                            print(f"ERROR: Fallback screen capture has unexpected shape {img_arr.shape}")
+                            ret = False
+                            frame = None
+
+                        if frame is not None:
+                            # Fix indentation here
+                            ret = True
+                            current_time = time.time()
+                            frame_read_delta_t = current_time - last_frame_read_time_ref[0]
+                            last_frame_read_time_ref[0] = current_time
+                            sequence_frame_index = frame_count + 1
+                            playback_state["current_frame"] = sequence_frame_index
+                            print(f"Fallback capture successful.")
+                    except Exception as e_fallback:
+                            print(f"Fallback screen capture failed: {e_fallback}")
+                            ret = False # Indicate failure if fallback also fails
+                            time.sleep(0.1) # Sleep longer on persistent error
+                            frame = None # Ensure frame is None on complete failure
+                            # No 'continue' here if fallback succeeded
+                            if not ret: # If fallback also failed
+                                time.sleep(0.05)
+                                continue # Skip processing this cycle
+
             elif input_mode in ["File", "GLB Sequence"] and not is_image:
                 # Virtual live mode: drop frames based on real-time timing
                 # Handle restart flag by resetting the media start time
@@ -1044,15 +1171,26 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     # Create dummy frame for debug view consistency
                     frame_h, frame_w = (100, 100) if num_vertices == 0 else (int(np.sqrt(num_vertices)), int(np.sqrt(num_vertices))) # Guess dims
                     rgb_frame_orig = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
-                else:
-                    continue # Skip if GLB load failed
-                # Mark depth processed time for GLB
-                current_time = time.time()
-                depth_process_delta_t = current_time - last_depth_processed_time
-                last_depth_processed_time = current_time
 
-            else: # Live, Video File, or Image File
-                # --- Preprocess Frame (Scale, Sharpen) ---
+                    # Mark depth processed time for GLB
+                    current_time = time.time()
+                    depth_process_delta_t = current_time - last_depth_processed_time
+                    last_depth_processed_time = current_time
+                else: # GLB load failed for this frame index
+                    print(f"Warning: Failed to load GLB frame at index {sequence_frame_index-1 if sequence_frame_index > 0 else 0}. Skipping.")
+                    # Don't 'continue' here, let it try the next frame index in the next loop iteration
+                    # Reset processing results for this failed frame
+                    points_xyz_np_processed = None
+                    colors_np_processed = None
+                    num_vertices = 0
+                    # Still need to update depth processing time to avoid large spikes in FPS calc
+                    current_time = time.time()
+                    depth_process_delta_t = current_time - last_depth_processed_time
+                    last_depth_processed_time = current_time
+
+
+            else: # Live, Video File, Image File, Screen Share (Needs Inference)
+                # --- Preprocess Frame ---
                 if current_scale > 0.1:
                     new_width = int(frame.shape[1] * current_scale)
                     new_height = int(frame.shape[0] * current_scale)
@@ -1066,8 +1204,8 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                 frame_h, frame_w, _ = rgb_frame_processed.shape
 
                 # --- Run Inference ---
-                data_queue.put(("status", f"Running inference on frame {frame_count}..."))
-                predictions = _run_model_inference(model, rgb_frame_processed, device) # Use processed frame for inference
+                # data_queue.put(("status", f"Running inference on frame {frame_count}...")) # DEBUG Verbose
+                predictions = _run_model_inference(model, rgb_frame_processed, device) # Use pre-loaded model
 
                 # --- Process Results ---
                 data_queue.put(("status", f"Processing results for frame {frame_count}..."))
@@ -1077,7 +1215,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                     _process_inference_results(predictions, rgb_frame_processed, device,
                                                edge_params_ref, prev_depth_map,
                                                smoothed_mean_depth, smoothed_points_xyz,
-                                               frame_h, frame_w)
+                                               frame_h, frame_w, input_mode)
                 # Mark depth processed time for inference
                 current_time = time.time()
                 depth_process_delta_t = current_time - last_depth_processed_time
@@ -1091,9 +1229,9 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                                        data_queue)
 
             # --- Calculate Latency & Queue Results ---
-            latency_ms = (time.time() - t_capture) * 1000.0
-            vertices_flat = points_xyz_np_processed.flatten() if points_xyz_np_processed is not None else None
-            colors_flat = colors_np_processed.flatten() if colors_np_processed is not None else None
+            latency_ms = (time.time() - t_capture) * 1000.0 if t_capture else 0.0 # Handle potential None t_capture?
+            vertices_flat = points_xyz_np_processed.flatten() if points_xyz_np_processed is not None and points_xyz_np_processed.size > 0 else None
+            colors_flat = colors_np_processed.flatten() if colors_np_processed is not None and colors_np_processed.size > 0 else None
 
             # --- Queue Results (with Real-time handling) ---
             if input_mode == "Live" and live_processing_mode == "Real-time" and data_queue.full():
@@ -1126,14 +1264,36 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
 # --- Viewer Class ---
 class LiveViewerWindow(pyglet.window.Window):
     def __init__(self, model_name, inference_interval=1,
-                 disable_point_smoothing=False, # This arg is now effectively ignored
+                 disable_point_smoothing=False,
                  *args, **kwargs):
         # Store args before calling super
         self._model_name = model_name
         self._inference_interval = inference_interval
-        # self._initial_disable_point_smoothing = disable_point_smoothing # No longer needed
+
+        print("DEBUG: LiveViewerWindow.__init__ - Start") # Added print
 
         super().__init__(*args, **kwargs)
+
+        print("DEBUG: LiveViewerWindow.__init__ - After super().__init__") # Added print
+
+        # --- Model Loading (moved to main thread __init__) ---
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            print(f"Loading UniK3D model: {self._model_name} on device: {self.device}...")
+            self.model = UniK3D.from_pretrained(f"lpiccinelli/{self._model_name}")
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            print("Model loaded successfully.")
+        except Exception as e_load:
+            print(f"FATAL: Error loading model {self._model_name}: {e_load}")
+            traceback.print_exc()
+            # Exit if model loading fails, as it's essential for most modes
+            pyglet.app.exit()
+            return
+        # --- End Model Loading ---
+
+        print("DEBUG: LiveViewerWindow.__init__ - After Model Load") # Added print
 
         self.vertex_list = None
         self.frame_count_display = 0
@@ -1204,9 +1364,18 @@ class LiveViewerWindow(pyglet.window.Window):
         self.edge_texture = None
         self.smoothing_texture = None
         self.debug_textures_initialized = False
+        # Store texture dimensions
+        self.camera_texture_width = 0
+        self.camera_texture_height = 0
+        self.depth_texture_width = 0
+        self.depth_texture_height = 0
+        self.edge_texture_width = 0
+        self.edge_texture_height = 0
+        self.smoothing_texture_width = 0
+        self.smoothing_texture_height = 0
 
         # Load initial settings (this initializes control variables and refs)
-        self.load_settings()
+        self.load_settings() # This will now load/default screen_capture_monitor_index
 
         # --- Status Display ---
         # self.ui_batch = pyglet.graphics.Batch() # Batch removed, using ImGui now
@@ -1346,6 +1515,11 @@ class LiveViewerWindow(pyglet.window.Window):
         # --- Debug Texture Setup ---
         self.create_debug_textures()
 
+        # Add state for screen share pop-up and selection
+        self.show_screen_share_popup = False
+        self.temp_monitor_index = 0 # Temporary storage for selection in popup
+
+        print("DEBUG: LiveViewerWindow.__init__ - End") # Added print
 
     def create_debug_textures(self):
         """Creates or re-creates textures for debug views."""
@@ -1373,6 +1547,8 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+        self.camera_texture_width = width
+        self.camera_texture_height = height
 
         self.depth_texture = gl.GLuint()
         gl.glGenTextures(1, self.depth_texture)
@@ -1380,6 +1556,8 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+        self.depth_texture_width = width
+        self.depth_texture_height = height
 
         self.edge_texture = gl.GLuint()
         gl.glGenTextures(1, self.edge_texture)
@@ -1387,6 +1565,8 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+        self.edge_texture_width = width
+        self.edge_texture_height = height
 
         self.smoothing_texture = gl.GLuint()
         gl.glGenTextures(1, self.smoothing_texture)
@@ -1394,6 +1574,8 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+        self.smoothing_texture_width = width
+        self.smoothing_texture_height = height
 
 
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
@@ -1440,23 +1622,30 @@ class LiveViewerWindow(pyglet.window.Window):
              self.update_playback_state() # Initialize playback state
         if not hasattr(self, 'recording_state') or not self.recording_state:
              self.update_recording_state() # Initialize recording state
+        # Ensure screen capture index attribute exists
+        if not hasattr(self, 'screen_capture_monitor_index'):
+            self.screen_capture_monitor_index = DEFAULT_SETTINGS['screen_capture_monitor_index']
 
-        # Start new thread with current settings
+        # Start new thread with current settings, including monitor index
         self.inference_thread = threading.Thread(
             target=inference_thread_func,
-            args=(self._data_queue, self._exit_event, self._model_name, self._inference_interval,
+            args=(self._data_queue, self._exit_event,
+                  self.model, # Pass pre-loaded model
+                  self.device, # Pass device
+                  self._inference_interval,
                   self.scale_factor_ref,
                   self.edge_params_ref,
-                  self.input_mode, # Pass current mode
-                  self.input_filepath, # Pass current filepath
-                  self.playback_state, # Pass playback state dict
-                  self.recording_state, # Pass recording state dict
-                  self.live_processing_mode), # Pass live processing mode
+                  self.input_mode,
+                  self.input_filepath,
+                  self.playback_state,
+                  self.recording_state,
+                  self.live_processing_mode,
+                  self.screen_capture_monitor_index),
             daemon=True
         )
         self.inference_thread.start()
-        print(f"DEBUG: Inference thread started (Mode: {self.input_mode}).")
-        self.status_message = f"Starting {self.input_mode}..." # Update status
+        print(f"DEBUG: Inference thread started (Mode: {self.input_mode}, Monitor: {self.screen_capture_monitor_index if self.input_mode == 'Screen' else 'N/A'}).")
+        self.status_message = f"Starting {self.input_mode}..."
 
     def _update_edge_params(self):
         """Updates the dictionary passed to the inference thread."""
@@ -1472,6 +1661,11 @@ class LiveViewerWindow(pyglet.window.Window):
         self.edge_params_ref["gradient_influence_scale"] = self.gradient_influence_scale
         self.edge_params_ref["enable_sharpening"] = self.enable_sharpening
         self.edge_params_ref["sharpness"] = self.sharpness
+        # Add thickening params
+        self.edge_params_ref["enable_point_thickening"] = self.enable_point_thickening
+        self.edge_params_ref["thickening_duplicates"] = int(self.thickening_duplicates) # Ensure int
+        self.edge_params_ref["thickening_variance"] = self.thickening_variance
+        self.edge_params_ref["thickening_depth_bias"] = self.thickening_depth_bias
 
     def update_playback_state(self):
         """Updates the playback state dictionary passed to the inference thread."""
@@ -1536,7 +1730,7 @@ class LiveViewerWindow(pyglet.window.Window):
             return vertices_data, colors_data, num_vertices_actual
 
         except Exception as e_unpack:
-            print(f"Error unpacking or processing data: {e_unpack}")
+            print(f"ERROR in _process_queue_data: {e_unpack}") # Added ERROR prefix
             traceback.print_exc()
             # Also reset timing deltas on error? Maybe not necessary.
             return None, None, 0 # Return default values on error
@@ -1547,34 +1741,113 @@ class LiveViewerWindow(pyglet.window.Window):
             return
 
         try:
-            # Update Camera Feed Texture
+            # --- Update Camera Feed Texture --- 
+            # Handle potential BGRA from MSS or BGR from OpenCV
             if self.latest_rgb_frame is not None and self.camera_texture is not None:
-                h, w, _ = self.latest_rgb_frame.shape
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
-                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_rgb_frame.ctypes.data)
+                frame_to_upload = self.latest_rgb_frame
+                # Check dimensions first
+                if frame_to_upload.ndim != 3:
+                    print(f"Warning: latest_rgb_frame has unexpected dimensions {frame_to_upload.shape}. Skipping camera texture update.")
+                    frame_to_upload = None
+                else:
+                    h, w, c = frame_to_upload.shape
+                    gl_format = gl.GL_RGB # Default
 
-            # Update Depth Map Texture
+                    # Explicitly handle Screen mode frame format (likely BGRA from mss)
+                    if self.input_mode == "Screen":
+                        try:
+                            if c == 4: # BGRA
+                                frame_to_upload = cv2.cvtColor(frame_to_upload, cv2.COLOR_BGRA2RGB)
+                            elif c == 3: # Maybe BGR?
+                                print("Warning: Screen capture frame has 3 channels, assuming BGR and converting to RGB.")
+                                frame_to_upload = cv2.cvtColor(frame_to_upload, cv2.COLOR_BGR2RGB)
+                            else:
+                                 print(f"Warning: Screen capture frame has unexpected channel count {c}. Skipping camera texture update.")
+                                 frame_to_upload = None
+                            
+                            if frame_to_upload is not None:
+                                # Ensure contiguous after conversion
+                                frame_to_upload = np.ascontiguousarray(frame_to_upload)
+                        except cv2.error as e_cvt:
+                            print(f"ERROR: Could not convert screen frame to RGB in _update_debug_textures: {e_cvt}. Skipping camera texture update.")
+                            traceback.print_exc()
+                            frame_to_upload = None # Skip upload
+                    # Handle non-Screen mode (likely RGB from cvtColor earlier)
+                    elif c == 3:
+                        gl_format = gl.GL_RGB
+                        # Ensure contiguous just in case
+                        frame_to_upload = np.ascontiguousarray(frame_to_upload)
+                    # Handle unexpected formats in non-screen mode
+                    elif c == 4:
+                         print("Warning: Unexpected 4-channel frame in non-screen mode. Trying RGBA->RGB.")
+                         try:
+                             frame_to_upload = cv2.cvtColor(frame_to_upload, cv2.COLOR_RGBA2RGB)
+                             gl_format = gl.GL_RGB
+                             frame_to_upload = np.ascontiguousarray(frame_to_upload)
+                         except cv2.error:
+                             print("Failed to convert RGBA->RGB. Skipping camera texture update.")
+                             frame_to_upload = None
+                    else:
+                         print(f"Warning: Unexpected frame channel count ({c}). Skipping camera texture update.")
+                         frame_to_upload = None
+
+                # Perform the upload if frame is valid
+                if frame_to_upload is not None:
+                    h, w, _ = frame_to_upload.shape 
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
+                    # Check if texture size needs reallocation
+                    if w != self.camera_texture_width or h != self.camera_texture_height:
+                        print(f"DEBUG: Reallocating camera_texture from ({self.camera_texture_width}x{self.camera_texture_height}) to ({w}x{h})")
+                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) # Reallocate
+                        self.camera_texture_width = w
+                        self.camera_texture_height = h
+                    # Upload data (use glTexSubImage2D if texture already allocated, but glTexImage2D is simpler if realloc just happened)
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, frame_to_upload.ctypes.data)
+
+            # --- Update Depth Map Texture --- 
+            # (Already handles BGR from applyColorMap)
             if self.latest_depth_map_viz is not None and self.depth_texture is not None:
-                h, w, _ = self.latest_depth_map_viz.shape
+                depth_viz_cont = np.ascontiguousarray(self.latest_depth_map_viz)
+                h, w, _ = depth_viz_cont.shape
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
-                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, self.latest_depth_map_viz.ctypes.data) # OpenCV uses BGR
+                if w != self.depth_texture_width or h != self.depth_texture_height:
+                    print(f"DEBUG: Reallocating depth_texture from ({self.depth_texture_width}x{self.depth_texture_height}) to ({w}x{h})")
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, None) # Reallocate (format BGR)
+                    self.depth_texture_width = w
+                    self.depth_texture_height = h
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, depth_viz_cont.ctypes.data)
 
-            # Update Edge Map Texture
+            # --- Update Edge Map Texture --- 
+            # (Should be RGB)
             if self.latest_edge_map is not None and self.edge_texture is not None:
-                h, w, _ = self.latest_edge_map.shape
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self.edge_texture)
-                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_edge_map.ctypes.data) # Edge map viz is RGB
+                 edge_map_cont = np.ascontiguousarray(self.latest_edge_map)
+                 h, w, _ = edge_map_cont.shape
+                 gl.glBindTexture(gl.GL_TEXTURE_2D, self.edge_texture)
+                 if w != self.edge_texture_width or h != self.edge_texture_height:
+                    print(f"DEBUG: Reallocating edge_texture from ({self.edge_texture_width}x{self.edge_texture_height}) to ({w}x{h})")
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) # Reallocate (format RGB)
+                    self.edge_texture_width = w
+                    self.edge_texture_height = h
+                 gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, edge_map_cont.ctypes.data)
 
-            # Update Smoothing Map Texture
+            # --- Update Smoothing Map Texture --- 
+            # (Should be RGB)
             if self.latest_smoothing_map is not None and self.smoothing_texture is not None:
-                h, w, _ = self.latest_smoothing_map.shape
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self.smoothing_texture)
-                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, self.latest_smoothing_map.ctypes.data) # Smoothing map viz is RGB
+                 smoothing_map_cont = np.ascontiguousarray(self.latest_smoothing_map)
+                 h, w, _ = smoothing_map_cont.shape
+                 gl.glBindTexture(gl.GL_TEXTURE_2D, self.smoothing_texture)
+                 if w != self.smoothing_texture_width or h != self.smoothing_texture_height:
+                    print(f"DEBUG: Reallocating smoothing_texture from ({self.smoothing_texture_width}x{self.smoothing_texture_height}) to ({w}x{h})")
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) # Reallocate (format RGB)
+                    self.smoothing_texture_width = w
+                    self.smoothing_texture_height = h
+                 gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, smoothing_map_cont.ctypes.data)
 
             gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
 
         except Exception as e_tex:
-            print(f"Error updating debug textures: {e_tex}")
+            print(f"ERROR in _update_debug_textures: {e_tex}") # Added ERROR prefix
+            traceback.print_exc()
             # Optionally disable debug views on error?
 
     def _update_vertex_list(self, vertices_data, colors_data, num_vertices, view_matrix):
@@ -1626,6 +1899,21 @@ class LiveViewerWindow(pyglet.window.Window):
                 colors_for_display = colors_data
             # --- End Sorting ---
 
+            # --- NaN/Inf Check ---
+            invalid_vertices = np.isnan(vertices_for_display).any() or np.isinf(vertices_for_display).any()
+            invalid_colors = np.isnan(colors_for_display).any() or np.isinf(colors_for_display).any()
+
+            if invalid_vertices or invalid_colors:
+                print(f"ERROR: Detected NaN/Inf in vertex data! (Vertices: {invalid_vertices}, Colors: {invalid_colors}). Skipping vertex list update for this frame.")
+                # Optionally clear existing list to avoid rendering stale valid data
+                if self.vertex_list:
+                    try: self.vertex_list.delete()
+                    except Exception: pass
+                    self.vertex_list = None
+                self.current_point_count = 0
+                return # Skip the update
+            # --- End NaN/Inf Check ---
+
             # Delete existing list if it exists
             if self.vertex_list:
                 try: self.vertex_list.delete()
@@ -1642,7 +1930,7 @@ class LiveViewerWindow(pyglet.window.Window):
                 )
                 self.frame_count_display += 1 # Increment display counter on successful update
             except Exception as e_create:
-                 print(f"Error creating vertex list: {e_create}")
+                 print(f"ERROR creating vertex list: {e_create}") # Added ERROR prefix
                  traceback.print_exc()
                  self.vertex_list = None # Ensure list is None on error
                  self.current_point_count = 0
@@ -1671,16 +1959,22 @@ class LiveViewerWindow(pyglet.window.Window):
                     continue # Process next item in queue
                 else:
                     # Process actual vertex and image data
-                    vertices_data, colors_data, num_vertices = self._process_queue_data(latest_data)
+                    # Wrap data processing and updates in try-except
+                    try:
+                        vertices_data, colors_data, num_vertices = self._process_queue_data(latest_data)
 
-                    # Update debug textures based on the processed data
-                    self._update_debug_textures()
+                        # Update debug textures based on the processed data
+                        self._update_debug_textures()
 
-                    # Get current view matrix for sorting
-                    _, current_view = self.get_camera_matrices()
+                        # Get current view matrix for sorting
+                        _, current_view = self.get_camera_matrices()
 
-                    # Update the main vertex list (pass view matrix)
-                    self._update_vertex_list(vertices_data, colors_data, num_vertices, current_view)
+                        # Update the main vertex list (pass view matrix)
+                        self._update_vertex_list(vertices_data, colors_data, num_vertices, current_view)
+                    except Exception as e_main_update:
+                        print(f"ERROR during main thread data update: {e_main_update}")
+                        traceback.print_exc()
+                        # Continue processing queue if possible, but skip this item's rendering logic
 
         except queue.Empty:
             pass # No more data in the queue
@@ -1769,7 +2063,7 @@ class LiveViewerWindow(pyglet.window.Window):
 
     def save_settings(self, filename="viewer_settings.json"):
         """Saves current settings to a JSON file."""
-        settings_to_save = {key: getattr(self, key) for key in DEFAULT_SETTINGS}
+        settings_to_save = {key: getattr(self, key, DEFAULT_SETTINGS[key]) for key in DEFAULT_SETTINGS}
         try:
             with open(filename, 'w') as f:
                 json.dump(settings_to_save, f, indent=4)
@@ -1781,41 +2075,36 @@ class LiveViewerWindow(pyglet.window.Window):
 
     def load_settings(self, filename="viewer_settings.json"):
         """Loads settings from a JSON file or uses defaults."""
-        # Initialize attributes from defaults first
-        for key, value in DEFAULT_SETTINGS.items():
-            setattr(self, key, value)
-
+        loaded_settings = {}
         try:
             if os.path.exists(filename):
                 with open(filename, 'r') as f:
                     loaded_settings = json.load(f)
-                # Update attributes from loaded file, keeping defaults if key missing
-                for key in DEFAULT_SETTINGS:
-                    default_val = DEFAULT_SETTINGS[key]
-                    loaded_val = loaded_settings.get(key, default_val)
-                    try:
-                        if isinstance(default_val, bool): setattr(self, key, bool(loaded_val))
-                        elif isinstance(default_val, int): setattr(self, key, int(loaded_val))
-                        elif isinstance(default_val, float): setattr(self, key, float(loaded_val))
-                        else: setattr(self, key, loaded_val)
-                    except (ValueError, TypeError):
-                         print(f"Warning: Could not convert loaded setting '{key}' ({loaded_val}), using default.")
-                         setattr(self, key, default_val)
                 print(f"DEBUG: Settings loaded from {filename}")
             else:
                 print(f"DEBUG: Settings file {filename} not found, using defaults.")
-                # Defaults are already set
         except Exception as e:
             print(f"Error loading settings: {e}. Using defaults.")
-            # Ensure defaults are set if loading fails
-            for key, value in DEFAULT_SETTINGS.items():
-                setattr(self, key, value)
+            loaded_settings = {} # Ensure defaults are used on error
 
-        # Ensure reference dicts are updated/created *after* loading/defaults
+        # Initialize/update attributes from defaults first, then override with loaded values
+        for key, default_val in DEFAULT_SETTINGS.items():
+            loaded_val = loaded_settings.get(key, default_val)
+            try:
+                # Basic type conversion attempt
+                if isinstance(default_val, bool): setattr(self, key, bool(loaded_val))
+                elif isinstance(default_val, int): setattr(self, key, int(loaded_val))
+                elif isinstance(default_val, float): setattr(self, key, float(loaded_val))
+                else: setattr(self, key, loaded_val) # Assume string or correct type
+            except (ValueError, TypeError):
+                 print(f"Warning: Could not convert loaded setting '{key}' ({loaded_val}), using default.")
+                 setattr(self, key, default_val) # Fallback to default on conversion error
+
+        # Ensure reference dicts/lists are updated/created *after* loading/defaults
         self.scale_factor_ref = [self.input_scale_factor]
         self._update_edge_params()
         self.update_playback_state()
-        self.update_recording_state() # Initialize recording state
+        self.update_recording_state()
 
 
     def _browse_file(self):
@@ -1913,29 +2202,168 @@ class LiveViewerWindow(pyglet.window.Window):
         self.update_playback_state()
         self.start_inference_thread()
 
-    def _switch_input_source(self, mode, filepath):
-        """Switches to the given input mode (Live or Screen), resets playback state, and restarts inference."""
+    def _switch_input_source(self, mode, filepath, monitor_index=0): # Added monitor_index
+        """Switches input mode, resets state, and restarts inference."""
         self.input_mode = mode
         self.input_filepath = filepath
+        # Store the chosen monitor index if mode is Screen
+        if mode == "Screen":
+            self.screen_capture_monitor_index = monitor_index
         self.status_message = f"{mode} selected"
+
         # Reset playback state for new source
         self.is_playing = True
         self.playback_state["current_frame"] = 0
         self.playback_state["total_frames"] = 0
         self.playback_state["restart"] = False
         self.update_playback_state()
-        # Restart the inference thread with the new source
+
+        # Restart the inference thread with the new source and monitor index
         self.start_inference_thread()
 
     def _draw_ui(self):
         """Draws the ImGui user interface."""
+        # --- Apply Custom Style --- 
+        style = imgui.get_style()
+        # Rounding
+        style.window_rounding = 4.0
+        style.frame_rounding = 4.0
+        style.grab_rounding = 4.0
+        # Padding
+        style.window_padding = (8, 8)
+        style.frame_padding = (6, 4)
+        # Spacing
+        style.item_spacing = (8, 4)
+        style.item_inner_spacing = (4, 4)
+        # Borders
+        style.window_border_size = 1.0
+        style.frame_border_size = 0.0 # Looks clean without frame borders
+        style.popup_rounding = 4.0
+        style.popup_border_size = 1.0
+        # Alignment
+        style.window_title_align = (0.5, 0.5) # Center title
+
+        # --- End Dracula Style ---
+
+        # --- Custom Style Settings (Apply after defaults) ---
+        # Example: Increase rounding
+        # style.window_rounding = 5.0
+        # style.frame_rounding = 4.0
+        # style.grab_rounding = 4.0
+
+        # Colors (Pure Black Dark Mode - More Transparent)
+        style.colors[imgui.COLOR_TEXT]                  = hex_to_imvec4("#E0E0E0") # Light Gray Text
+        style.colors[imgui.COLOR_TEXT_DISABLED]         = hex_to_imvec4("#666666") # Dark Gray Disabled Text
+        style.colors[imgui.COLOR_WINDOW_BACKGROUND]             = hex_to_imvec4("#050505", alpha=0.85) # Near Black, More Transparent
+        style.colors[imgui.COLOR_CHILD_BACKGROUND]              = hex_to_imvec4("#0A0A0A", alpha=0.85) # Slightly Off-Black, More Transparent
+        style.colors[imgui.COLOR_POPUP_BACKGROUND]              = hex_to_imvec4("#030303", alpha=0.90) # Darker Near Black Popup, More Transparent
+        style.colors[imgui.COLOR_BORDER]                = hex_to_imvec4("#444444") # Slightly Lighter Border for visibility
+        style.colors[imgui.COLOR_BORDER_SHADOW]         = hex_to_imvec4("#000000", alpha=0.0) # No shadow
+        style.colors[imgui.COLOR_FRAME_BACKGROUND]              = hex_to_imvec4("#101010", alpha=0.80) # Very Dark Gray Frame, Transparent
+        style.colors[imgui.COLOR_FRAME_BACKGROUND_HOVERED]      = hex_to_imvec4("#181818", alpha=0.85)
+        style.colors[imgui.COLOR_FRAME_BACKGROUND_ACTIVE]       = hex_to_imvec4("#202020", alpha=0.90)
+        style.colors[imgui.COLOR_TITLE_BACKGROUND]              = hex_to_imvec4("#050505", alpha=0.85) # Near Black Title, Transparent
+        style.colors[imgui.COLOR_TITLE_BACKGROUND_ACTIVE]       = hex_to_imvec4("#151515", alpha=0.90) # Slightly lighter active title, Transparent
+        style.colors[imgui.COLOR_TITLE_BACKGROUND_COLLAPSED]    = hex_to_imvec4("#050505", alpha=0.75)
+        style.colors[imgui.COLOR_MENUBAR_BACKGROUND]            = hex_to_imvec4("#050505")
+        style.colors[imgui.COLOR_SCROLLBAR_BACKGROUND]          = hex_to_imvec4("#000000") # Black Scrollbar BG
+        style.colors[imgui.COLOR_SCROLLBAR_GRAB]        = hex_to_imvec4("#444444") # Mid Gray Grab
+        style.colors[imgui.COLOR_SCROLLBAR_GRAB_HOVERED]= hex_to_imvec4("#666666")
+        style.colors[imgui.COLOR_SCROLLBAR_GRAB_ACTIVE] = hex_to_imvec4("#888888")
+        style.colors[imgui.COLOR_CHECK_MARK]            = hex_to_imvec4("#FFFFFF") # White Checkmark
+        style.colors[imgui.COLOR_SLIDER_GRAB]           = hex_to_imvec4("#BBBBBB") # Light Gray Slider
+        style.colors[imgui.COLOR_SLIDER_GRAB_ACTIVE]    = hex_to_imvec4("#FFFFFF") # White Active Slider
+        style.colors[imgui.COLOR_BUTTON]                = hex_to_imvec4("#252525") # Dark Gray Button
+        style.colors[imgui.COLOR_BUTTON_HOVERED]        = hex_to_imvec4("#353535")
+        style.colors[imgui.COLOR_BUTTON_ACTIVE]         = hex_to_imvec4("#454545")
+        style.colors[imgui.COLOR_HEADER]                = hex_to_imvec4("#181818") # Very Dark Gray Header
+        style.colors[imgui.COLOR_HEADER_HOVERED]        = hex_to_imvec4("#282828")
+        style.colors[imgui.COLOR_HEADER_ACTIVE]         = hex_to_imvec4("#383838")
+        style.colors[imgui.COLOR_SEPARATOR]             = hex_to_imvec4("#333333") # Dark Gray Separator (matches border)
+        style.colors[imgui.COLOR_SEPARATOR_HOVERED]     = hex_to_imvec4("#555555")
+        style.colors[imgui.COLOR_SEPARATOR_ACTIVE]      = hex_to_imvec4("#777777")
+        style.colors[imgui.COLOR_RESIZE_GRIP]           = hex_to_imvec4("#444444") # Mid Gray Grip
+        style.colors[imgui.COLOR_RESIZE_GRIP_HOVERED]   = hex_to_imvec4("#666666")
+        style.colors[imgui.COLOR_RESIZE_GRIP_ACTIVE]    = hex_to_imvec4("#888888")
+        style.colors[imgui.COLOR_TAB]                   = hex_to_imvec4("#0A0A0A") # Slightly Off-Black Tab
+        style.colors[imgui.COLOR_TAB_HOVERED]           = hex_to_imvec4("#1A1A1A")
+        style.colors[imgui.COLOR_TAB_ACTIVE]            = hex_to_imvec4("#2A2A2A") # Light Gray Active Tab
+        style.colors[imgui.COLOR_TAB_UNFOCUSED]         = hex_to_imvec4("#050505") # Near Black Unfocused Tab
+        style.colors[imgui.COLOR_TAB_UNFOCUSED_ACTIVE]  = hex_to_imvec4("#151515")
+        style.colors[imgui.COLOR_PLOT_LINES]            = hex_to_imvec4("#FFFFFF") # White Plot Lines
+        style.colors[imgui.COLOR_PLOT_LINES_HOVERED]    = hex_to_imvec4("#DDDDDD")
+        style.colors[imgui.COLOR_PLOT_HISTOGRAM]        = hex_to_imvec4("#BBBBBB") # Light Gray Histogram
+        style.colors[imgui.COLOR_PLOT_HISTOGRAM_HOVERED]= hex_to_imvec4("#FFFFFF")
+        style.colors[imgui.COLOR_TABLE_HEADER_BACKGROUND] = hex_to_imvec4("#181818") # Dark Header for Table
+        style.colors[imgui.COLOR_TABLE_BORDER_STRONG]   = hex_to_imvec4("#333333") # Dark Gray Strong Border
+        style.colors[imgui.COLOR_TABLE_BORDER_LIGHT]    = hex_to_imvec4("#222222") # Very Dark Gray Light Border
+        style.colors[imgui.COLOR_TABLE_ROW_BACKGROUND]      = hex_to_imvec4("#0A0A0A") # Off-Black Row BG
+        style.colors[imgui.COLOR_TABLE_ROW_BACKGROUND_ALT]  = hex_to_imvec4("#101010") # Slightly Lighter Alt Row BG
+        style.colors[imgui.COLOR_TEXT_SELECTED_BACKGROUND]      = hex_to_imvec4("#444444") # Mid Gray Selection BG
+        style.colors[imgui.COLOR_DRAG_DROP_TARGET]      = hex_to_imvec4("#FFFFFF") # White Drag/Drop Target Highlight
+        style.colors[imgui.COLOR_NAV_HIGHLIGHT]         = hex_to_imvec4("#FFFFFF") # White Nav Highlight
+        style.colors[imgui.COLOR_NAV_WINDOWING_HIGHLIGHT]= hex_to_imvec4("#888888") # Gray Windowing Highlight
+        style.colors[imgui.COLOR_NAV_WINDOWING_DIM_BACKGROUND]  = hex_to_imvec4("#000000", alpha=0.2) # Dim Black BG
+        style.colors[imgui.COLOR_MODAL_WINDOW_DIM_BACKGROUND]   = hex_to_imvec4("#000000", alpha=0.5) # Darker Dim Black BG
+        # --- End Custom Style ---
+        
         # UI drawing logic will be moved here
         # --- ImGui Frame ---
         imgui.new_frame()
 
+        # --- Screen Share Selection Popup ---
+        if self.show_screen_share_popup:
+            imgui.open_popup("Select Screen Monitor") # Trigger the popup
+
+        # Center the popup
+        main_viewport = imgui.get_main_viewport()
+        popup_pos = (main_viewport.work_pos[0] + main_viewport.work_size[0] * 0.5,
+                     main_viewport.work_pos[1] + main_viewport.work_size[1] * 0.5)
+        imgui.set_next_window_position(popup_pos[0], popup_pos[1], imgui.ALWAYS, 0.5, 0.5)
+        imgui.set_next_window_size(400, 0) # Auto-adjust height
+
+        if imgui.begin_popup_modal("Select Screen Monitor", True, imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+            imgui.text("Select Monitor to Capture:")
+            imgui.separator()
+
+            monitors = []
+            try:
+                with mss.mss() as sct:
+                    monitors = sct.monitors
+            except Exception as e_mss:
+                imgui.text_colored(f"Error getting monitors: {e_mss}", 1.0, 0.0, 0.0, 1.0)
+
+            # Ensure temp index is valid before creating radio buttons
+            if self.temp_monitor_index >= len(monitors):
+                self.temp_monitor_index = 0 # Default to entire desktop if invalid
+
+            # Option for entire desktop (monitor 0)
+            changed_radio, self.temp_monitor_index = imgui.radio_button("Entire Desktop (All Monitors)", self.temp_monitor_index, 0)
+
+            # Options for individual monitors (monitor 1, 2, ...)
+            for i in range(1, len(monitors)):
+                 mon = monitors[i]
+                 label = f"Monitor {i} ({mon['width']}x{mon['height']} at {mon['left']},{mon['top']})"
+                 changed_radio, self.temp_monitor_index = imgui.radio_button(label, self.temp_monitor_index, i)
+
+            imgui.separator()
+            if imgui.button("Start Sharing", width=120):
+                self.screen_capture_monitor_index = self.temp_monitor_index # Store selection
+                self.show_screen_share_popup = False # Hide flag
+                self._switch_input_source("Screen", None, self.screen_capture_monitor_index) # Start thread
+                imgui.close_current_popup()
+            imgui.same_line()
+            if imgui.button("Cancel", width=120):
+                self.show_screen_share_popup = False # Hide flag
+                imgui.close_current_popup()
+
+            imgui.end_popup()
+        # --- End Screen Share Popup ---
+
+
         # --- Main Controls Window ---
         imgui.set_next_window_position(10, 10, imgui.ONCE)
-        imgui.set_next_window_size(350, self.height - 20, imgui.ONCE) # Adjust height dynamically
+        imgui.set_next_window_size(350, self.height - 20, imgui.ONCE)
         imgui.begin("UniK3D Controls")
 
         # --- Status Display (Always Visible) ---
@@ -1989,6 +2417,9 @@ class LiveViewerWindow(pyglet.window.Window):
                 # Show selected path for file or sequence
                 if self.input_mode in ["File", "GLB Sequence"]:
                     imgui.text("Path: " + (self.input_filepath or "None"))
+                elif self.input_mode == "Screen":
+                    mon_label = "Entire Desktop" if self.screen_capture_monitor_index == 0 else f"Monitor {self.screen_capture_monitor_index}"
+                    imgui.text(f"Capturing: {mon_label}")
                 imgui.separator()
                 imgui.end_tab_item()
             # --- End Input/Output Tab ---
@@ -2115,7 +2546,8 @@ class LiveViewerWindow(pyglet.window.Window):
                 changed_boost, self.point_size_boost = imgui.slider_float("Base Size Boost", self.point_size_boost, 0.1, 50.0)
                 if imgui.button("Reset##PointSize"): self.point_size_boost = DEFAULT_SETTINGS["point_size_boost"]
 
-                changed_scale, self.input_scale_factor = imgui.slider_float("World Radius Scale", self.input_scale_factor, 0.01, 5.0, "%.2f")
+                # Slider for Input Resolution Scale Factor
+                changed_scale, self.input_scale_factor = imgui.slider_float("Input Resolution Scale", self.input_scale_factor, 0.25, 4.0, "%.2f")
                 if changed_scale: self.scale_factor_ref[0] = self.input_scale_factor # Update shared ref for thread
                 if imgui.button("Reset##InputScale"):
                     self.input_scale_factor = DEFAULT_SETTINGS["input_scale_factor"]
@@ -2127,6 +2559,13 @@ class LiveViewerWindow(pyglet.window.Window):
                 )
                 if imgui.button("Reset##SizeScale"):
                     self.size_scale_factor = DEFAULT_SETTINGS["size_scale_factor"]
+
+                imgui.separator()
+                imgui.text("Inverse Square Law Params")
+                # Slider for Depth Exponent (related to inverse square law)
+                changed_depth_exp, self.depth_exponent = imgui.slider_float("Depth Exponent", self.depth_exponent, -4.0, 4.0, "%.2f")
+                if imgui.button("Reset##DepthExponent"):
+                    self.depth_exponent = DEFAULT_SETTINGS["depth_exponent"]
 
                 imgui.separator()
                 imgui.text("Color Adjustments")
@@ -2195,7 +2634,13 @@ class LiveViewerWindow(pyglet.window.Window):
             imgui.set_next_window_position(10, self.height - 250, imgui.ONCE) # Position top-leftish
             is_open, self.show_camera_feed = imgui.begin("Camera Feed", closable=True)
             if is_open:
-                imgui.image(self.camera_texture, self.latest_rgb_frame.shape[1], self.latest_rgb_frame.shape[0])
+                # Calculate aspect ratio preserving size
+                available_width = imgui.get_content_region_available()[0]
+                orig_h, orig_w, _ = self.latest_rgb_frame.shape
+                aspect_ratio = float(orig_w) / float(orig_h) if orig_h > 0 else 1.0
+                display_width = available_width
+                display_height = display_width / aspect_ratio
+                imgui.image(self.camera_texture, display_width, display_height)
             imgui.end()
 
         if self.show_depth_map and self.depth_texture and self.latest_depth_map_viz is not None:
@@ -2203,7 +2648,13 @@ class LiveViewerWindow(pyglet.window.Window):
             imgui.set_next_window_position(340, self.height - 250, imgui.ONCE) # Position next to camera feed
             is_open, self.show_depth_map = imgui.begin("Depth Map", closable=True)
             if is_open:
-                imgui.image(self.depth_texture, self.latest_depth_map_viz.shape[1], self.latest_depth_map_viz.shape[0])
+                # Calculate aspect ratio preserving size
+                available_width = imgui.get_content_region_available()[0]
+                orig_h, orig_w, _ = self.latest_depth_map_viz.shape
+                aspect_ratio = float(orig_w) / float(orig_h) if orig_h > 0 else 1.0
+                display_width = available_width
+                display_height = display_width / aspect_ratio
+                imgui.image(self.depth_texture, display_width, display_height)
             imgui.end()
 
         if self.show_edge_map and self.edge_texture and self.latest_edge_map is not None:
@@ -2211,7 +2662,13 @@ class LiveViewerWindow(pyglet.window.Window):
             imgui.set_next_window_position(10, self.height - 500, imgui.ONCE) # Position below camera feed
             is_open, self.show_edge_map = imgui.begin("Edge Map", closable=True)
             if is_open:
-                imgui.image(self.edge_texture, self.latest_edge_map.shape[1], self.latest_edge_map.shape[0])
+                # Calculate aspect ratio preserving size
+                available_width = imgui.get_content_region_available()[0]
+                orig_h, orig_w, _ = self.latest_edge_map.shape
+                aspect_ratio = float(orig_w) / float(orig_h) if orig_h > 0 else 1.0
+                display_width = available_width
+                display_height = display_width / aspect_ratio
+                imgui.image(self.edge_texture, display_width, display_height)
             imgui.end()
 
         if self.show_smoothing_map and self.smoothing_texture and self.latest_smoothing_map is not None:
@@ -2219,7 +2676,13 @@ class LiveViewerWindow(pyglet.window.Window):
              imgui.set_next_window_position(340, self.height - 500, imgui.ONCE) # Position below depth map
              is_open, self.show_smoothing_map = imgui.begin("Smoothing Alpha Map", closable=True)
              if is_open:
-                 imgui.image(self.smoothing_texture, self.latest_smoothing_map.shape[1], self.latest_smoothing_map.shape[0])
+                 # Calculate aspect ratio preserving size
+                 available_width = imgui.get_content_region_available()[0]
+                 orig_h, orig_w, _ = self.latest_smoothing_map.shape
+                 aspect_ratio = float(orig_w) / float(orig_h) if orig_h > 0 else 1.0
+                 display_width = available_width
+                 display_height = display_width / aspect_ratio
+                 imgui.image(self.smoothing_texture, display_width, display_height)
              imgui.end()
         # --- End Debug View Windows ---
 
@@ -2240,74 +2703,94 @@ class LiveViewerWindow(pyglet.window.Window):
         # --- Draw 3D Splats ---
         if self.vertex_list:
             projection, current_view = self.get_camera_matrices()
-            self.shader_program.use()
-            self.shader_program['projection'] = projection
-            self.shader_program['view'] = current_view
-            self.shader_program['viewportSize'] = (float(self.width), float(self.height))
-            # Pass control uniforms to shader
-            self.shader_program['inputScaleFactor'] = self.input_scale_factor
-            self.shader_program['pointSizeBoost'] = self.point_size_boost
-            self.shader_program['renderMode'] = self.render_mode
-            self.shader_program['falloffFactor'] = self.falloff_factor
-            self.shader_program['saturation'] = self.saturation
-            self.shader_program['brightness'] = self.brightness
-            self.shader_program['contrast'] = self.contrast
-            # Sharpness is applied in inference thread, but shader still has uniform
-            self.shader_program['sharpness'] = self.sharpness if self.enable_sharpening else 1.0
-
-            # Compute and pass input camera focal length (pixel units) for sizing
-            if self.latest_rgb_frame is not None:
-                input_h = float(self.latest_rgb_frame.shape[0])
-            else:
-                input_h = float(self.height) # Fallback if no frame yet
-            fov_rad = math.radians(self.input_camera_fov)
-            input_focal = (input_h * 0.5) / math.tan(fov_rad * 0.5)
-            self.shader_program['inputFocal'] = input_focal
-
-            # Pass the tunable size scale factor
-            self.shader_program['sizeScaleFactor'] = self.size_scale_factor
-
-            # Pass new min/max size clamp uniforms
-            self.shader_program['minPointSize'] = self.min_point_size
-            self.shader_program['enableMaxSizeClamp'] = self.enable_max_size_clamp
-            self.shader_program['maxPointSize'] = self.max_point_size
-
-            # Set GL state based on render mode
-            if self.render_mode == 0: # Square (Opaque)
-                gl.glEnable(gl.GL_DEPTH_TEST)
-                gl.glDepthMask(gl.GL_TRUE)
-                gl.glDisable(gl.GL_BLEND)
-            elif self.render_mode == 1: # Circle (Opaque)
-                gl.glEnable(gl.GL_DEPTH_TEST)
-                gl.glDepthMask(gl.GL_TRUE)
-                gl.glDisable(gl.GL_BLEND)
-            elif self.render_mode == 2: # Gaussian (Premultiplied Alpha Blend)
-                gl.glEnable(gl.GL_DEPTH_TEST)
-                gl.glDepthMask(gl.GL_FALSE) # Disable depth write for transparency
-                gl.glEnable(gl.GL_BLEND)
-                gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA) # Premultiplied alpha blend func
-
-            # Draw the splats
             try:
+                self.shader_program.use()
+                self.shader_program['projection'] = projection
+                self.shader_program['view'] = current_view
+                self.shader_program['viewportSize'] = (float(self.width), float(self.height))
+                # Pass control uniforms to shader
+                self.shader_program['inputScaleFactor'] = self.input_scale_factor
+                self.shader_program['pointSizeBoost'] = self.point_size_boost
+                self.shader_program['renderMode'] = self.render_mode
+                self.shader_program['falloffFactor'] = self.falloff_factor
+                self.shader_program['saturation'] = self.saturation
+                self.shader_program['brightness'] = self.brightness
+                self.shader_program['contrast'] = self.contrast
+                # Sharpness is applied in inference thread, but shader still has uniform
+                self.shader_program['sharpness'] = self.sharpness if self.enable_sharpening else 1.0
+
+                # Compute and pass input camera focal length (pixel units) for sizing
+                if self.latest_rgb_frame is not None:
+                    input_h = float(self.latest_rgb_frame.shape[0])
+                else:
+                    input_h = float(self.height) # Fallback if no frame yet
+                fov_rad = math.radians(self.input_camera_fov)
+                input_focal = (input_h * 0.5) / math.tan(fov_rad * 0.5)
+                self.shader_program['inputFocal'] = input_focal
+
+                # Pass the tunable size scale factor
+                self.shader_program['sizeScaleFactor'] = self.size_scale_factor
+
+                # Pass new min/max size clamp uniforms
+                self.shader_program['minPointSize'] = self.min_point_size
+                self.shader_program['enableMaxSizeClamp'] = self.enable_max_size_clamp
+                self.shader_program['maxPointSize'] = self.max_point_size
+
+                # Pass depth exponent for sizing
+                self.shader_program['depthExponent'] = self.depth_exponent
+
+                # Set GL state based on render mode
+                if self.render_mode == 0: # Square (Opaque)
+                    gl.glEnable(gl.GL_DEPTH_TEST)
+                    gl.glDepthMask(gl.GL_TRUE)
+                    gl.glDisable(gl.GL_BLEND)
+                elif self.render_mode == 1: # Circle (Opaque)
+                    gl.glEnable(gl.GL_DEPTH_TEST)
+                    gl.glDepthMask(gl.GL_TRUE)
+                    gl.glDisable(gl.GL_BLEND)
+                elif self.render_mode == 2: # Gaussian (Premultiplied Alpha Blend)
+                    gl.glEnable(gl.GL_DEPTH_TEST)
+                    gl.glDepthMask(gl.GL_FALSE) # Disable depth write for transparency
+                    gl.glEnable(gl.GL_BLEND)
+                    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA) # Premultiplied alpha blend func
+
+                # Draw the splats
+                # try:
                 self.vertex_list.draw(gl.GL_POINTS)
-            except Exception as e:
-                print(f"Error during vertex_list.draw: {e}")
-            finally:
+                # except Exception as e:
+                #     print(f"Error during vertex_list.draw: {e}")
+                # finally:
                 # Restore default-ish state after drawing splats
                 gl.glDepthMask(gl.GL_TRUE)
                 # Keep blend enabled for ImGui/UI, but set to standard alpha
                 gl.glEnable(gl.GL_BLEND)
                 gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
                 self.shader_program.stop()
+            except Exception as e_render:
+                 print(f"ERROR during _render_scene: {e_render}")
+                 traceback.print_exc()
+                 # Attempt to stop shader program even if draw failed
+                 try: self.shader_program.stop()
+                 except: pass
+                 # Restore GL state
+                 gl.glDepthMask(gl.GL_TRUE)
+                 gl.glEnable(gl.GL_BLEND)
+                 gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         # --- End Draw 3D Splats ---
 
     def on_draw(self):
         # Clear the main window buffer
-        gl.glClearColor(0.1, 0.1, 0.1, 1.0)
+        # gl.glClearColor(0.1, 0.1, 0.1, 1.0) # Old gray background
+        gl.glClearColor(0.0, 0.0, 0.0, 1.0) # New pure black background
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
 
-        # Render the 3D scene
-        self._render_scene()
+        # Render the 3D scene (wrap in try-except)
+        try:
+            self._render_scene()
+        except Exception as e_on_draw_render:
+            print(f"ERROR in on_draw calling _render_scene: {e_on_draw_render}")
+            traceback.print_exc()
+
         # --- Draw Stats Overlay (Individual Labels) ---
         # Set GL state for drawing text overlay
         gl.glEnable(gl.GL_BLEND)
@@ -2326,8 +2809,12 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glEnable(gl.GL_DEPTH_TEST)
         # --- End Stats Overlay ---
 
-        # Draw the ImGui UI using the helper method
-        self._draw_ui()
+        # Draw the ImGui UI using the helper method (wrap in try-except)
+        try:
+            self._draw_ui()
+        except Exception as e_on_draw_ui:
+             print(f"ERROR in on_draw calling _draw_ui: {e_on_draw_ui}")
+             traceback.print_exc()
 
         # Final GL state restoration (if needed, though ImGui usually handles its own)
         # gl.glEnable(gl.GL_DEPTH_TEST) # Already enabled after overlay
