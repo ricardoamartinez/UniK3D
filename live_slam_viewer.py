@@ -77,6 +77,16 @@ DEFAULT_SETTINGS = {
     "thickening_depth_bias": 0.5,   # Strength of backward push along ray (0=none)
     "depth_exponent": 2.0,        # Exponent for depth-based sizing (2.0=z^2, 1.0=z, -2.0=1/z^2)
     "screen_capture_monitor_index": 0, # 0 for entire desktop, 1+ for specific monitors
+    # --- Visual Debugging --- (Additions)
+    "debug_show_input_distance": False,
+    "debug_show_raw_diameter": False,
+    "debug_show_density_factor": False,
+    "debug_show_final_size": False,
+    # Geometry Debugging
+    "debug_show_input_frustum": False,
+    "debug_show_viewer_frustum": False,
+    "debug_show_input_rays": False,
+    "debug_show_world_axes": True, # Default axes to True
 }
 
 # --- GLB Saving Helper ---
@@ -165,6 +175,11 @@ vertex_source = """#version 150 core
     in vec3 colors; // Expects normalized floats (0.0-1.0)
 
     out vec3 vertex_colors;
+    // Debug outputs
+    out float debug_inputDistance_out;
+    out float debug_rawDiameter_out;
+    out float debug_densityFactor_out;
+    out float debug_finalSize_out;
 
     uniform mat4 projection;
     uniform mat4 view;
@@ -176,7 +191,7 @@ vertex_source = """#version 150 core
     uniform float minPointSize;     // Minimum point size in pixels
     uniform float maxPointSize;     // Maximum point size in pixels (if clamp enabled)
     uniform bool enableMaxSizeClamp;// Toggle for max size clamp
-    uniform float depthExponent;    // Exponent applied to depth for sizing
+    // uniform float depthExponent;    // Exponent applied to depth for sizing (Removed for automatic sizing)
 
     void main() {
         // Transform to view and clip space
@@ -185,13 +200,29 @@ vertex_source = """#version 150 core
         gl_Position = clipPos;
         vertex_colors = colors;
 
-        // --- Input-camera-based point sizing (viewer frustum independent) ---
-        float worldRadius = max(0.0001, inputScaleFactor);
-        // Depth relative to input camera = -vertices.z
-        float depth = max(-vertices.z, 0.0001);
-        // Pixel radius proportional to depth^exponent
-        float radius_scaled = inputFocal * worldRadius * pow(depth, depthExponent);
-        float diameter = 2.0 * radius_scaled * sizeScaleFactor * pointSizeBoost;
+        // --- Point Sizing based on INPUT Camera Distance (Inverse Square Law) and Density Compensation ---
+        // Calculate distance from the INPUT camera (origin in model space)
+        float inputDistance = length(vertices); // USE INPUT DISTANCE
+        inputDistance = max(inputDistance, 0.0001); // Avoid division by zero
+
+        // Point size proportional to the square of the INPUT distance (inverse square law)
+        // We use an exponent of -2.0 for inverse square.
+        // The base size is adjusted by inputScaleFactor, sizeScaleFactor, and pointSizeBoost.
+        float baseSize = inputFocal * inputScaleFactor; // Base size related to input camera properties
+        // Use inputDistance for scaling instead of viewerDistance
+        float diameter = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, -2.0); // USE INPUT DISTANCE
+
+        // Density compensation based on the original 360 projection (assuming spherical)
+        // Calculate normalized ray direction from INPUT camera to the point
+        vec3 inputRay = normalize(vertices); // USE INPUT RAY
+        // The Y-component of the normalized ray is sin(latitude).
+        // Note: vertices.y is DOWN in the original coordinate system before view transform.
+        // We use inputRay.y directly.
+        float cosInputLatitude = sqrt(1.0 - clamp(inputRay.y * inputRay.y, 0.0, 1.0)); // USE INPUT RAY
+        // Point size should be inversely proportional to the density, which is proportional to cos(latitude)
+        float densityCompensationFactor = 1.0 / max(1e-5, cosInputLatitude); // USE INPUT LATITUDE
+
+        diameter *= densityCompensationFactor; // Apply density compensation
 
         // Apply minimum and optional maximum size clamp
         float finalSize = max(diameter, minPointSize);
@@ -199,7 +230,13 @@ vertex_source = """#version 150 core
             finalSize = min(finalSize, maxPointSize);
         }
         gl_PointSize = finalSize;
-        // --- End Point Size Calculation ---
+
+        // Assign debug values
+        debug_inputDistance_out = inputDistance;
+        debug_rawDiameter_out = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, -2.0); // Raw diameter before density comp
+        debug_densityFactor_out = densityCompensationFactor;
+        debug_finalSize_out = finalSize;
+        // --- End Automatic Point Size Calculation ---
     }
 """
 
@@ -207,7 +244,19 @@ vertex_source = """#version 150 core
 fragment_source = """#version 150 core
     in vec3 geom_colors; // Input from Geometry Shader
     in vec2 texCoord;    // Input texture coordinate from Geometry Shader
+    // Receive debug values
+    in float debug_inputDistance_frag;
+    in float debug_rawDiameter_frag;
+    in float debug_densityFactor_frag;
+    in float debug_finalSize_frag;
+
     out vec4 final_color;
+
+    // Debug uniforms
+    uniform bool debug_show_input_distance;
+    uniform bool debug_show_raw_diameter;
+    uniform bool debug_show_density_factor;
+    uniform bool debug_show_final_size;
 
     uniform int renderMode; // 0=Square, 1=Circle, 2=Gaussian
     uniform float falloffFactor; // For Gaussian
@@ -233,8 +282,45 @@ fragment_source = """#version 150 core
         return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
     }
 
+    // Simple heatmap function (blue -> green -> red)
+    vec3 heatmap(float value) {
+        value = clamp(value, 0.0, 1.0); // Ensure value is in [0, 1]
+        float r = clamp(mix(0.0, 1.0, value * 2.0), 0.0, 1.0);
+        float g = clamp(mix(1.0, 0.0, abs(value - 0.5) * 2.0), 0.0, 1.0);
+        float b = clamp(mix(1.0, 0.0, (value - 0.5) * 2.0), 0.0, 1.0);
+        return vec3(r, g, b);
+    }
+
     void main() {
-        // --- Image Processing ---
+
+        // --- Debug Visualizations ---
+        if (debug_show_input_distance) {
+            // Map distance (e.g., 0-20) to a heatmap
+            float normalized_dist = clamp(debug_inputDistance_frag / 20.0, 0.0, 1.0);
+            final_color = vec4(heatmap(normalized_dist), 1.0);
+            return; // Skip normal processing
+        }
+        if (debug_show_raw_diameter) {
+             // Map diameter (e.g., 0-50 pixels) to grayscale
+             float gray = clamp(debug_rawDiameter_frag / 50.0, 0.0, 1.0);
+             final_color = vec4(gray, gray, gray, 1.0);
+             return;
+        }
+        if (debug_show_density_factor) {
+             // Map factor (e.g., 1.0 to 5.0+) to heatmap
+             float normalized_factor = clamp((debug_densityFactor_frag - 1.0) / 4.0, 0.0, 1.0);
+             final_color = vec4(heatmap(normalized_factor), 1.0);
+             return;
+        }
+         if (debug_show_final_size) {
+             // Map final size (e.g., 0-50 pixels) to grayscale
+             float gray = clamp(debug_finalSize_frag / 50.0, 0.0, 1.0);
+             final_color = vec4(gray, gray, gray, 1.0);
+             return;
+        }
+        // --- End Debug Visualizations ---
+
+        // --- Image Processing --- (Only runs if no debug mode active)
         vec3 processed_color = geom_colors;
 
         // Saturation, Brightness, Contrast (applied in HSV)
@@ -281,8 +367,19 @@ geometry_source = """#version 150 core
     layout (triangle_strip, max_vertices = 4) out;
 
     in vec3 vertex_colors[]; // Receive from vertex shader
+    // Receive debug values from vertex shader
+    in float debug_inputDistance_out[];
+    in float debug_rawDiameter_out[];
+    in float debug_densityFactor_out[];
+    in float debug_finalSize_out[];
+
     out vec3 geom_colors;    // Pass color to fragment shader
     out vec2 texCoord;       // Pass texture coordinate to fragment shader
+    // Pass debug values to fragment shader
+    out float debug_inputDistance_frag;
+    out float debug_rawDiameter_frag;
+    out float debug_densityFactor_frag;
+    out float debug_finalSize_frag;
 
     uniform vec2 viewportSize; // To convert pixel size to clip space
 
@@ -298,21 +395,41 @@ geometry_source = """#version 150 core
         gl_Position = centerPosition + vec4(-halfSizeX, -halfSizeY, 0.0, 0.0);
         geom_colors = vertex_colors[0];
         texCoord = vec2(0.0, 0.0); // Bottom-left
+        // Pass debug values
+        debug_inputDistance_frag = debug_inputDistance_out[0];
+        debug_rawDiameter_frag = debug_rawDiameter_out[0];
+        debug_densityFactor_frag = debug_densityFactor_out[0];
+        debug_finalSize_frag = debug_finalSize_out[0];
         EmitVertex();
 
         gl_Position = centerPosition + vec4( halfSizeX, -halfSizeY, 0.0, 0.0);
         geom_colors = vertex_colors[0];
         texCoord = vec2(1.0, 0.0); // Bottom-right
+        // Pass debug values
+        debug_inputDistance_frag = debug_inputDistance_out[0];
+        debug_rawDiameter_frag = debug_rawDiameter_out[0];
+        debug_densityFactor_frag = debug_densityFactor_out[0];
+        debug_finalSize_frag = debug_finalSize_out[0];
         EmitVertex();
 
         gl_Position = centerPosition + vec4(-halfSizeX,  halfSizeY, 0.0, 0.0);
         geom_colors = vertex_colors[0];
         texCoord = vec2(0.0, 1.0); // Top-left
+        // Pass debug values
+        debug_inputDistance_frag = debug_inputDistance_out[0];
+        debug_rawDiameter_frag = debug_rawDiameter_out[0];
+        debug_densityFactor_frag = debug_densityFactor_out[0];
+        debug_finalSize_frag = debug_finalSize_out[0];
         EmitVertex();
 
         gl_Position = centerPosition + vec4( halfSizeX,  halfSizeY, 0.0, 0.0);
         geom_colors = vertex_colors[0];
         texCoord = vec2(1.0, 1.0); // Top-right
+        // Pass debug values
+        debug_inputDistance_frag = debug_inputDistance_out[0];
+        debug_rawDiameter_frag = debug_rawDiameter_out[0];
+        debug_densityFactor_frag = debug_densityFactor_out[0];
+        debug_finalSize_frag = debug_finalSize_out[0];
         EmitVertex();
 
         EndPrimitive();
@@ -875,9 +992,15 @@ def _handle_recording(points_xyz_np, colors_np, recording_state_ref, sequence_fr
     return new_recorded_frame_counter
 
 
-def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices, rgb_frame_orig, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, t_capture, sequence_frame_index, video_total_frames, current_recorded_count, frame_count, frame_read_delta_t, depth_process_delta_t, latency_ms):
+def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices,
+                   rgb_frame_orig, scaled_depth_map_for_queue, edge_map_viz,
+                   smoothing_map_viz, t_capture, sequence_frame_index,
+                   video_total_frames, current_recorded_count, frame_count,
+                   frame_read_delta_t, depth_process_delta_t, latency_ms):
     """Puts the processed data into the queue for the main thread."""
     if not data_queue.full():
+            # Add frame_count back to the tuple if needed by receiver (currently not)
+            # For now, keep it out of the tuple to match _process_queue_data
             data_queue.put((vertices_flat, colors_flat, num_vertices,
                             rgb_frame_orig,
                             scaled_depth_map_for_queue,
@@ -887,8 +1010,9 @@ def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices, rgb_fra
                             sequence_frame_index,
                             video_total_frames,
                             current_recorded_count,
-                            frame_read_delta_t, depth_process_delta_t, latency_ms)) # Add timing info
+                            frame_read_delta_t, depth_process_delta_t, latency_ms))
     else:
+        # Use frame_count in the warning message again
         print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
         # Optionally put a status message instead of dropping silently
         # data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
@@ -1344,6 +1468,19 @@ class LiveViewerWindow(pyglet.window.Window):
         self.edge_params_ref = {} # Dictionary to pass edge params to thread
         self.playback_state = {} # Dictionary for playback control
         self.recording_state = {} # Dictionary for recording control
+        # Debug Flags (Additions)
+        self.debug_show_input_distance = None
+        self.debug_show_raw_diameter = None
+        self.debug_show_density_factor = None
+        self.debug_show_final_size = None
+        # Geometry Debug Flags
+        self.debug_show_input_frustum = None
+        self.debug_show_viewer_frustum = None
+        self.debug_show_input_rays = None
+        self.debug_show_world_axes = None
+
+        # Store latest vertex data for debug drawing (rays)
+        self.latest_points_for_debug = None
 
         # Local UI state variables (not saved in settings, but needed for immediate UI feedback)
         self.is_playing = True # Default to playing when starting/loading
@@ -1418,68 +1555,61 @@ class LiveViewerWindow(pyglet.window.Window):
         self.push_handlers(self.keys)
         self.mouse_down = False
 
-        # --- Geometry Shader Source ---
-        # (Keep geometry_source definition as is)
-        geometry_source = """#version 150 core
-            layout (points) in;
-            layout (triangle_strip, max_vertices = 4) out;
-
-            in vec3 vertex_colors[]; // Receive from vertex shader (array because input is point)
-            out vec3 geom_colors;    // Pass color to fragment shader
-            out vec2 texCoord;       // Pass texture coordinate to fragment shader
-
-            uniform vec2 viewportSize; // To convert pixel size to clip space
-
-            void main() {
-                vec4 centerPosition = gl_in[0].gl_Position;
-                float pointSize = gl_in[0].gl_PointSize; // Get size calculated in vertex shader
-
-                // Calculate half-size in clip space coordinates
-                float halfSizeX = pointSize / viewportSize.x;
-                float halfSizeY = pointSize / viewportSize.y;
-
-                // Emit 4 vertices for the quad
-                gl_Position = centerPosition + vec4(-halfSizeX, -halfSizeY, 0.0, 0.0);
-                geom_colors = vertex_colors[0];
-                texCoord = vec2(0.0, 0.0); // Bottom-left
-                EmitVertex();
-
-                gl_Position = centerPosition + vec4( halfSizeX, -halfSizeY, 0.0, 0.0);
-                geom_colors = vertex_colors[0];
-                texCoord = vec2(1.0, 0.0); // Bottom-right
-                EmitVertex();
-
-                gl_Position = centerPosition + vec4(-halfSizeX,  halfSizeY, 0.0, 0.0);
-                geom_colors = vertex_colors[0];
-                texCoord = vec2(0.0, 1.0); // Top-left
-                EmitVertex();
-
-                gl_Position = centerPosition + vec4( halfSizeX,  halfSizeY, 0.0, 0.0);
-                geom_colors = vertex_colors[0];
-                texCoord = vec2(1.0, 1.0); // Top-right
-                EmitVertex();
-
-                EndPrimitive();
-            }
-        """
-
-        # Shader only (No Batch)
+        # --- Main Point Cloud Shader --- 
+        print("DEBUG: Creating main point cloud shaders...")
         try:
-            print("DEBUG: Creating shaders...")
             vert_shader = pyglet.graphics.shader.Shader(vertex_source, 'vertex')
             frag_shader = pyglet.graphics.shader.Shader(fragment_source, 'fragment')
             geom_shader = pyglet.graphics.shader.Shader(geometry_source, 'geometry')
             self.shader_program = pyglet.graphics.shader.ShaderProgram(vert_shader, frag_shader, geom_shader)
-            print(f"DEBUG: Shader program created.")
+            print(f"DEBUG: Main shader program created.")
         except pyglet.graphics.shader.ShaderException as e:
-            print(f"FATAL: Shader compilation error: {e}")
+            print(f"FATAL: Main shader compilation error: {e}")
             pyglet.app.exit()
             return
         except Exception as e:
-             print(f"FATAL: Error during pyglet setup: {e}")
+             print(f"FATAL: Error during main shader setup: {e}")
              pyglet.app.exit()
              return
 
+        # --- Simple Debug Line Shader --- 
+        print("DEBUG: Creating debug line shaders...")
+        debug_vertex_source = """#version 150 core
+            in vec3 position;
+            in vec3 color;
+            out vec3 vertex_colors;
+
+            uniform mat4 projection;
+            uniform mat4 view;
+
+            void main() {
+                gl_Position = projection * view * vec4(position, 1.0);
+                vertex_colors = color;
+            }
+        """
+        debug_fragment_source = """#version 150 core
+            in vec3 vertex_colors;
+            out vec4 final_color;
+
+            void main() {
+                final_color = vec4(vertex_colors, 1.0);
+            }
+        """
+        try:
+            debug_vert_shader = pyglet.graphics.shader.Shader(debug_vertex_source, 'vertex')
+            debug_frag_shader = pyglet.graphics.shader.Shader(debug_fragment_source, 'fragment')
+            self.debug_shader_program = pyglet.graphics.shader.ShaderProgram(debug_vert_shader, debug_frag_shader)
+            print("DEBUG: Debug shader program created.")
+        except pyglet.graphics.shader.ShaderException as e:
+            print(f"FATAL: Debug shader compilation error: {e}")
+            pyglet.app.exit()
+            return
+        except Exception as e:
+            print(f"FATAL: Error during debug shader setup: {e}")
+            pyglet.app.exit()
+            return
+
+        print("DEBUG: Scheduling updates...") # Added print
         # Schedule the main update function
         pyglet.clock.schedule_interval(self.update, 1.0 / 60.0)
         pyglet.clock.schedule_interval(self.update_camera, 1.0 / 60.0)
@@ -1726,6 +1856,9 @@ class LiveViewerWindow(pyglet.window.Window):
             else:
                 self.latest_depth_map_viz = None
 
+            # Store latest vertex data for debug drawing (rays)
+            self.latest_points_for_debug = None
+
             # Return processed data needed for vertex list update
             return vertices_data, colors_data, num_vertices_actual
 
@@ -1854,93 +1987,96 @@ class LiveViewerWindow(pyglet.window.Window):
         """Updates the main point cloud vertex list, sorting if needed for Gaussian render mode."""
         self.current_point_count = num_vertices # Update point count regardless
 
-        if vertices_data is not None and colors_data is not None and num_vertices > 0:
-
-            # --- Depth Sorting for Gaussian Splats --- 
-            if self.render_mode == 2:
-                try:
-                    # Reshape flat arrays back to N x 3
-                    vertices_np = vertices_data.reshape((num_vertices, 3))
-                    colors_np = colors_data.reshape((num_vertices, 3))
-
-                    # Transform world vertices to view space to get depth
-                    # Pyglet Mat4 can multiply Vec3s directly, but slower for large arrays.
-                    # Convert to numpy for faster batch transformation.
-                    # Add homogeneous coordinate (w=1)
-                    vertices_homogeneous = np.hstack((vertices_np, np.ones((num_vertices, 1))))
-                    # Convert pyglet Mat4 to numpy array (column-major to row-major if needed? Test)
-                    # Pyglet matrices are column-major, numpy expects row-major for standard @ op
-                    view_np = np.array(view_matrix).reshape((4, 4), order='F') # 'F' for Fortran/Column-major
-                    view_space_points = vertices_homogeneous @ view_np.T # Transpose view_np for correct multiplication
-
-                    # Extract Z depth (larger Z is farther in OpenGL view space)
-                    view_space_depths = view_space_points[:, 2]
-
-                    # Get indices to sort by depth, ascending (nearest first) - FLIPPED
-                    sort_indices = np.argsort(view_space_depths)
-
-                    # Sort vertices and colors
-                    vertices_sorted = vertices_np[sort_indices]
-                    colors_sorted = colors_np[sort_indices]
-
-                    # Flatten back for vertex list
-                    vertices_for_display = vertices_sorted.flatten()
-                    colors_for_display = colors_sorted.flatten()
-
-                except Exception as e_sort:
-                    print(f"Error during point sorting: {e_sort}")
-                    traceback.print_exc()
-                    # Fallback to unsorted data if sorting fails
-                    vertices_for_display = vertices_data
-                    colors_for_display = colors_data
-            else:
-                # Use original data if not Gaussian mode
-                vertices_for_display = vertices_data
-                colors_for_display = colors_data
-            # --- End Sorting ---
-
-            # --- NaN/Inf Check ---
-            invalid_vertices = np.isnan(vertices_for_display).any() or np.isinf(vertices_for_display).any()
-            invalid_colors = np.isnan(colors_for_display).any() or np.isinf(colors_for_display).any()
-
-            if invalid_vertices or invalid_colors:
-                print(f"ERROR: Detected NaN/Inf in vertex data! (Vertices: {invalid_vertices}, Colors: {invalid_colors}). Skipping vertex list update for this frame.")
-                # Optionally clear existing list to avoid rendering stale valid data
-                if self.vertex_list:
-                    try: self.vertex_list.delete()
-                    except Exception: pass
-                    self.vertex_list = None
-                self.current_point_count = 0
-                return # Skip the update
-            # --- End NaN/Inf Check ---
-
-            # Delete existing list if it exists
-            if self.vertex_list:
-                try: self.vertex_list.delete()
-                except Exception: pass # Ignore error if already deleted
-                self.vertex_list = None
-
-            # Create new vertex list with potentially sorted data
-            try:
-                self.vertex_list = self.shader_program.vertex_list(
-                    num_vertices,
-                    gl.GL_POINTS,
-                    vertices=('f', vertices_for_display),
-                    colors=('f', colors_for_display)
-                )
-                self.frame_count_display += 1 # Increment display counter on successful update
-            except Exception as e_create:
-                 print(f"ERROR creating vertex list: {e_create}") # Added ERROR prefix
-                 traceback.print_exc()
-                 self.vertex_list = None # Ensure list is None on error
-                 self.current_point_count = 0
-        else:
+        # Check if vertices_data and colors_data are None or empty *before* trying processing
+        if vertices_data is None or colors_data is None or num_vertices <= 0:
             # If no valid vertices, clear the list
             if self.vertex_list:
                 try: self.vertex_list.delete()
                 except Exception: pass
                 self.vertex_list = None
             self.current_point_count = 0
+            return # Exit early
+
+        # Continue only if we have valid data
+        # --- Depth Sorting for Gaussian Splats --- 
+        if self.render_mode == 2:
+            try:
+                # Reshape flat arrays back to N x 3
+                vertices_np = vertices_data.reshape((num_vertices, 3))
+                colors_np = colors_data.reshape((num_vertices, 3))
+                # rays_np = rays_data.reshape((num_vertices, 3)) # REMOVED - Unused in current sorting
+
+                # Transform world vertices to view space to get depth
+                # Pyglet Mat4 can multiply Vec3s directly, but slower for large arrays.
+                # Convert to numpy for faster batch transformation.
+                # Add homogeneous coordinate (w=1)
+                vertices_homogeneous = np.hstack((vertices_np, np.ones((num_vertices, 1))))
+                # Convert pyglet Mat4 to numpy array (column-major to row-major if needed? Test)
+                # Pyglet matrices are column-major, numpy expects row-major for standard @ op
+                view_np = np.array(view_matrix).reshape((4, 4), order='F') # 'F' for Fortran/Column-major
+                view_space_points = vertices_homogeneous @ view_np.T # Transpose view_np for correct multiplication
+
+                # Extract Z depth (larger Z is farther in OpenGL view space)
+                view_space_depths = view_space_points[:, 2]
+
+                # Get indices to sort by depth, ascending (nearest first) - FLIPPED
+                sort_indices = np.argsort(view_space_depths)
+
+                # Sort vertices and colors
+                vertices_sorted = vertices_np[sort_indices]
+                colors_sorted = colors_np[sort_indices]
+
+                # Flatten back for vertex list
+                vertices_for_display = vertices_sorted.flatten()
+                colors_for_display = colors_sorted.flatten()
+
+            except Exception as e_sort:
+                print(f"Error during point sorting: {e_sort}")
+                traceback.print_exc()
+                # Fallback to unsorted data if sorting fails
+                vertices_for_display = vertices_data
+                colors_for_display = colors_data
+        else:
+            # Use original data if not Gaussian mode
+            vertices_for_display = vertices_data
+            colors_for_display = colors_data
+        # --- End Sorting ---
+
+        # --- NaN/Inf Check ---
+        invalid_vertices = np.isnan(vertices_for_display).any() or np.isinf(vertices_for_display).any()
+        invalid_colors = np.isnan(colors_for_display).any() or np.isinf(colors_for_display).any()
+
+        if invalid_vertices or invalid_colors:
+            print(f"ERROR: Detected NaN/Inf in vertex data! (Vertices: {invalid_vertices}, Colors: {invalid_colors}). Skipping vertex list update for this frame.")
+            # Optionally clear existing list to avoid rendering stale valid data
+            if self.vertex_list:
+                try: self.vertex_list.delete()
+                except Exception: pass
+                self.vertex_list = None
+            self.current_point_count = 0
+            return # Skip the update
+        # --- End NaN/Inf Check ---
+
+        # Delete existing list if it exists
+        if self.vertex_list:
+            try: self.vertex_list.delete()
+            except Exception: pass # Ignore error if already deleted
+            self.vertex_list = None
+
+        # Create new vertex list with potentially sorted data
+        try:
+            self.vertex_list = self.shader_program.vertex_list(
+                num_vertices,
+                gl.GL_POINTS,
+                vertices=('f', vertices_for_display),
+                colors=('f', colors_for_display)
+            )
+            self.frame_count_display += 1 # Increment display counter on successful update
+        except Exception as e_create:
+             print(f"ERROR creating vertex list: {e_create}") # Added ERROR prefix
+             traceback.print_exc()
+             self.vertex_list = None # Ensure list is None on error
+             self.current_point_count = 0
 
     def update(self, dt):
         """Scheduled function to process data from the inference thread."""
@@ -2608,6 +2744,40 @@ class LiveViewerWindow(pyglet.window.Window):
                 _, self.show_latency_overlay = imgui.checkbox("Latency##Overlay", self.show_latency_overlay)
                 # Add more debug info if needed
 
+                imgui.separator()
+                imgui.text("Visualize Sizing Calculations:")
+                # Use changed flags to ensure only one is active?
+                # For now, use simple checkboxes.
+                changed_dbg_dist, self.debug_show_input_distance = imgui.checkbox("Input Distance", self.debug_show_input_distance)
+                changed_dbg_diam, self.debug_show_raw_diameter = imgui.checkbox("Raw Diameter (Pre-Density)", self.debug_show_raw_diameter)
+                changed_dbg_dens, self.debug_show_density_factor = imgui.checkbox("Density Factor", self.debug_show_density_factor)
+                changed_dbg_size, self.debug_show_final_size = imgui.checkbox("Final Size (gl_PointSize)", self.debug_show_final_size)
+
+                # Logic to ensure only one is active at a time (optional)
+                if changed_dbg_dist and self.debug_show_input_distance:
+                    self.debug_show_raw_diameter = False
+                    self.debug_show_density_factor = False
+                    self.debug_show_final_size = False
+                elif changed_dbg_diam and self.debug_show_raw_diameter:
+                    self.debug_show_input_distance = False
+                    self.debug_show_density_factor = False
+                    self.debug_show_final_size = False
+                elif changed_dbg_dens and self.debug_show_density_factor:
+                     self.debug_show_input_distance = False
+                     self.debug_show_raw_diameter = False
+                     self.debug_show_final_size = False
+                elif changed_dbg_size and self.debug_show_final_size:
+                     self.debug_show_input_distance = False
+                     self.debug_show_raw_diameter = False
+                     self.debug_show_density_factor = False
+
+                imgui.separator()
+                imgui.text("Visualize Geometry:")
+                _, self.debug_show_world_axes = imgui.checkbox("World Axes##Geom", self.debug_show_world_axes)
+                _, self.debug_show_input_frustum = imgui.checkbox("Input Frustum##Geom", self.debug_show_input_frustum)
+                _, self.debug_show_viewer_frustum = imgui.checkbox("Viewer Frustum##Geom", self.debug_show_viewer_frustum)
+                _, self.debug_show_input_rays = imgui.checkbox("Input Rays (Sampled)##Geom", self.debug_show_input_rays)
+
                 imgui.end_tab_item()
             # --- End Debug Tab ---
 
@@ -2736,8 +2906,14 @@ class LiveViewerWindow(pyglet.window.Window):
                 self.shader_program['enableMaxSizeClamp'] = self.enable_max_size_clamp
                 self.shader_program['maxPointSize'] = self.max_point_size
 
-                # Pass depth exponent for sizing
-                self.shader_program['depthExponent'] = self.depth_exponent
+                # Pass depth exponent for sizing (Removed for automatic sizing)
+                # self.shader_program['depthExponent'] = self.depth_exponent
+
+                # Pass debug uniforms
+                self.shader_program['debug_show_input_distance'] = self.debug_show_input_distance
+                self.shader_program['debug_show_raw_diameter'] = self.debug_show_raw_diameter
+                self.shader_program['debug_show_density_factor'] = self.debug_show_density_factor
+                self.shader_program['debug_show_final_size'] = self.debug_show_final_size
 
                 # Set GL state based on render mode
                 if self.render_mode == 0: # Square (Opaque)
@@ -2816,9 +2992,148 @@ class LiveViewerWindow(pyglet.window.Window):
              print(f"ERROR in on_draw calling _draw_ui: {e_on_draw_ui}")
              traceback.print_exc()
 
-        # Final GL state restoration (if needed, though ImGui usually handles its own)
-        # gl.glEnable(gl.GL_DEPTH_TEST) # Already enabled after overlay
+        # --- Draw Debug Geometry --- (New Call)
+        try:
+            self._draw_debug_geometry()
+        except Exception as e_on_draw_debug:
+            print(f"ERROR in on_draw calling _draw_debug_geometry: {e_on_draw_debug}")
+            traceback.print_exc()
 
+        # Final GL state restoration (if needed, though ImGui usually handles its own)
+        # gl.Enable(gl.GL_DEPTH_TEST) # Already enabled after overlay
+
+    def _draw_debug_geometry(self):
+        """Draws various debug geometries like frustums and axes using shaders."""
+        proj_mat, view_mat = self.get_camera_matrices()
+        batch = pyglet.graphics.Batch() # Create a batch for drawing debug elements
+        debug_elements = [] # List to hold vertex_list objects
+
+        # --- Setup GL State (Shader independent) --- 
+        # Store previous state manually
+        prev_line_width = gl.GLfloat()
+        gl.glGetFloatv(gl.GL_LINE_WIDTH, prev_line_width)
+        depth_test_enabled = gl.glIsEnabled(gl.GL_DEPTH_TEST)
+        blend_enabled = gl.glIsEnabled(gl.GL_BLEND)
+        depth_mask_enabled = gl.GLboolean()
+        gl.glGetBooleanv(gl.GL_DEPTH_WRITEMASK, depth_mask_enabled)
+
+        # Configure GL state for debug overlays
+        gl.glDisable(gl.GL_BLEND)   # Ensure lines are solid
+        gl.glDisable(gl.GL_DEPTH_TEST) # DRAW ON TOP! Disable depth test
+        gl.glDepthMask(gl.GL_FALSE)     # Don't write to depth buffer
+        gl.glLineWidth(2.0)
+
+        # --- World Axes --- 
+        if self.debug_show_world_axes:
+            axis_length = 1.0
+            vertices = [ 0.0, 0.0, 0.0, axis_length, 0.0, 0.0, # X
+                         0.0, 0.0, 0.0, 0.0, axis_length, 0.0, # Y
+                         0.0, 0.0, 0.0, 0.0, 0.0, axis_length] # Z
+            colors =   [ 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, # Red
+                         0.0, 1.0, 0.0, 0.0, 1.0, 0.0, # Green
+                         0.0, 0.0, 1.0, 0.0, 0.0, 1.0] # Blue
+            debug_elements.append(self.debug_shader_program.vertex_list(
+                3 * 2, gl.GL_LINES, batch=batch,
+                position=('f', vertices),
+                color=('f', colors)
+            ))
+
+        # --- Input Frustum --- (Yellow)
+        if self.debug_show_input_frustum:
+            try:
+                input_fov_rad = math.radians(self.input_camera_fov)
+                aspect = 1.0
+                if self.latest_rgb_frame is not None and self.latest_rgb_frame.shape[0] > 0:
+                    aspect = self.latest_rgb_frame.shape[1] / self.latest_rgb_frame.shape[0]
+                else: aspect = self.width / self.height
+                near_plane, far_plane = 0.1, 20.0
+                h_near = 2.0 * near_plane * math.tan(input_fov_rad / 2.0); w_near = h_near * aspect
+                h_far = 2.0 * far_plane * math.tan(input_fov_rad / 2.0); w_far = h_far * aspect
+                corners = [ # Model space corners (Y down, -Z forward)
+                    ( w_near/2,  h_near/2, -near_plane), (-w_near/2,  h_near/2, -near_plane),
+                    (-w_near/2, -h_near/2, -near_plane), ( w_near/2, -h_near/2, -near_plane),
+                    ( w_far/2,  h_far/2, -far_plane), (-w_far/2,  h_far/2, -far_plane),
+                    (-w_far/2, -h_far/2, -far_plane), ( w_far/2, -h_far/2, -far_plane) ]
+                # Convert to render space (+Y up, -Z forward)
+                corners_render = [(c[0], -c[1], -c[2]) for c in corners]
+                # Define lines for frustum
+                indices = [0,1, 1,2, 2,3, 3,0, 4,5, 5,6, 6,7, 7,4, 0,4, 1,5, 2,6, 3,7]
+                vertices = [coord for i in indices for coord in corners_render[i]]
+                num_verts = len(indices)
+                colors = [1.0, 1.0, 0.0] * num_verts # Yellow for all lines
+                debug_elements.append(self.debug_shader_program.vertex_list(
+                    num_verts, gl.GL_LINES, batch=batch,
+                    position=('f', vertices),
+                    color=('f', colors)
+                ))
+            except Exception as e_inf: print(f"Error drawing input frustum: {e_inf}")
+
+        # --- Viewer Frustum --- (Magenta)
+        if self.debug_show_viewer_frustum:
+            try:
+                vp_mat = proj_mat @ view_mat
+                inv_vp_mat = vp_mat.inverse()
+                ndc_corners = [
+                    (-1,-1,-1), ( 1,-1,-1), ( 1, 1,-1), (-1, 1,-1),
+                    (-1,-1, 1), ( 1,-1, 1), ( 1, 1, 1), (-1, 1, 1) ]
+                world_corners = []
+                for ndc in ndc_corners:
+                    ndc_vec = Vec3(ndc[0], ndc[1], ndc[2])
+                    world_h = inv_vp_mat @ ndc_vec
+                    w = world_h._cdata[3]
+                    if abs(w) < 1e-6: w = 1.0
+                    world_corners.append((world_h._cdata[0]/w, world_h._cdata[1]/w, world_h._cdata[2]/w))
+                indices = [0,1, 1,2, 2,3, 3,0, 4,5, 5,6, 6,7, 7,4, 0,4, 1,5, 2,6, 3,7]
+                vertices = [coord for i in indices for coord in world_corners[i]]
+                num_verts = len(indices)
+                colors = [1.0, 0.0, 1.0] * num_verts # Magenta
+                debug_elements.append(self.debug_shader_program.vertex_list(
+                    num_verts, gl.GL_LINES, batch=batch,
+                    position=('f', vertices),
+                    color=('f', colors)
+                ))
+            except Exception as e_vf: print(f"Error drawing viewer frustum: {e_vf}")
+
+        # --- Input Rays --- (Cyan, Sampled)
+        if self.debug_show_input_rays and self.latest_points_for_debug is not None and len(self.latest_points_for_debug) > 0:
+            try:
+                num_rays_to_draw = 100
+                num_points = len(self.latest_points_for_debug)
+                step = max(1, num_points // num_rays_to_draw) if num_points > 0 else 1
+                sampled_points = self.latest_points_for_debug[::step]
+                vertices = []
+                origin = (0.0, 0.0, 0.0)
+                for point_coords in sampled_points:
+                    vertices.extend(origin)
+                    vertices.extend(point_coords)
+                num_verts = len(sampled_points) * 2
+                colors = [0.0, 1.0, 1.0] * num_verts # Cyan
+                debug_elements.append(self.debug_shader_program.vertex_list(
+                    num_verts, gl.GL_LINES, batch=batch,
+                    position=('f', vertices),
+                    color=('f', colors)
+                ))
+            except Exception as e_rays: print(f"Error drawing input rays: {e_rays}")
+
+        # --- Draw all debug elements --- 
+        if debug_elements:
+            self.debug_shader_program.use()
+            self.debug_shader_program['projection'] = proj_mat
+            self.debug_shader_program['view'] = view_mat
+            batch.draw()
+            self.debug_shader_program.stop()
+
+        # --- Restore GL State --- 
+        gl.glLineWidth(prev_line_width.value)
+        if depth_test_enabled:
+            gl.glEnable(gl.GL_DEPTH_TEST)
+        else:
+            gl.glDisable(gl.GL_DEPTH_TEST)
+        if blend_enabled:
+            gl.glEnable(gl.GL_BLEND)
+        else:
+            gl.glDisable(gl.GL_BLEND)
+        gl.glDepthMask(depth_mask_enabled.value)
 
     # --- Input Handlers ---
     def on_resize(self, width, height):
