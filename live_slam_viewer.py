@@ -16,6 +16,11 @@ import glob # For finding files
 import re # For sorting files numerically
 import trimesh # For GLB saving/loading
 import mss  # For screen capture (virtual camera)
+from collections import deque
+try:
+    from pytorch_wavelets import DWTForward, DWTInverse
+except ImportError:
+    print("ERROR: pytorch_wavelets not installed; install via 'pip install pytorch-wavelets'")
 
 # Assuming unik3d is installed and importable
 from unik3d.models import UniK3D
@@ -32,24 +37,24 @@ DEFAULT_SETTINGS = {
     "input_mode": "Live", # "Live", "File", "GLB Sequence"
     "input_filepath": "", # Can be file or directory path
     "render_mode": 2, # 0=Square, 1=Circle, 2=Gaussian
-    "falloff_factor": 5.0,
-    "saturation": 1.5,
+    "falloff_factor": 1.0,
+    "saturation": 1.0,
     "brightness": 1.0,
-    "contrast": 1.1,
-    "sharpness": 1.1,
+    "contrast": 1.0,
+    "sharpness": 1.0,
     "enable_sharpening": False,
-    "point_size_boost": 2.5,
-    "input_scale_factor": 0.9,
-    "size_scale_factor": 0.001, # Scale factor for z^2 point sizing
-    "enable_point_smoothing": True,
+    "point_size_boost": 1.0,
+    "input_scale_factor": 1.0,
+    "size_scale_factor": 0.001, # Scale factor for depth sizing (default inverse-square)
+    "enable_point_smoothing": False,
     "min_alpha_points": 0.0,
     "max_alpha_points": 1.0,
-    "enable_edge_aware_smoothing": True,
+    "enable_edge_aware_smoothing": False,
     "depth_edge_threshold1": 50.0,
     "depth_edge_threshold2": 150.0,
     "rgb_edge_threshold1": 50.0,
     "rgb_edge_threshold2": 150.0,
-    "edge_smoothing_influence": 0.7,
+    "edge_smoothing_influence": 0.0,
     "gradient_influence_scale": 1.0,
     "playback_speed": 1.0, # For video/GLB sequence files
     "loop_video": True, # For video/GLB sequence files
@@ -59,6 +64,7 @@ DEFAULT_SETTINGS = {
     "show_depth_map": False,
     "show_edge_map": False,
     "show_smoothing_map": False,
+    "show_wavelet_map": False,
     # Overlay Toggles
     "show_fps_overlay": False,
     "show_points_overlay": False,
@@ -72,10 +78,10 @@ DEFAULT_SETTINGS = {
     "max_point_size": 50.0,       # Max pixel size (if clamped)
     # --- Point Thickening --- 
     "enable_point_thickening": False,
-    "thickening_duplicates": 4,     # Num duplicates per point (total points = original * (1 + duplicates))
-    "thickening_variance": 0.01,   # StdDev of random perturbation
-    "thickening_depth_bias": 0.5,   # Strength of backward push along ray (0=none)
-    "depth_exponent": 2.0,        # Exponent for depth-based sizing (2.0=z^2, 1.0=z, -2.0=1/z^2)
+    "thickening_duplicates": 0,     # Num duplicates per point (total points = original * (1 + duplicates))
+    "thickening_variance": 0.0,   # StdDev of random perturbation
+    "thickening_depth_bias": 0.0,   # Strength of backward push along ray (0=none)
+    "depth_exponent": 2.0,        # Exponent for depth-based sizing (direct square)
     "screen_capture_monitor_index": 0, # 0 for entire desktop, 1+ for specific monitors
     # --- Visual Debugging --- (Additions)
     "debug_show_input_distance": False,
@@ -87,6 +93,11 @@ DEFAULT_SETTINGS = {
     "debug_show_viewer_frustum": False,
     "debug_show_input_rays": False,
     "debug_show_world_axes": True, # Default axes to True
+    "wavelet_packet_window_size": 64,
+    "wavelet_packet_type": "db4",
+    "fft_size": 512,
+    "dmd_time_window": 10,
+    "enable_cuda_transform": True,
 }
 
 # --- GLB Saving Helper ---
@@ -187,11 +198,11 @@ vertex_source = """#version 150 core
     uniform float pointSizeBoost;   // Controlled via ImGui
     uniform vec2 viewportSize;      // Width, height of viewport in pixels
     uniform float inputFocal;       // Focal length of input camera in pixel units
-    uniform float sizeScaleFactor;  // Tunable scale factor for z^2 sizing
     uniform float minPointSize;     // Minimum point size in pixels
     uniform float maxPointSize;     // Maximum point size in pixels (if clamp enabled)
     uniform bool enableMaxSizeClamp;// Toggle for max size clamp
-    // uniform float depthExponent;    // Exponent applied to depth for sizing (Removed for automatic sizing)
+    uniform float depthExponent;    // Exponent applied to depth for sizing
+    uniform float sizeScaleFactor;  // Tunable scale factor for depth sizing
 
     void main() {
         // Transform to view and clip space
@@ -210,7 +221,7 @@ vertex_source = """#version 150 core
         // The base size is adjusted by inputScaleFactor, sizeScaleFactor, and pointSizeBoost.
         float baseSize = inputFocal * inputScaleFactor; // Base size related to input camera properties
         // Use inputDistance for scaling instead of viewerDistance
-        float diameter = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, -2.0); // USE INPUT DISTANCE
+        float diameter = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, depthExponent); // Reinstated sizeScaleFactor
 
         // Density compensation based on the original 360 projection (assuming spherical)
         // Calculate normalized ray direction from INPUT camera to the point
@@ -233,7 +244,7 @@ vertex_source = """#version 150 core
 
         // Assign debug values
         debug_inputDistance_out = inputDistance;
-        debug_rawDiameter_out = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, -2.0); // Raw diameter before density comp
+        debug_rawDiameter_out = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, depthExponent); // Reinstated sizeScaleFactor
         debug_densityFactor_out = densityCompensationFactor;
         debug_finalSize_out = finalSize;
         // --- End Automatic Point Size Calculation ---
@@ -1457,6 +1468,7 @@ class LiveViewerWindow(pyglet.window.Window):
         self.show_depth_map = None
         self.show_edge_map = None
         self.show_smoothing_map = None
+        self.show_wavelet_map = None  # Flag to display Wavelet overlay
         # Overlay Toggles
         self.show_fps_overlay = None
         self.show_points_overlay = None
@@ -1651,6 +1663,15 @@ class LiveViewerWindow(pyglet.window.Window):
 
         print("DEBUG: LiveViewerWindow.__init__ - End") # Added print
 
+        # Prepare depth history buffer for Wavelet/FFT
+        self.depth_history = deque(maxlen=self.dmd_time_window)
+        self.latest_depth_tensor = None  # Latest raw depth tensor on GPU
+
+        # --- Set up a default VAO so ImGui can bind/unbind safely ---
+        self._default_vao = gl.GLuint()
+        gl.glGenVertexArrays(1, self._default_vao)
+        gl.glBindVertexArray(self._default_vao)
+
     def create_debug_textures(self):
         """Creates or re-creates textures for debug views."""
         # Delete existing textures if they exist
@@ -1707,6 +1728,16 @@ class LiveViewerWindow(pyglet.window.Window):
         self.smoothing_texture_width = width
         self.smoothing_texture_height = height
 
+        # Create texture for Wavelet/FFT output
+        self.wavelet_texture = gl.GLuint()
+        gl.glGenTextures(1, self.wavelet_texture)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.wavelet_texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+        self.wavelet_texture_width = width
+        self.wavelet_texture_height = height
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
         self.debug_textures_initialized = True
@@ -1859,6 +1890,36 @@ class LiveViewerWindow(pyglet.window.Window):
             # Store latest vertex data for debug drawing (rays)
             self.latest_points_for_debug = None
 
+            # Store raw depth tensor and keep history for spatiotemporal processing
+            if depth_map_tensor is not None:
+                try:
+                    # Ensure on correct device
+                    self.latest_depth_tensor = depth_map_tensor.to(self.device)
+                    self.depth_history.append(self.latest_depth_tensor)
+                except Exception as e_depth_hist:
+                    print(f"Warning: could not append depth tensor to history: {e_depth_hist}")
+                # Generate Wavelet/FFT map image for the debug window
+                try:
+                    # Stack history [T,1,H,W] and perform spatial wavelet + FFT
+                    depth_stack = torch.stack(list(self.depth_history), dim=0).unsqueeze(1)
+                    J = int(math.log2(max(1, self.wavelet_packet_window_size)))
+                    dwt = DWTForward(J=J, wave=self.wavelet_packet_type, mode='zero').to(self.device)
+                    idwt = DWTInverse(wave=self.wavelet_packet_type, mode='zero').to(self.device)
+                    Yl, Yh = dwt(depth_stack)
+                    recon_spatial = idwt((Yl, Yh)).squeeze(1)  # [T,H,W]
+                    freq = torch.fft.fftn(recon_spatial, dim=(0,1,2), norm='ortho')
+                    recon_full = torch.fft.ifftn(freq, dim=(0,1,2), norm='ortho').real
+                    final_depth = recon_full[-1].cpu().numpy()
+                    # Normalize and color map
+                    minv, maxv = final_depth.min(), final_depth.max()
+                    depth_norm = (final_depth - minv) / (maxv - minv + 1e-6)
+                    depth_img = (depth_norm * 255).astype(np.uint8)
+                    depth_color = cv2.applyColorMap(depth_img, cv2.COLORMAP_JET)
+                    self.latest_wavelet_map = np.ascontiguousarray(depth_color)
+                except Exception as e_wavelet:
+                    print(f"Warning: failed to generate wavelet map: {e_wavelet}")
+                    self.latest_wavelet_map = None
+
             # Return processed data needed for vertex list update
             return vertices_data, colors_data, num_vertices_actual
 
@@ -1975,6 +2036,30 @@ class LiveViewerWindow(pyglet.window.Window):
                     self.smoothing_texture_width = w
                     self.smoothing_texture_height = h
                  gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, smoothing_map_cont.ctypes.data)
+
+            # Update Wavelet/FFT overlay texture (or fallback to depth map)
+            if self.wavelet_texture is not None:
+                bmp = None
+                fmt = gl.GL_RGB
+                # Prefer generated wavelet map
+                if hasattr(self, 'latest_wavelet_map') and self.latest_wavelet_map is not None:
+                    bmp = self.latest_wavelet_map
+                    fmt = gl.GL_RGB
+                # Fallback to depth map visualization if no wavelet yet
+                elif self.latest_depth_map_viz is not None:
+                    bmp = self.latest_depth_map_viz
+                    fmt = gl.GL_BGR
+                if bmp is not None:
+                    data = np.ascontiguousarray(bmp)
+                    h, w, _ = data.shape
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.wavelet_texture)
+                    # Reallocate if size changed
+                    if w != self.wavelet_texture_width or h != self.wavelet_texture_height:
+                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, fmt, gl.GL_UNSIGNED_BYTE, None)
+                        self.wavelet_texture_width = w
+                        self.wavelet_texture_height = h
+                    # Upload texture data
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, fmt, gl.GL_UNSIGNED_BYTE, data.ctypes.data)
 
             gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
 
@@ -2669,12 +2754,27 @@ class LiveViewerWindow(pyglet.window.Window):
                 if imgui.radio_button("Circle##RenderMode", self.render_mode == 1): self.render_mode = 1
                 imgui.same_line()
                 if imgui.radio_button("Gaussian##RenderMode", self.render_mode == 2): self.render_mode = 2
+                imgui.same_line()
+                if imgui.radio_button("Wavelet/FFT##RenderMode", self.render_mode == 3): self.render_mode = 3
 
                 if self.render_mode == 2: # Gaussian Params
                     imgui.indent()
                     changed_falloff, self.falloff_factor = imgui.slider_float("Gaussian Falloff", self.falloff_factor, 0.1, 50.0)
                     if imgui.button("Reset##Falloff"): self.falloff_factor = DEFAULT_SETTINGS["falloff_factor"]
                     imgui.unindent()
+
+                if self.render_mode == 3: # Wavelet/FFT Params
+                    imgui.indent()
+                    changed_wp_window, self.wavelet_packet_window_size = imgui.slider_int("Wavelet Window Size", self.wavelet_packet_window_size, 16, 256)
+                    changed_wp_type, self.wavelet_packet_type = imgui.input_text("Wavelet Type", self.wavelet_packet_type, 64)
+                    changed_fft_size, self.fft_size = imgui.slider_int("FFT Size", self.fft_size, 128, 2048)
+                    changed_dmd_window, self.dmd_time_window = imgui.slider_int("DMD Time Window", self.dmd_time_window, 1, 100)
+                    changed_cuda, self.enable_cuda_transform = imgui.checkbox("Enable CUDA Transform", self.enable_cuda_transform)
+                    imgui.unindent()
+                    # Reset wavelet history and cached output when parameters change
+                    if changed_wp_window or changed_wp_type or changed_fft_size or changed_dmd_window or changed_cuda:
+                        self.depth_history.clear()
+                        self.latest_wavelet_map = None
 
                 imgui.separator()
                 imgui.text("Point Sizing (Input Camera Relative)")
@@ -2689,17 +2789,17 @@ class LiveViewerWindow(pyglet.window.Window):
                     self.input_scale_factor = DEFAULT_SETTINGS["input_scale_factor"]
                     self.scale_factor_ref[0] = self.input_scale_factor
 
-                # Changed to SliderFloat with larger range
-                size_scale_changed, self.size_scale_factor = imgui.slider_float(
-                    "Size Scale (z^2)", self.size_scale_factor, 0.0, 1.0, "%.4f"
-                )
-                if imgui.button("Reset##SizeScale"):
-                    self.size_scale_factor = DEFAULT_SETTINGS["size_scale_factor"]
+                # Slider for Global Size Scale Factor
+                changed_ssf, self.size_scale_factor = imgui.slider_float("Global Size Scale", self.size_scale_factor, 0.0001, 10.0, "%.4f")
+                if changed_ssf:
+                    print(f"DEBUG: Global sizeScaleFactor changed to {self.size_scale_factor}")
 
                 imgui.separator()
                 imgui.text("Inverse Square Law Params")
                 # Slider for Depth Exponent (related to inverse square law)
                 changed_depth_exp, self.depth_exponent = imgui.slider_float("Depth Exponent", self.depth_exponent, -4.0, 4.0, "%.2f")
+                if changed_depth_exp:
+                    print(f"DEBUG: depthExponent changed to {self.depth_exponent}")
                 if imgui.button("Reset##DepthExponent"):
                     self.depth_exponent = DEFAULT_SETTINGS["depth_exponent"]
 
@@ -2724,6 +2824,7 @@ class LiveViewerWindow(pyglet.window.Window):
                 _, self.show_depth_map = imgui.checkbox("Depth Map", self.show_depth_map)
                 _, self.show_edge_map = imgui.checkbox("Edge Map", self.show_edge_map)
                 _, self.show_smoothing_map = imgui.checkbox("Smoothing Map", self.show_smoothing_map)
+                _, self.show_wavelet_map = imgui.checkbox("Wavelet/FFT Map", self.show_wavelet_map)
 
                 imgui.separator()
                 imgui.text("Performance Info:")
@@ -2854,6 +2955,27 @@ class LiveViewerWindow(pyglet.window.Window):
                  display_height = display_width / aspect_ratio
                  imgui.image(self.smoothing_texture, display_width, display_height)
              imgui.end()
+
+        if self.show_wavelet_map and hasattr(self, 'wavelet_texture'):
+            imgui.set_next_window_size(320, 240, imgui.ONCE)
+            imgui.set_next_window_position(660, self.height - 250, imgui.ONCE)
+            is_open, self.show_wavelet_map = imgui.begin("Wavelet/FFT Output", closable=True)
+            if is_open:
+                available_width = imgui.get_content_region_available()[0]
+                # Choose which texture to display: wavelet or depth fallback
+                if self.latest_wavelet_map is not None:
+                    tex = self.wavelet_texture
+                    w = self.wavelet_texture_width
+                    h = self.wavelet_texture_height
+                else:
+                    tex = self.depth_texture
+                    w = self.depth_texture_width
+                    h = self.depth_texture_height
+                aspect = float(w) / float(h) if h > 0 else 1.0
+                display_width = available_width
+                display_height = display_width / aspect
+                imgui.image(tex, display_width, display_height)
+            imgui.end()
         # --- End Debug View Windows ---
 
 
@@ -2863,9 +2985,28 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         gl.glDisable(gl.GL_DEPTH_TEST) # ImGui draws in 2D
 
+        # Bind our default VAO so ImGui's renderer captures a valid VAO
+        try:
+            gl.glBindVertexArray(self._default_vao)
+        except Exception:
+            pass
+
         imgui.render()
-        self.imgui_renderer.render(imgui.get_draw_data())
+        # Draw ImGui, catching any GL errors from buffer binding
+        try:
+            self.imgui_renderer.render(imgui.get_draw_data())
+        except Exception as e:
+            print(f"Warning: ImGui renderer error (ignored): {e}")
+        # Re-bind our default VAO so ImGui's glBindVertexArray(last) will be valid
+        try:
+            gl.glBindVertexArray(self._default_vao)
+        except Exception:
+            pass
         # --- End ImGui Frame ---
+
+        # Auto-enable the Wavelet overlay when in Wavelet/FFT render mode
+        if self.render_mode == 3:
+            self.show_wavelet_map = True
 
     def _render_scene(self):
         """Renders the 3D point cloud scene."""
@@ -2898,7 +3039,7 @@ class LiveViewerWindow(pyglet.window.Window):
                 input_focal = (input_h * 0.5) / math.tan(fov_rad * 0.5)
                 self.shader_program['inputFocal'] = input_focal
 
-                # Pass the tunable size scale factor
+                # Pass the global size scale factor for point sizing
                 self.shader_program['sizeScaleFactor'] = self.size_scale_factor
 
                 # Pass new min/max size clamp uniforms
@@ -2906,8 +3047,8 @@ class LiveViewerWindow(pyglet.window.Window):
                 self.shader_program['enableMaxSizeClamp'] = self.enable_max_size_clamp
                 self.shader_program['maxPointSize'] = self.max_point_size
 
-                # Pass depth exponent for sizing (Removed for automatic sizing)
-                # self.shader_program['depthExponent'] = self.depth_exponent
+                # Pass depth exponent for sizing
+                self.shader_program['depthExponent'] = self.depth_exponent
 
                 # Pass debug uniforms
                 self.shader_program['debug_show_input_distance'] = self.debug_show_input_distance
@@ -2929,19 +3070,22 @@ class LiveViewerWindow(pyglet.window.Window):
                     gl.glDepthMask(gl.GL_FALSE) # Disable depth write for transparency
                     gl.glEnable(gl.GL_BLEND)
                     gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA) # Premultiplied alpha blend func
+                elif self.render_mode == 3: # Wavelet/FFT
+                    gl.glEnable(gl.GL_DEPTH_TEST)
+                    gl.glDepthMask(gl.GL_FALSE)
+                    gl.glEnable(gl.GL_BLEND)
+                    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA)
+                # --- End setup for Draw 3D Splats ---
 
-                # Draw the splats
-                # try:
-                self.vertex_list.draw(gl.GL_POINTS)
-                # except Exception as e:
-                #     print(f"Error during vertex_list.draw: {e}")
-                # finally:
-                # Restore default-ish state after drawing splats
-                gl.glDepthMask(gl.GL_TRUE)
-                # Keep blend enabled for ImGui/UI, but set to standard alpha
-                gl.glEnable(gl.GL_BLEND)
-                gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-                self.shader_program.stop()
+                # Draw the splats: use Wavelet/FFT for mode 3, else default point draw
+                if self.render_mode == 3:
+                    try:
+                        self._render_wavelet_fft()
+                    except Exception as e_wfft:
+                        print(f"Error in Wavelet/FFT rendering: {e_wfft}")
+                else:
+                    self.vertex_list.draw(gl.GL_POINTS)
+
             except Exception as e_render:
                  print(f"ERROR during _render_scene: {e_render}")
                  traceback.print_exc()
@@ -3208,11 +3352,43 @@ class LiveViewerWindow(pyglet.window.Window):
         if hasattr(self, 'smoothing_texture') and self.smoothing_texture:
              try: gl.glDeleteTextures(1, self.smoothing_texture)
              except: pass
+        if hasattr(self, 'wavelet_texture') and self.wavelet_texture:
+             try: gl.glDeleteTextures(1, self.wavelet_texture)
+             except: pass
         # --- ImGui Cleanup ---
         if hasattr(self, 'imgui_renderer') and self.imgui_renderer:
             self.imgui_renderer.shutdown()
         # --- End ImGui Cleanup ---
         super().on_close()
+
+    def _render_wavelet_fft(self):
+        """Perform spatiotemporal Wavelet Packet + FFT on the depth history (GPU)."""
+        # If no depth history, fallback
+        if not hasattr(self, 'depth_history') or len(self.depth_history) == 0:
+            self.vertex_list.draw(gl.GL_POINTS)
+            return
+        # Stack history into tensor [T,1,H,W]
+        try:
+            depth_stack = torch.stack(list(self.depth_history), dim=0).unsqueeze(1)  # B=frames, C=1
+            # Spatial Wavelet Packet Decomposition and Reconstruction
+            # J = log2(window_size) levels
+            J = int(math.log2(max(1, self.wavelet_packet_window_size)))
+            dwt = DWTForward(J=J, wave=self.wavelet_packet_type, mode='zero').to(self.device)
+            idwt = DWTInverse(wave=self.wavelet_packet_type, mode='zero').to(self.device)
+            Yl, Yh = dwt(depth_stack)                 # Spatial wavelet
+            recon_spatial = idwt((Yl, Yh)).squeeze(1)  # [T,H,W]
+
+            # Temporal FFT (across frames) and inverse
+            freq = torch.fft.fftn(recon_spatial, dim=(0,1,2), norm='ortho')
+            recon_full = torch.fft.ifftn(freq, dim=(0,1,2), norm='ortho').real  # [T,H,W]
+            final_depth = recon_full[-1]  # Last frame [H,W]
+        except Exception as e_proc:
+            print(f"Error in Wavelet+FFT pipeline: {e_proc}")
+            self.vertex_list.draw(gl.GL_POINTS)
+            return
+        # TODO: integrate `final_depth` back into 3D splat positions/colors
+        # For now, fallback to default rendering
+        self.vertex_list.draw(gl.GL_POINTS)
 
 
 if __name__ == '__main__':
