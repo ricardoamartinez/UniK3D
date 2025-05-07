@@ -98,6 +98,9 @@ DEFAULT_SETTINGS = {
     "fft_size": 512,
     "dmd_time_window": 10,
     "enable_cuda_transform": True,
+    "planar_projection": False,       # ADDED: Toggle to use planar projection instead of spherical rays for point generation
+    "use_orthographic": False,        # ADDED: Toggle between perspective and orthographic viewer projection
+    "orthographic_size": 5.0,         # ADDED: Ortho camera half-height (world units)
 }
 
 # --- GLB Saving Helper ---
@@ -720,30 +723,78 @@ def _process_inference_results(predictions, rgb_frame_processed, device, edge_pa
     new_prev_depth_map = prev_depth_map
     new_smoothed_mean_depth = smoothed_mean_depth
     new_smoothed_points_xyz = smoothed_points_xyz
+    points_xyz = None # Initialize points_xyz
 
     if predictions is None:
         return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
 
-    points_xyz = None
     current_depth_map = None
 
     # Extract points or calculate from depth/rays
-    if 'rays' in predictions and 'depth' in predictions:
-        current_depth_map = predictions['depth'].squeeze()
-        rays = predictions['rays'].squeeze()
-        if rays.shape[0] == 3 and rays.ndim == 3: rays = rays.permute(1, 2, 0)
-        if current_depth_map.shape == rays.shape[:2]:
-            depth_to_multiply = current_depth_map.unsqueeze(-1)
-            points_xyz = rays * depth_to_multiply
-        else: print("Warning: Depth and Ray shape mismatch.")
-    elif "points" in predictions:
+    if 'depth' in predictions:
+        current_depth_map = predictions['depth'].squeeze().float() # Ensure float type
+        H, W = current_depth_map.shape
+
+        if edge_params_ref.get('planar_projection', False):
+            # --- Pinhole Unprojection ---
+            input_fov_deg = edge_params_ref.get('input_camera_fov', 60.0)
+            # Ensure calculations are done with tensors on the correct device and dtype
+            fov_y_rad = torch.tensor(math.radians(input_fov_deg), device=device, dtype=torch.float32)
+
+            f_y = H / (2 * torch.tan(fov_y_rad / 2.0))
+            f_x = f_y # Assume square pixels for simplicity, common in many sensors
+
+            cx = torch.tensor(W / 2.0, device=device, dtype=torch.float32)
+            cy = torch.tensor(H / 2.0, device=device, dtype=torch.float32)
+
+            # Create pixel coordinate grid
+            jj = torch.arange(0, H, device=device, dtype=torch.float32) # Rows
+            ii = torch.arange(0, W, device=device, dtype=torch.float32) # Cols
+            
+            # grid_y will have shape (H, W) with values from 0 to H-1 varying along rows
+            # grid_x will have shape (H, W) with values from 0 to W-1 varying along columns
+            grid_y, grid_x = torch.meshgrid(jj, ii, indexing='ij')
+
+            depth_values = current_depth_map # Z in camera space
+
+            X_cam = (grid_x - cx) * depth_values / f_x
+            Y_cam = (grid_y - cy) * depth_values / f_y # This Y is positive downwards
+            Z_cam = depth_values
+
+            points_xyz = torch.stack([X_cam, Y_cam, Z_cam], dim=-1) # Shape (H, W, 3)
+            # This points_xyz is in (+X Right, +Y Down, +Z Forward) convention
+            # --- End Pinhole Unprojection ---
+        elif 'rays' in predictions:
+            # Use original UniK3D rays if planar projection is OFF
+            rays = predictions['rays'].squeeze()
+            if rays.ndim == 3 and rays.shape[0] == 3: # Check if it's C, H, W
+                rays = rays.permute(1, 2, 0) # Convert to H, W, C
+            
+            if current_depth_map.shape == rays.shape[:2]:
+                depth_to_multiply = current_depth_map.unsqueeze(-1)
+                points_xyz = rays * depth_to_multiply
+            else:
+                print(f"Warning: Spherical rays shape {rays.shape} and depth map shape {current_depth_map.shape} mismatch.")
+                # points_xyz remains None
+        else:
+            # Fallback if no rays and planar is off
+            print("Warning: Depth map present but no UniK3D rays found and planar projection is off. Cannot generate points from depth.")
+            # points_xyz remains None
+
+    elif "points" in predictions: # If model directly outputs points (e.g. GLB direct load)
         points_xyz = predictions["points"]
+        # Ensure points_xyz is H, W, C or N, C.
+        if points_xyz.ndim == 3 and points_xyz.shape[0] == 1 and points_xyz.shape[-1] == 3 : # Check for [1, N, 3]
+            points_xyz = points_xyz.squeeze(0) # Convert to [N, 3]
+        # If model output points are already in a different convention, that needs to be handled
+        # Assuming 'points' from predictions are in the (+X Right, +Y Down, +Z Forward) convention
+        # or will be handled by the GLB loading specific path if that's where they originate.
     else:
-        print("Warning: No points/depth found in predictions.")
-        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+        print("Warning: No points or depth found in UniK3D predictions.")
+        # points_xyz remains None
 
     if points_xyz is None or points_xyz.numel() == 0:
-        print("Warning: No valid points generated.")
+        print("Warning: No valid points generated from predictions.")
         return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
 
     # --- Edge Detection & Depth Processing (Run for all modes now) ---
@@ -1490,6 +1541,11 @@ class LiveViewerWindow(pyglet.window.Window):
         self.debug_show_viewer_frustum = None
         self.debug_show_input_rays = None
         self.debug_show_world_axes = None
+        # Orthographic projection settings
+        self.use_orthographic = None
+        self.orthographic_size = None
+        # Planar ray generation toggle
+        self.planar_projection = None
 
         # Store latest vertex data for debug drawing (rays)
         self.latest_points_for_debug = None
@@ -1672,6 +1728,13 @@ class LiveViewerWindow(pyglet.window.Window):
         gl.glGenVertexArrays(1, self._default_vao)
         gl.glBindVertexArray(self._default_vao)
 
+        self.input_camera_fov = None # Initialized before load_settings
+        # Orthographic projection settings
+        self.use_orthographic = None
+        self.orthographic_size = None
+        # Planar ray generation toggle
+        self.planar_projection = None
+
     def create_debug_textures(self):
         """Creates or re-creates textures for debug views."""
         # Delete existing textures if they exist
@@ -1827,6 +1890,10 @@ class LiveViewerWindow(pyglet.window.Window):
         self.edge_params_ref["thickening_duplicates"] = int(self.thickening_duplicates) # Ensure int
         self.edge_params_ref["thickening_variance"] = self.thickening_variance
         self.edge_params_ref["thickening_depth_bias"] = self.thickening_depth_bias
+        # Planar vs spherical projection toggle
+        self.edge_params_ref["planar_projection"] = self.planar_projection
+        # Pass input_camera_fov for planar ray calculation
+        self.edge_params_ref["input_camera_fov"] = self.input_camera_fov if self.input_camera_fov is not None else DEFAULT_SETTINGS["input_camera_fov"]
 
     def update_playback_state(self):
         """Updates the playback state dictionary passed to the inference thread."""
@@ -2743,6 +2810,26 @@ class LiveViewerWindow(pyglet.window.Window):
                         self._update_edge_params()
                     imgui.unindent()
 
+                imgui.separator()
+                imgui.text("Ray Generation (Input Cam)")
+                current_planar_projection = self.planar_projection if self.planar_projection is not None else DEFAULT_SETTINGS["planar_projection"]
+                changed_planar_proj, current_planar_projection = imgui.checkbox("Planar Rays (Pinhole Model)", current_planar_projection)
+                if changed_planar_proj:
+                    self.planar_projection = current_planar_projection
+                    self._update_edge_params()
+
+                if self.planar_projection: # Only show FOV if planar is active
+                    imgui.indent()
+                    current_fov = self.input_camera_fov if self.input_camera_fov is not None else DEFAULT_SETTINGS["input_camera_fov"]
+                    changed_fov, current_fov = imgui.slider_float("Input Camera FOV (Y)", current_fov, 10.0, 120.0, "%.1f deg")
+                    if changed_fov:
+                        self.input_camera_fov = current_fov
+                        self._update_edge_params()
+                    if imgui.button("Reset##InputFOV"):
+                        self.input_camera_fov = DEFAULT_SETTINGS["input_camera_fov"]
+                        self._update_edge_params()
+                    imgui.unindent()
+
                 imgui.end_tab_item()
             # --- End Processing Tab ---
 
@@ -2813,6 +2900,24 @@ class LiveViewerWindow(pyglet.window.Window):
 
                 changed_con, self.contrast = imgui.slider_float("Contrast", self.contrast, 0.1, 3.0)
                 if imgui.button("Reset##Contrast"): self.contrast = DEFAULT_SETTINGS["contrast"]
+
+                imgui.separator()
+                imgui.text("Viewer Camera Projection")
+                current_use_orthographic = self.use_orthographic if self.use_orthographic is not None else DEFAULT_SETTINGS["use_orthographic"]
+                changed_ortho, current_use_orthographic = imgui.checkbox("Use Orthographic Projection", current_use_orthographic)
+                if changed_ortho:
+                    self.use_orthographic = current_use_orthographic
+                # No _update_edge_params needed, used directly in get_camera_matrices
+
+                if self.use_orthographic:
+                    imgui.indent()
+                    current_ortho_size = self.orthographic_size if self.orthographic_size is not None else DEFAULT_SETTINGS["orthographic_size"]
+                    changed_ortho_size, current_ortho_size = imgui.slider_float("Ortho Size (Half-Height)", current_ortho_size, 0.1, 100.0, "%.1f")
+                    if changed_ortho_size:
+                        self.orthographic_size = current_ortho_size
+                    if imgui.button("Reset##OrthoSize"):
+                        self.orthographic_size = DEFAULT_SETTINGS["orthographic_size"]
+                    imgui.unindent()
 
                 imgui.end_tab_item()
             # --- End Rendering Tab ---
@@ -3035,7 +3140,9 @@ class LiveViewerWindow(pyglet.window.Window):
                     input_h = float(self.latest_rgb_frame.shape[0])
                 else:
                     input_h = float(self.height) # Fallback if no frame yet
-                fov_rad = math.radians(self.input_camera_fov)
+                
+                current_input_fov = self.input_camera_fov if self.input_camera_fov is not None else DEFAULT_SETTINGS["input_camera_fov"]
+                fov_rad = math.radians(current_input_fov)
                 input_focal = (input_h * 0.5) / math.tan(fov_rad * 0.5)
                 self.shader_program['inputFocal'] = input_focal
 
@@ -3185,11 +3292,11 @@ class LiveViewerWindow(pyglet.window.Window):
         # --- Input Frustum --- (Yellow)
         if self.debug_show_input_frustum:
             try:
-                input_fov_rad = math.radians(self.input_camera_fov)
+                current_input_fov_geom = self.input_camera_fov if self.input_camera_fov is not None else DEFAULT_SETTINGS["input_camera_fov"]
+                input_fov_rad = math.radians(current_input_fov_geom)
                 aspect = 1.0
                 if self.latest_rgb_frame is not None and self.latest_rgb_frame.shape[0] > 0:
                     aspect = self.latest_rgb_frame.shape[1] / self.latest_rgb_frame.shape[0]
-                else: aspect = self.width / self.height
                 near_plane, far_plane = 0.1, 20.0
                 h_near = 2.0 * near_plane * math.tan(input_fov_rad / 2.0); w_near = h_near * aspect
                 h_far = 2.0 * far_plane * math.tan(input_fov_rad / 2.0); w_far = h_far * aspect
