@@ -1,5 +1,5 @@
 {
-    "input_mode": "Live",
+    "input_mode": "Live Camera",
     "input_filepath": "",
     "render_mode": 2,
     "falloff_factor": 6.9079999923706055,
@@ -22,6 +22,7 @@
     "gradient_influence_scale": 1.0,
     "playback_speed": 1.0,
     "loop_video": true,
+    "live_camera_index": 0,
     "is_recording": false,
     "recording_output_dir": "recording_output",
     "show_camera_feed": true,
@@ -33,5 +34,6 @@
     "show_input_fps_overlay": true,
     "show_depth_fps_overlay": true,
     "show_latency_overlay": true,
-    "live_processing_mode": "Real-time"
+    "live_processing_mode": "Real-time",
+    "ui_theme": "Dark"
 }

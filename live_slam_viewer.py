@@ -36,7 +36,7 @@ from imgui.integrations.pyglet import create_renderer
 
 # Default settings dictionary
 DEFAULT_SETTINGS = {
-    "input_mode": "Live", # "Live", "File", "GLB Sequence"
+    "input_mode": "Live Camera", # "Live Camera", "File (Video/Image)", "GLB Sequence", "Screen Capture"
     "input_filepath": "", # Can be file or directory path
     "render_mode": 2, # 0=Square, 1=Circle, 2=Gaussian
     "falloff_factor": 5.0,
@@ -59,6 +59,7 @@ DEFAULT_SETTINGS = {
     "gradient_influence_scale": 1.0,
     "playback_speed": 1.0, # For video/GLB sequence files
     "loop_video": True, # For video/GLB sequence files
+    "live_camera_index": 0,
     "is_recording": False, # Recording state
     "recording_output_dir": "recording_output", # Default output dir
     "show_camera_feed": False,
@@ -72,7 +73,10 @@ DEFAULT_SETTINGS = {
     "show_depth_fps_overlay": False,
     "show_latency_overlay": False,
     "live_processing_mode": "Real-time", # "Real-time" or "Buffered"
+    "ui_theme": "Dark",  # "Dark", "Light", or "Classic"
 }
+
+THEME_OPTIONS = ["Dark", "Light", "Classic"]
 
 # --- GLB Saving Helper ---
 def save_glb(filepath, points, colors=None):
@@ -326,8 +330,22 @@ def _get_window_list():
 
 # --- Inference Thread Helper Functions ---
 
-def _initialize_input_source(input_mode, input_filepath, data_queue, playback_state_ref):
-    """Initializes the input source (camera, file, sequence)."""
+def _initialize_input_source(input_mode, input_filepath, data_queue, playback_state_ref, camera_index=0):
+    """Initializes the input source (camera, file, sequence).
+
+    Parameters
+    ----------
+    input_mode : str
+        Selected input type.
+    input_filepath : str
+        Path to file or directory depending on mode.
+    data_queue : queue.Queue
+        Queue to push status messages.
+    playback_state_ref : dict
+        Shared playback state dictionary.
+    camera_index : int, optional
+        Index of the camera device for live capture.
+    """
     cap = None
     is_video = False
     is_image = False
@@ -343,7 +361,7 @@ def _initialize_input_source(input_mode, input_filepath, data_queue, playback_st
     if input_mode == "Live Camera": # Use exact name from UI
         print("Initializing camera...")
         data_queue.put(("status", "Initializing camera..."))
-        cap = cv2.VideoCapture(0) # TODO: Allow selecting camera index
+        cap = cv2.VideoCapture(camera_index)
         if cap.isOpened():
             is_video = True # Treat live feed as video
             frame_source_name = "Live Camera"
@@ -897,8 +915,15 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                           scale_factor_ref, edge_params_ref,
                           input_mode, input_filepath, playback_state,
                           recording_state, live_processing_mode,
-                          selected_monitor_index, selected_window_hwnd): # Added screen capture args
-    """Loads model, captures/loads data, runs inference, processes, and queues results."""
+                          selected_monitor_index, selected_window_hwnd,
+                          camera_index):
+    """Loads model, captures/loads data, runs inference, processes, and queues results.
+
+    Parameters
+    ----------
+    camera_index : int
+        Index of camera device to use when `input_mode` is "Live Camera".
+    """
     print(f"Inference thread started. Mode: {input_mode}, File: {input_filepath if input_filepath else 'N/A'}")
     data_queue.put(("status", f"Inference thread started ({input_mode})..."))
 
@@ -934,7 +959,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
         # --- Initialize Input Source ---
         cap, image_frame, is_video, is_image, is_glb_sequence, glb_files, \
         frame_source_name, video_total_frames, video_fps, input_mode, error_message = \
-            _initialize_input_source(input_mode, input_filepath, data_queue, playback_state) # Use renamed variable
+            _initialize_input_source(input_mode, input_filepath, data_queue, playback_state, camera_index)
 
         if error_message:
             return # Error already queued by helper
@@ -961,7 +986,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             t_capture = time.time() # Capture time at loop start for latency
 
             # --- Frame Acquisition Logic ---
-            if input_mode == "Live" and is_video and cap:
+            if input_mode == "Live Camera" and is_video and cap:
                 if live_processing_mode == "Real-time":
                     # Grab latest frame, discard older ones
                     grabbed = False
@@ -1006,7 +1031,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             # Check if sequence looped or restarted (index reset by _read_or_load_frame)
             # Reset recorder counter accordingly
             # Use frame_count > 1 to avoid resetting on the very first frame
-            if frame_count > 1 and sequence_frame_index <= 1 and input_mode != "Live": # Only reset for sequences/files
+            if frame_count > 1 and sequence_frame_index <= 1 and input_mode != "Live Camera": # Only reset for sequences/files
                  if recorded_frame_counter > 0: # Only reset if it was actually counting
                     print("DEBUG: Resetting recorded frame counter due to loop/restart.")
                     recorded_frame_counter = 0
@@ -1108,7 +1133,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
             colors_flat = colors_np_processed.flatten() if colors_np_processed is not None else None
 
             # --- Queue Results (with Real-time handling) ---
-            if input_mode == "Live" and live_processing_mode == "Real-time" and data_queue.full():
+            if input_mode == "Live Camera" and live_processing_mode == "Real-time" and data_queue.full():
                 print(f"Warning: Viewer queue full in Real-time mode, dropping frame {frame_count}.")
                 # Skip queuing to prioritize processing next frame
             else:
@@ -1120,7 +1145,7 @@ def inference_thread_func(data_queue, exit_event, model_name, inference_interval
                                frame_read_delta_t, depth_process_delta_t, latency_ms) # Pass timing
 
             # Short sleep for live mode to prevent busy loop
-            if is_video and input_mode == "Live":
+            if is_video and input_mode == "Live Camera":
                 time.sleep(0.005)
 
     except Exception as e_thread:
@@ -1193,6 +1218,7 @@ class LiveViewerWindow(pyglet.window.Window):
         self.show_depth_fps_overlay = None
         self.show_latency_overlay = None
         self.live_processing_mode = None # Added attribute
+        self.ui_theme = None
         self.scale_factor_ref = None # Initialized in load_settings
         self.edge_params_ref = {} # Dictionary to pass edge params to thread
         self.playback_state = {} # Dictionary for playback control
@@ -1220,6 +1246,8 @@ class LiveViewerWindow(pyglet.window.Window):
 
         # Load initial settings (this initializes control variables and refs)
         self.load_settings()
+        self.apply_theme()
+        self.theme_index = THEME_OPTIONS.index(self.ui_theme) if self.ui_theme in THEME_OPTIONS else 0
         # Ensure default input mode is set correctly after loading settings
         if self.input_mode not in ["Live Camera", "File (Video/Image)", "GLB Sequence", "Screen Capture"]:
             print(f"DEBUG: Input mode '{self.input_mode}' from settings invalid or missing, defaulting to 'Live Camera'.")
@@ -1460,7 +1488,8 @@ class LiveViewerWindow(pyglet.window.Window):
                   self.recording_state, # Pass recording state dict
                   self.live_processing_mode, # Pass live processing mode
                   getattr(self, 'selected_monitor_index', 1), # Pass screen capture args w/ defaults
-                  getattr(self, 'selected_window_hwnd', 0)),
+                  getattr(self, 'selected_window_hwnd', 0),
+                  getattr(self, 'live_camera_index', 0)),
             daemon=True
         )
         self.inference_thread.start()
@@ -1746,6 +1775,16 @@ class LiveViewerWindow(pyglet.window.Window):
             print(f"Error saving settings: {e}")
             self.status_message = "Error saving settings."
 
+    def apply_theme(self):
+        """Applies the ImGui style based on the selected theme."""
+        theme = getattr(self, "ui_theme", "Dark")
+        if theme == "Light":
+            imgui.style_colors_light()
+        elif theme == "Classic":
+            imgui.style_colors_classic()
+        else:
+            imgui.style_colors_dark()
+
     def load_settings(self, filename="viewer_settings.json"):
         """Loads settings from a JSON file or uses defaults."""
         # Initialize attributes from defaults first
@@ -1783,6 +1822,8 @@ class LiveViewerWindow(pyglet.window.Window):
         self._update_edge_params()
         self.update_playback_state()
         self.update_recording_state() # Initialize recording state
+        self.apply_theme()
+        self.theme_index = THEME_OPTIONS.index(self.ui_theme) if self.ui_theme in THEME_OPTIONS else 0
 
 
     def _browse_file(self, browse_type="file"): # Add browse_type argument
@@ -1853,10 +1894,10 @@ class LiveViewerWindow(pyglet.window.Window):
         thread_is_running = self.inference_thread and self.inference_thread.is_alive()
 
         if thread_is_running:
-            if self.input_mode == "Live":
+            if self.input_mode == "Live Camera":
                 status_text = "Status: Live Feed Active"
                 status_color = (0.1, 1.0, 0.1, 1.0) # Green
-            elif self.input_mode == "File":
+            elif self.input_mode == "File (Video/Image)":
                 status_text = f"Status: Processing File ({os.path.basename(self.input_filepath)})"
                 status_color = (0.1, 0.6, 1.0, 1.0) # Blue
             elif self.input_mode == "GLB Sequence":
@@ -1879,7 +1920,7 @@ class LiveViewerWindow(pyglet.window.Window):
 
             # --- Input/Output Tab ---
             if imgui.begin_tab_item("Input/Output")[0]:
-                imgui.text("Input Source")
+                imgui.text_colored("Input Source", 0.8, 0.9, 1.0)
 
                 # --- Collapsing Headers for Input Modes ---
 
@@ -1890,6 +1931,8 @@ class LiveViewerWindow(pyglet.window.Window):
                     imgui.indent()
                     # Camera Index Input
                     changed_cam_idx, self.live_camera_index = imgui.input_int("Camera Index", self.live_camera_index if hasattr(self, 'live_camera_index') else 0, 1)
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Select which camera device to use")
                     # Activate Button
                     is_active = self.input_mode == "Live Camera" and self.inference_thread and self.inference_thread.is_alive()
                     if imgui.button("Activate##Live" if not is_active else "Stop##Live"):
@@ -1900,7 +1943,6 @@ class LiveViewerWindow(pyglet.window.Window):
                             print("DEBUG: Activating Live Camera...")
                             self.input_mode = "Live Camera"
                             self.input_filepath = "" # Clear path
-                            # TODO: Pass self.live_camera_index to start_inference_thread/init
                             self.start_inference_thread()
                     imgui.unindent()
 
@@ -1911,6 +1953,8 @@ class LiveViewerWindow(pyglet.window.Window):
                     imgui.indent()
                     if imgui.button("Browse File...##File"):
                         self._browse_file(browse_type="file")
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Select a video or image file")
                     imgui.same_line()
                     imgui.text(f"Path: {self.input_filepath if self.input_filepath else 'None selected'}")
                     # Activate Button
@@ -1920,13 +1964,15 @@ class LiveViewerWindow(pyglet.window.Window):
                         imgui.internal.push_item_flag(imgui.internal.ITEM_DISABLED, True)
                         imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.5)
                     if imgui.button("Activate##File" if not is_active else "Stop##File"):
-                         if is_active:
+                        if is_active:
                             print("DEBUG: Stopping File source...")
                             self.start_inference_thread() # Stops current thread
-                         elif not activate_disabled:
+                        elif not activate_disabled:
                             print("DEBUG: Activating File source...")
                             self.input_mode = "File (Video/Image)"
                             self.start_inference_thread()
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Start or stop processing the selected file")
                     if activate_disabled:
                         imgui.pop_style_var()
                         imgui.internal.pop_item_flag()
@@ -1939,6 +1985,8 @@ class LiveViewerWindow(pyglet.window.Window):
                     imgui.indent()
                     if imgui.button("Browse Directory...##GLB"):
                         self._browse_file(browse_type="directory")
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Choose a folder containing GLB files")
                     imgui.same_line()
                     imgui.text(f"Path: {self.input_filepath if self.input_filepath else 'None selected'}")
                     # Activate Button
@@ -1955,6 +2003,8 @@ class LiveViewerWindow(pyglet.window.Window):
                             print("DEBUG: Activating GLB Sequence...")
                             self.input_mode = "GLB Sequence"
                             self.start_inference_thread()
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Play or stop the GLB sequence")
                     if activate_disabled:
                         imgui.pop_style_var()
                         imgui.internal.pop_item_flag()
@@ -1971,6 +2021,8 @@ class LiveViewerWindow(pyglet.window.Window):
                     if not hasattr(self, 'selected_monitor_index'): self.selected_monitor_index = 1 # Default to primary
                     if self.selected_monitor_index >= len(monitors): self.selected_monitor_index = 1 # Ensure valid index
                     changed_monitor, self.selected_monitor_index = imgui.combo("Monitor", self.selected_monitor_index, monitor_names)
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Select which monitor to capture")
 
                     # Window Selection (Windows Only)
                     windows = _get_window_list()
@@ -1981,6 +2033,8 @@ class LiveViewerWindow(pyglet.window.Window):
                         try: current_window_index = next(i for i, (hwnd, _) in enumerate(windows, 1) if hwnd == self.selected_window_hwnd)
                         except StopIteration: self.selected_window_hwnd = 0 # Reset if window not found
                     changed_window, current_window_index = imgui.combo("Target Window", current_window_index, window_names)
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Capture a specific window or the entire monitor")
                     if changed_window: self.selected_window_hwnd = 0 if current_window_index == 0 else windows[current_window_index - 1][0]
 
                     # Activate Button
@@ -1993,7 +2047,6 @@ class LiveViewerWindow(pyglet.window.Window):
                             print("DEBUG: Activating Screen Capture...")
                             self.input_mode = "Screen Capture"
                             self.input_filepath = "" # Clear path
-                            # TODO: Pass self.selected_monitor_index and self.selected_window_hwnd
                             self.start_inference_thread()
                     imgui.unindent()
 
@@ -2019,7 +2072,6 @@ class LiveViewerWindow(pyglet.window.Window):
                         if self.inference_thread and self.inference_thread.is_alive():
                             print(f"Switching live processing mode to {self.live_processing_mode}, restarting thread...")
                             self.start_inference_thread()
-                    # Duplicate radio button logic removed here
 
                 imgui.separator()
                 imgui.text("Recording") # Keep recording section
@@ -2052,64 +2104,6 @@ class LiveViewerWindow(pyglet.window.Window):
 
                 # Model Selection moved here earlier
 
-                # Live Processing Mode (Only show if Live Camera is selected)
-                if self.input_mode == "Live":
-                    imgui.separator()
-                    imgui.text("Live Processing Mode:")
-                    mode_changed = False
-                    if imgui.radio_button("Real-time (Low Latency)", self.live_processing_mode == "Real-time"):
-                        if self.live_processing_mode != "Real-time":
-                            self.live_processing_mode = "Real-time"
-                            mode_changed = True
-                    imgui.same_line()
-                    if imgui.radio_button("Buffered (Process All Frames)", self.live_processing_mode == "Buffered"):
-                         if self.live_processing_mode != "Buffered":
-                            self.live_processing_mode = "Buffered"
-                            mode_changed = True
-                    if mode_changed:
-                        # Restart thread with new mode if it's currently running
-                        if self.inference_thread and self.inference_thread.is_alive():
-                            print(f"Switching live processing mode to {self.live_processing_mode}, restarting thread...")
-                            self.start_inference_thread()
-                    if imgui.radio_button("Buffered (Process All Frames)", self.live_processing_mode == "Buffered"):
-                         if self.live_processing_mode != "Buffered":
-                            self.live_processing_mode = "Buffered"
-                            mode_changed = True
-                    if mode_changed:
-                        # Restart thread with new mode if it's currently running
-                        if self.inference_thread and self.inference_thread.is_alive():
-                            print(f"Switching live processing mode to {self.live_processing_mode}, restarting thread...")
-                            self.start_inference_thread()
-
-                imgui.separator()
-                imgui.text("Recording")
-                rec_button_text = " Stop Recording " if self.is_recording else " Start Recording "
-                if imgui.button(rec_button_text):
-                    self.is_recording = not self.is_recording
-                    if self.is_recording:
-                        try:
-                            os.makedirs(self.recording_output_dir, exist_ok=True)
-                            self.recorded_frame_count = 0 # Reset counter
-                            self.status_message = f"Recording started to {self.recording_output_dir}"
-                        except Exception as e_dir:
-                            print(f"Error creating recording directory: {e_dir}")
-                            self.status_message = "Error creating recording dir!"
-                            self.is_recording = False # Abort recording
-                    else:
-                        self.status_message = f"Recording stopped. {self.recorded_frame_count} frames saved."
-                    self.update_recording_state() # Update thread state
-
-                imgui.same_line()
-                # Read recorded frame count from recording_state dict (updated by thread)
-                saved_count = self.recording_state.get("frames_saved", 0)
-                imgui.text(f"({saved_count} frames saved)")
-
-                changed_dir, self.recording_output_dir = imgui.input_text(
-                    "Output Dir", self.recording_output_dir, 256
-                )
-                if changed_dir and not self.recording_state.get("is_recording", False): # Update ref only if not recording
-                     self.update_recording_state()
-
                 imgui.separator()
                 imgui.text("Model Selection")
                 # --- Model Selection Combo ---
@@ -2134,15 +2128,18 @@ class LiveViewerWindow(pyglet.window.Window):
                         self.start_inference_thread() # Restart thread with new model
                     else:
                         print("DEBUG: Selected model is already active.")
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Reload the model with the chosen type")
                 # --- End Model Selection ---
 
                 imgui.end_tab_item()
             # --- End Input/Output Tab ---
 
             # --- Playback Tab (Conditional) ---
-            show_playback_tab = self.input_mode != "Live" and self.playback_state.get("total_frames", 0) > 0
+            show_playback_tab = self.input_mode != "Live Camera" and self.playback_state.get("total_frames", 0) > 0
             if show_playback_tab:
                 if imgui.begin_tab_item("Playback")[0]:
+                    imgui.text_colored("Playback Controls", 0.8, 0.9, 1.0)
                     play_button_text = " Pause " if self.is_playing else " Play  "
                     if imgui.button(play_button_text): # Button text based on self.is_playing
                         self.is_playing = not self.is_playing # Toggle local UI state variable
@@ -2173,6 +2170,7 @@ class LiveViewerWindow(pyglet.window.Window):
 
             # --- Processing Tab ---
             if imgui.begin_tab_item("Processing")[0]:
+                imgui.text_colored("Processing Settings", 0.9, 0.8, 0.6)
                 # Smoothing Section
                 imgui.text("Temporal Smoothing")
                 changed_smooth, self.enable_point_smoothing = imgui.checkbox("Enable##SmoothEnable", self.enable_point_smoothing)
@@ -2271,6 +2269,7 @@ class LiveViewerWindow(pyglet.window.Window):
 
             # --- Rendering Tab ---
             if imgui.begin_tab_item("Rendering")[0]:
+                imgui.text_colored("Rendering", 0.8, 0.8, 1.0)
                 imgui.text("Point Style")
                 if imgui.radio_button("Square##RenderMode", self.render_mode == 0): self.render_mode = 0
                 imgui.same_line()
@@ -2311,6 +2310,7 @@ class LiveViewerWindow(pyglet.window.Window):
 
             # --- Debug Tab ---
             if imgui.begin_tab_item("Debug")[0]:
+                imgui.text_colored("Debug Views", 1.0, 0.8, 0.6)
                 imgui.text("Show Debug Views:")
                 _, self.show_camera_feed = imgui.checkbox("Camera Feed", self.show_camera_feed)
                 _, self.show_depth_map = imgui.checkbox("Depth Map", self.show_depth_map)
@@ -2347,7 +2347,13 @@ class LiveViewerWindow(pyglet.window.Window):
                 imgui.same_line()
                 if imgui.button("Reset All Defaults"): self.reset_settings()
                 imgui.text(f"Settings File: viewer_settings.json")
-                # Could add more settings-related info here if needed
+                imgui.separator()
+                changed_theme, self.theme_index = imgui.combo("UI Theme", self.theme_index, THEME_OPTIONS)
+                if changed_theme:
+                    self.ui_theme = THEME_OPTIONS[self.theme_index]
+                    self.apply_theme()
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Select the color theme for the interface")
                 imgui.end_tab_item()
             # --- End Settings Tab ---
 
