@@ -184,7 +184,7 @@ def hex_to_imvec4(hex_color, alpha=1.0):
 
 
 # Simple shaders (Using 'vertices' instead of 'position')
-vertex_source = """#version 150 core
+vertex_source = '''#version 150 core
     in vec3 vertices;
     in vec3 colors; // Expects normalized floats (0.0-1.0)
 
@@ -206,6 +206,7 @@ vertex_source = """#version 150 core
     uniform bool enableMaxSizeClamp;// Toggle for max size clamp
     uniform float depthExponent;    // Exponent applied to depth for sizing
     uniform float sizeScaleFactor;  // Tunable scale factor for depth sizing
+    uniform bool planarProjectionActive; // NEW UNIFORM
 
     void main() {
         // Transform to view and clip space
@@ -215,44 +216,34 @@ vertex_source = """#version 150 core
         vertex_colors = colors;
 
         // --- Point Sizing based on INPUT Camera Distance (Inverse Square Law) and Density Compensation ---
-        // Calculate distance from the INPUT camera (origin in model space)
-        float inputDistance = length(vertices); // USE INPUT DISTANCE
-        inputDistance = max(inputDistance, 0.0001); // Avoid division by zero
+        float inputDistance = length(vertices);
+        inputDistance = max(inputDistance, 0.0001);
 
-        // Point size proportional to the square of the INPUT distance (inverse square law)
-        // We use an exponent of -2.0 for inverse square.
-        // The base size is adjusted by inputScaleFactor, sizeScaleFactor, and pointSizeBoost.
-        float baseSize = inputFocal * inputScaleFactor; // Base size related to input camera properties
-        // Use inputDistance for scaling instead of viewerDistance
-        float diameter = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, depthExponent); // Reinstated sizeScaleFactor
+        float baseSize = inputFocal * inputScaleFactor;
+        float diameter = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, depthExponent);
 
-        // Density compensation based on the original 360 projection (assuming spherical)
-        // Calculate normalized ray direction from INPUT camera to the point
-        vec3 inputRay = normalize(vertices); // USE INPUT RAY
-        // The Y-component of the normalized ray is sin(latitude).
-        // Note: vertices.y is DOWN in the original coordinate system before view transform.
-        // We use inputRay.y directly.
-        float cosInputLatitude = sqrt(1.0 - clamp(inputRay.y * inputRay.y, 0.0, 1.0)); // USE INPUT RAY
-        // Point size should be inversely proportional to the density, which is proportional to cos(latitude)
-        float densityCompensationFactor = 1.0 / max(1e-5, cosInputLatitude); // USE INPUT LATITUDE
+        float densityCompensationFactor = 1.0;
+        if (!planarProjectionActive) {
+            // Apply spherical density compensation only if not in planar projection mode
+            vec3 inputRay = normalize(vertices); 
+            float cosInputLatitude = sqrt(1.0 - clamp(inputRay.y * inputRay.y, 0.0, 1.0));
+            densityCompensationFactor = 1.0 / max(1e-5, cosInputLatitude);
+        }
 
-        diameter *= densityCompensationFactor; // Apply density compensation
+        diameter *= densityCompensationFactor;
 
-        // Apply minimum and optional maximum size clamp
         float finalSize = max(diameter, minPointSize);
         if (enableMaxSizeClamp) {
             finalSize = min(finalSize, maxPointSize);
         }
         gl_PointSize = finalSize;
 
-        // Assign debug values
         debug_inputDistance_out = inputDistance;
-        debug_rawDiameter_out = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, depthExponent); // Reinstated sizeScaleFactor
+        debug_rawDiameter_out = 2.0 * baseSize * sizeScaleFactor * pointSizeBoost * pow(inputDistance, depthExponent); 
         debug_densityFactor_out = densityCompensationFactor;
         debug_finalSize_out = finalSize;
-        // --- End Automatic Point Size Calculation ---
     }
-"""
+'''
 
 # Modified Fragment Shader with Controls
 fragment_source = """#version 150 core
@@ -466,9 +457,7 @@ texture_vertex_source = """#version 150 core
 texture_fragment_source = """#version 150 core
     in vec2 texCoord;
     out vec4 final_color;
-
     uniform sampler2D fboTexture;
-
     void main() {
         final_color = texture(fboTexture, texCoord);
     }
@@ -724,62 +713,307 @@ def _process_inference_results(predictions, rgb_frame_processed, device, edge_pa
     new_smoothed_mean_depth = smoothed_mean_depth
     new_smoothed_points_xyz = smoothed_points_xyz
     points_xyz = None # Initialize points_xyz
+    newly_calculated_bias_map_for_queue = None # New: For sending back captured bias
+    main_screen_coeff_viz_for_queue = None # New: For render_mode 3 main screen visualization
+
+    # --- Get WPT parameters and current render mode --- (New)
+    render_mode = edge_params_ref.get("render_mode", DEFAULT_SETTINGS["render_mode"])
+    wavelet_packet_type = edge_params_ref.get("wavelet_packet_type", DEFAULT_SETTINGS["wavelet_packet_type"])
+    wavelet_packet_window_size = edge_params_ref.get("wavelet_packet_window_size", DEFAULT_SETTINGS["wavelet_packet_window_size"])
+    # --- End WPT parameters ---
+
+    # --- Get bias map and toggle state --- 
+    apply_bias = edge_params_ref.get("apply_depth_bias", False)
+    bias_map = edge_params_ref.get("depth_bias_map", None)
+    # --- End Get bias --- 
 
     if predictions is None:
-        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz, newly_calculated_bias_map_for_queue, main_screen_coeff_viz_for_queue
 
     current_depth_map = None
+    raw_model_depth_for_bias_capture = None # Store raw depth before any modification
 
-    # Extract points or calculate from depth/rays
     if 'depth' in predictions:
-        current_depth_map = predictions['depth'].squeeze().float() # Ensure float type
-        H, W = current_depth_map.shape
+        current_depth_map = predictions['depth'].squeeze().float() # Get original depth
+        raw_model_depth_for_bias_capture = current_depth_map.clone() # Clone for potential bias capture
 
+        # --- Check for Bias Capture Trigger ---
+        pending_bias_capture_type = edge_params_ref.get("trigger_bias_capture", None)
+        if pending_bias_capture_type and raw_model_depth_for_bias_capture is not None:
+            print(f"INFO: Inference thread processing '{pending_bias_capture_type}' bias capture request.")
+            if pending_bias_capture_type == "mean_plane":
+                try:
+                    mean_val = torch.mean(raw_model_depth_for_bias_capture.float())
+                    flat_ref_plane = torch.full_like(raw_model_depth_for_bias_capture, mean_val)
+                    newly_calculated_bias_map_for_queue = raw_model_depth_for_bias_capture - flat_ref_plane
+                    print(f"  Inference: Raw Depth for Bias - Min: {torch.min(raw_model_depth_for_bias_capture):.3f}, Max: {torch.max(raw_model_depth_for_bias_capture):.3f}, Mean: {mean_val:.3f}")
+                    print(f"  Inference: Calculated Bias Map - Min: {torch.min(newly_calculated_bias_map_for_queue):.3f}, Max: {torch.max(newly_calculated_bias_map_for_queue):.3f}, Mean: {torch.mean(newly_calculated_bias_map_for_queue.float()):.3f}")
+                except Exception as e_capture:
+                    print(f"ERROR in inference thread during bias map calculation: {e_capture}")
+                    traceback.print_exc()
+                    newly_calculated_bias_map_for_queue = None # Ensure it's None on error
+            # Note: The trigger in edge_params_ref is not cleared here;
+            # it's managed by the main thread to be a one-shot signal.
+
+        # --- Apply Bias Correction (if enabled and valid) ---
+        if apply_bias and bias_map is not None and current_depth_map is not None:
+            if bias_map.shape == current_depth_map.shape:
+                # Ensure bias map is on the correct device before subtracting
+                if bias_map.device != current_depth_map.device:
+                    bias_map = bias_map.to(current_depth_map.device)
+                
+                original_min = torch.min(current_depth_map).item() # For debug
+                corrected_depth = current_depth_map - bias_map
+                # Ensure depth doesn't become non-positive
+                corrected_depth = torch.clamp(corrected_depth, min=0.01) 
+                corrected_min = torch.min(corrected_depth).item() # For debug
+                print(f"DEBUG: Applied depth bias. Original Min: {original_min:.3f}, Corrected Min: {corrected_min:.3f}")
+                current_depth_map = corrected_depth # Overwrite with corrected map
+            else:
+                print(f"Warning: Skipping bias correction - bias map shape {bias_map.shape} != current depth shape {current_depth_map.shape}")
+        # --- End Bias Correction ---
+
+        # --- Apply WPT if render_mode is 3 (Wavelet/FFT) --- (New)
+        if render_mode == 3 and current_depth_map is not None and current_depth_map.numel() > 0:
+            print("DEBUG: Applying WPT to current_depth_map for render_mode 3")
+            try:
+                original_depth_for_scaling = current_depth_map.clone() # Store original for scaling
+
+                d_in = current_depth_map.unsqueeze(0).unsqueeze(0) # Add batch and channel dims
+                # J = levels of decomposition
+                J = int(math.log2(max(1, wavelet_packet_window_size))) 
+                # Ensure J is not too large for the input size
+                min_dim = min(d_in.shape[-2], d_in.shape[-1])
+                max_J_possible = int(math.log2(min_dim)) if min_dim > 0 else 0
+                if J > max_J_possible:
+                    print(f"Warning: Requested J={J} for WPT is too large for depth map size ({d_in.shape[-2]}x{d_in.shape[-1]}). Clamping to J={max_J_possible}.")
+                    J = max_J_possible
+
+                if J > 0: # Only proceed if at least one level of decomposition is possible
+                    dwt_op = DWTForward(J=J, wave=wavelet_packet_type, mode='zero').to(device)
+                    idwt_op = DWTInverse(wave=wavelet_packet_type, mode='zero').to(device)
+                    Yl, Yh = dwt_op(d_in)
+                    wpt_processed_depth = idwt_op((Yl, Yh)).squeeze(0).squeeze(0)
+                    
+                    # --- NEW: Compute per-pixel WPT energy for Gaussian splatting ---
+                    # Use the highest-frequency subbands at the last level
+                    # Yh is a list of length J, each [B, C, 3, H, W] (LH, HL, HH)
+                    # We'll use the last level (finest scale)
+                    lh = Yh[-1][0, 0, 0, :, :].abs().cpu().numpy() # LH
+                    hl = Yh[-1][0, 0, 1, :, :].abs().cpu().numpy() # HL
+                    hh = Yh[-1][0, 0, 2, :, :].abs().cpu().numpy() # HH
+                    # Energy (sum of squares)
+                    energy = (lh**2 + hl**2 + hh**2)
+                    # Normalize energy for size/opacity
+                    energy_norm = (energy - energy.min()) / (energy.max() - energy.min() + 1e-7)
+                    # Map to reasonable size/opacity ranges
+                    size_map = 2.0 + 8.0 * energy_norm # [2, 10] pixels
+                    opacity_map = 0.2 + 0.8 * energy_norm # [0.2, 1.0]
+                    # Color: map LH, HL, HH to RGB (normalize for display)
+                    lh_n = (lh - lh.min()) / (lh.max() - lh.min() + 1e-7)
+                    hl_n = (hl - hl.min()) / (hl.max() - hl.min() + 1e-7)
+                    hh_n = (hh - hh.min()) / (hh.max() - hh.min() + 1e-7)
+                    color_map = np.stack([lh_n, hl_n, hh_n], axis=-1)
+                    # Points: get 3D positions as before
+                    H, W = current_depth_map.shape
+                    input_fov_deg = edge_params_ref.get('input_camera_fov', 60.0)
+                    fov_y_rad = math.radians(input_fov_deg)
+                    f_y = H / (2 * math.tan(fov_y_rad / 2.0))
+                    f_x = f_y
+                    cx = W / 2.0
+                    cy = H / 2.0
+                    jj, ii = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+                    depth_values = current_depth_map.cpu().numpy()
+                    X_cam = (ii + 0.5 - cx) * depth_values / f_x
+                    Y_cam = (jj + 0.5 - cy) * depth_values / f_y
+                    Z_cam = depth_values
+                    points_xyz = np.stack([X_cam, Y_cam, Z_cam], axis=-1)
+                    # Flatten all for splatting
+                    points_xyz_np_processed = points_xyz.reshape(-1, 3)
+                    colors_np_processed = color_map.reshape(-1, 3)
+                    sizes_np_processed = size_map.flatten()
+                    opacities_np_processed = opacity_map.flatten()
+                    num_vertices = points_xyz_np_processed.shape[0]
+                    # Store for queue (add to return tuple at end)
+                    # Also update main_screen_coeff_viz_for_queue as before
+                    coeff_viz_bgr_np = cv2.merge((hh_n, hl_n, lh_n))
+                    coeff_viz_bgr_np = (coeff_viz_bgr_np * 255).astype(np.uint8)
+                    main_screen_coeff_viz_for_queue = coeff_viz_bgr_np
+                else:
+                    print("Warning: Cannot apply WPT, J (levels) is 0 or less.")
+            except ImportError:
+                print("ERROR: pytorch_wavelets not available for WPT processing. Skipping.")
+            except Exception as e_wpt:
+                print(f"ERROR during WPT processing: {e_wpt}")
+                traceback.print_exc()
+        # --- End WPT Application ---
+
+        # --- Check current_depth_map state before CoeffViz ---
+        if render_mode == 3:
+            if current_depth_map is not None:
+                print(f"DEBUG CoeffViz Pre-Check: current_depth_map exists. Shape: {current_depth_map.shape}, Numel: {current_depth_map.numel()}, Device: {current_depth_map.device}")
+            else:
+                print("DEBUG CoeffViz Pre-Check: current_depth_map is None before attempting CoeffViz.")
+        # --- End Check ---
+
+        # --- Start: Generate Coefficient Visualization if render_mode == 3 ---
+        if render_mode == 3 and current_depth_map is not None and current_depth_map.numel() > 0:
+            print("DEBUG CoeffViz: Entered block for render_mode 3.")
+            try:
+                wavelet_type_viz = edge_params_ref.get("wavelet_packet_type", DEFAULT_SETTINGS["wavelet_packet_type"])
+                J_viz = 1 
+                
+                temp_h, temp_w = current_depth_map.shape
+                print(f"DEBUG CoeffViz: current_depth_map shape: {temp_h}x{temp_w}")
+                min_dim_viz = min(temp_h, temp_w)
+                max_J_possible_viz = int(math.log2(min_dim_viz)) if min_dim_viz > 0 else 0
+                actual_J_viz = min(J_viz, max_J_possible_viz)
+                print(f"DEBUG CoeffViz: J_viz={J_viz}, actual_J_viz={actual_J_viz}")
+
+                if actual_J_viz > 0:
+                    dwt_op_viz = DWTForward(J=actual_J_viz, wave=wavelet_type_viz, mode='zero').to(device)
+                    depth_tensor_for_dwt = current_depth_map.unsqueeze(0).unsqueeze(0) 
+                    _, Yh_viz = dwt_op_viz(depth_tensor_for_dwt) 
+
+                    lh_coeffs = Yh_viz[0][0, 0, 0, :, :] 
+                    hl_coeffs = Yh_viz[0][0, 0, 1, :, :]
+                    hh_coeffs = Yh_viz[0][0, 0, 2, :, :]
+                    print(f"DEBUG CoeffViz: Coeff shapes: LH={lh_coeffs.shape}, HL={hl_coeffs.shape}, HH={hh_coeffs.shape}")
+
+                    target_size_viz = (frame_h, frame_w) 
+                    print(f"DEBUG CoeffViz: Target viz size: {target_size_viz}")
+
+                    def process_coeff_band_for_viz(band_tensor_func):
+                        resized_band = torch.nn.functional.interpolate(
+                            band_tensor_func.unsqueeze(0).unsqueeze(0), 
+                            size=target_size_viz, mode='bilinear', align_corners=False
+                        ).squeeze().cpu().numpy()
+                        min_v, max_v = np.min(resized_band), np.max(resized_band)
+                        norm_band = (resized_band - min_v) / (max_v - min_v + 1e-7) if (max_v - min_v) > 1e-7 else np.zeros_like(resized_band)
+                        return (norm_band * 255).astype(np.uint8)
+
+                    r_c = process_coeff_band_for_viz(torch.abs(lh_coeffs))
+                    g_c = process_coeff_band_for_viz(torch.abs(hl_coeffs))
+                    b_c = process_coeff_band_for_viz(torch.abs(hh_coeffs))
+                    print(f"DEBUG CoeffViz: Processed band shapes: R={r_c.shape}, G={g_c.shape}, B={b_c.shape}")
+                    
+                    coeff_viz_bgr_np = cv2.merge((b_c, g_c, r_c))
+
+                    depth_for_mod_np_viz = current_depth_map.cpu().numpy()
+                    min_d_viz, max_d_viz = np.min(depth_for_mod_np_viz), np.max(depth_for_mod_np_viz)
+                    norm_depth_mod_viz = (depth_for_mod_np_viz - min_d_viz) / (max_d_viz - min_d_viz + 1e-7) if (max_d_viz - min_d_viz) > 1e-7 else np.ones_like(depth_for_mod_np_viz)
+                    
+                    final_viz_bgr_np = coeff_viz_bgr_np * norm_depth_mod_viz[:, :, np.newaxis]
+                    main_screen_coeff_viz_for_queue = np.clip(final_viz_bgr_np, 0, 255).astype(np.uint8)
+                    print(f"DEBUG CoeffViz: Successfully generated main_screen_coeff_viz_for_queue with shape {main_screen_coeff_viz_for_queue.shape}")
+                else:
+                    print("DEBUG CoeffViz: actual_J_viz <= 0. Cannot generate coefficient viz.")
+                    main_screen_coeff_viz_for_queue = None # Explicitly set to None
+            except Exception as e_coeff_viz:
+                print(f"ERROR CoeffViz: Error generating coefficient visualization for main screen: {e_coeff_viz}")
+                traceback.print_exc()
+                main_screen_coeff_viz_for_queue = None # Ensure it's None on error
+        else:
+            if render_mode == 3: # Only print this if mode is 3 but other conditions failed
+                 print(f"DEBUG CoeffViz: Skipped main screen coeff viz. current_depth_map valid: {current_depth_map is not None and current_depth_map.numel() > 0}")
+            main_screen_coeff_viz_for_queue = None # Ensure it is None if not render_mode 3 or depth invalid
+        # --- End: Generate Coefficient Visualization --- 
+
+        # Now proceed with planar or spherical projection using the (potentially WPT-processed or bias-corrected) current_depth_map
         if edge_params_ref.get('planar_projection', False):
-            # --- Pinhole Unprojection ---
+            H_orig, W_orig = (480,640)
+            if current_depth_map is not None:
+                 H_orig, W_orig = current_depth_map.shape
+            # else: # No need for the print here if we are not forcing depth
+                 # print(f"DIAGNOSTIC: Planar mode, but no initial depth from model. Using default H,W: {H_orig}x{W_orig}")
+
+            # --- REMOVE FORCED CONSTANT DEPTH FOR PLANAR CASE ---
+            # forced_depth_value_planar = 5.0
+            # print(f"DIAGNOSTIC: Planar mode - Forcing constant depth: {forced_depth_value_planar}")
+            # current_depth_map = torch.full((H_orig, W_orig), forced_depth_value_planar, device=device, dtype=torch.float32)
+            # H, W = current_depth_map.shape 
+            # --- END REMOVAL ---
+            # Ensure H, W are from the actual current_depth_map if it exists, else use defaults for grid gen if needed (though it should exist if 'depth' in predictions)
+            if current_depth_map is not None:
+                H, W = current_depth_map.shape
+            else: # Should not happen if 'depth' in predictions, but as a fallback for H,W if current_depth_map became None unexpectedly
+                H, W = H_orig, W_orig 
+            
             input_fov_deg = edge_params_ref.get('input_camera_fov', 60.0)
-            # Ensure calculations are done with tensors on the correct device and dtype
+            # --- Safeguard for None FOV value from ref dict --- 
+            if input_fov_deg is None:
+                 print("WARNING: input_fov_deg was None in edge_params_ref! Defaulting to 60.0.")
+                 input_fov_deg = 60.0
+            # --- End Safeguard ---
+
             fov_y_rad = torch.tensor(math.radians(input_fov_deg), device=device, dtype=torch.float32)
-
             f_y = H / (2 * torch.tan(fov_y_rad / 2.0))
-            f_x = f_y # Assume square pixels for simplicity, common in many sensors
-
+            f_x = f_y 
             cx = torch.tensor(W / 2.0, device=device, dtype=torch.float32)
             cy = torch.tensor(H / 2.0, device=device, dtype=torch.float32)
-
-            # Create pixel coordinate grid
-            jj = torch.arange(0, H, device=device, dtype=torch.float32) # Rows
-            ii = torch.arange(0, W, device=device, dtype=torch.float32) # Cols
-            
-            # grid_y will have shape (H, W) with values from 0 to H-1 varying along rows
-            # grid_x will have shape (H, W) with values from 0 to W-1 varying along columns
+            jj = torch.arange(0, H, device=device, dtype=torch.float32)
+            ii = torch.arange(0, W, device=device, dtype=torch.float32)
             grid_y, grid_x = torch.meshgrid(jj, ii, indexing='ij')
-
-            depth_values = current_depth_map # Z in camera space
-
-            X_cam = (grid_x - cx) * depth_values / f_x
-            Y_cam = (grid_y - cy) * depth_values / f_y # This Y is positive downwards
+            depth_values = current_depth_map # This will now be the model's actual depth
+            X_cam = (grid_x + 0.5 - cx) * depth_values / f_x
+            Y_cam = (grid_y + 0.5 - cy) * depth_values / f_y 
             Z_cam = depth_values
+            points_xyz = torch.stack([X_cam, Y_cam, Z_cam], dim=-1)
 
-            points_xyz = torch.stack([X_cam, Y_cam, Z_cam], dim=-1) # Shape (H, W, 3)
-            # This points_xyz is in (+X Right, +Y Down, +Z Forward) convention
-            # --- End Pinhole Unprojection ---
         elif 'rays' in predictions:
-            # Use original UniK3D rays if planar projection is OFF
             rays = predictions['rays'].squeeze()
-            if rays.ndim == 3 and rays.shape[0] == 3: # Check if it's C, H, W
-                rays = rays.permute(1, 2, 0) # Convert to H, W, C
+            if rays.ndim == 3 and rays.shape[0] == 3:
+                rays = rays.permute(1, 2, 0)
             
-            if current_depth_map.shape == rays.shape[:2]:
+            if rays is not None and rays.numel() > 0 and rays.ndim == 3 and rays.shape[-1] == 3:
+                rays_norm_val = torch.norm(rays, p=2, dim=-1, keepdim=True)
+                rays_norm_val[rays_norm_val < 1e-6] = 1e-6 
+                rays = rays / rays_norm_val # Corrected variable name
+            
+            # --- DIAGNOSTIC: Force constant depth for spherical case ---
+            forced_depth_value_spherical = 5.0 
+            # Determine shape for the forced depth map
+            H_sph, W_sph = (480,640) # Default if rays or original current_depth_map is None
+            if current_depth_map is not None:
+                H_sph, W_sph = current_depth_map.shape
+                print(f"DIAGNOSTIC: Spherical mode - Overriding model depth with constant {forced_depth_value_spherical}")
+            elif rays is not None and rays.ndim ==3: # If no depth from model, but we have rays
+                H_sph, W_sph, _ = rays.shape
+                print(f"DIAGNOSTIC: Spherical mode - Model provided no depth, creating constant depth {forced_depth_value_spherical} based on ray dimensions.")
+            else:
+                 print(f"DIAGNOSTIC: Spherical mode - Cannot determine shape for forced depth. Skipping override.")
+            
+            # Only override/create if we have a valid shape
+            if H_sph > 0 and W_sph > 0:
+                 current_depth_map = torch.full((H_sph, W_sph), forced_depth_value_spherical, device=device, dtype=torch.float32)
+            # --- END DIAGNOSTIC ---
+
+            if current_depth_map is not None and rays is not None and current_depth_map.shape == rays.shape[:2]:
                 depth_to_multiply = current_depth_map.unsqueeze(-1)
                 points_xyz = rays * depth_to_multiply
             else:
-                print(f"Warning: Spherical rays shape {rays.shape} and depth map shape {current_depth_map.shape} mismatch.")
-                # points_xyz remains None
+                print(f"Warning: Spherical rays shape {rays.shape if rays is not None else 'N/A'} and overridden/original depth map shape {current_depth_map.shape if current_depth_map is not None else 'N/A'} mismatch or depth missing.")
         else:
-            # Fallback if no rays and planar is off
             print("Warning: Depth map present but no UniK3D rays found and planar projection is off. Cannot generate points from depth.")
-            # points_xyz remains None
+    elif 'rays' in predictions: # Only rays, no depth from model initially for spherical case
+        print("DIAGNOSTIC: Only rays found, no initial depth. Spherical mode will use forced constant depth.")
+        rays = predictions['rays'].squeeze()
+        if rays.ndim == 3 and rays.shape[0] == 3:
+            rays = rays.permute(1, 2, 0)
+        
+        if rays is not None and rays.numel() > 0 and rays.ndim == 3 and rays.shape[-1] == 3:
+            rays_norm_val = torch.norm(rays, p=2, dim=-1, keepdim=True)
+            rays_norm_val[rays_norm_val < 1e-6] = 1e-6 
+            rays = rays / rays_norm_val
+
+            forced_depth_value_spherical_no_init_depth = 5.0
+            H_rays, W_rays, _ = rays.shape
+            current_depth_map_generated = torch.full((H_rays, W_rays), forced_depth_value_spherical_no_init_depth, device=device, dtype=torch.float32)
+            depth_to_multiply = current_depth_map_generated.unsqueeze(-1)
+            points_xyz = rays * depth_to_multiply
+            print(f"DIAGNOSTIC: Spherical - generated points with forced depth {forced_depth_value_spherical_no_init_depth}")
+        else:
+            print("Warning: Only rays found, but rays are invalid.")
 
     elif "points" in predictions: # If model directly outputs points (e.g. GLB direct load)
         points_xyz = predictions["points"]
@@ -795,7 +1029,7 @@ def _process_inference_results(predictions, rgb_frame_processed, device, edge_pa
 
     if points_xyz is None or points_xyz.numel() == 0:
         print("Warning: No valid points generated from predictions.")
-        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz
+        return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz, newly_calculated_bias_map_for_queue, main_screen_coeff_viz_for_queue
 
     # --- Edge Detection & Depth Processing (Run for all modes now) ---
     combined_edge_map = None
@@ -1028,7 +1262,10 @@ def _process_inference_results(predictions, rgb_frame_processed, device, edge_pa
     # ... (Remove this fallback) ...
 
     # Return processed points, colors, counts, and debug maps
-    return points_xyz_np_processed, colors_np_processed, num_vertices, scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz # Note: returning original smoothed points for next frame's smoothing
+    return points_xyz_np_processed, colors_np_processed, num_vertices, \
+           scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, \
+           new_prev_depth_map, new_smoothed_mean_depth, new_smoothed_points_xyz, \
+           newly_calculated_bias_map_for_queue, main_screen_coeff_viz_for_queue # Added new viz content
 
 
 def _handle_recording(points_xyz_np, colors_np, recording_state_ref, sequence_frame_index, recorded_frame_counter, is_video, is_glb_sequence, data_queue):
@@ -1058,11 +1295,11 @@ def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices,
                    rgb_frame_orig, scaled_depth_map_for_queue, edge_map_viz,
                    smoothing_map_viz, t_capture, sequence_frame_index,
                    video_total_frames, current_recorded_count, frame_count,
-                   frame_read_delta_t, depth_process_delta_t, latency_ms):
+                   frame_read_delta_t, depth_process_delta_t, latency_ms,
+                   newly_calculated_bias_map_for_main_thread, # Existing last custom item
+                   main_screen_coeff_viz_content): # New item for coeff viz
     """Puts the processed data into the queue for the main thread."""
     if not data_queue.full():
-            # Add frame_count back to the tuple if needed by receiver (currently not)
-            # For now, keep it out of the tuple to match _process_queue_data
             data_queue.put((vertices_flat, colors_flat, num_vertices,
                             rgb_frame_orig,
                             scaled_depth_map_for_queue,
@@ -1072,12 +1309,11 @@ def _queue_results(data_queue, vertices_flat, colors_flat, num_vertices,
                             sequence_frame_index,
                             video_total_frames,
                             current_recorded_count,
-                            frame_read_delta_t, depth_process_delta_t, latency_ms))
+                            frame_read_delta_t, depth_process_delta_t, latency_ms,
+                            newly_calculated_bias_map_for_main_thread,
+                            main_screen_coeff_viz_content)) # Added new item
     else:
-        # Use frame_count in the warning message again
         print(f"Warning: Viewer queue full, dropping frame {frame_count}.")
-        # Optionally put a status message instead of dropping silently
-        # data_queue.put(("status", f"Viewer queue full, dropping frame {frame_count}"))
 
 
 # --- Main Inference Thread Function ---
@@ -1397,7 +1633,8 @@ def inference_thread_func(data_queue, exit_event,
                 data_queue.put(("status", f"Processing results for frame {frame_count}..."))
                 points_xyz_np_processed, colors_np_processed, num_vertices, \
                 scaled_depth_map_for_queue, edge_map_viz, smoothing_map_viz, \
-                prev_depth_map, smoothed_mean_depth, smoothed_points_xyz = \
+                prev_depth_map, smoothed_mean_depth, smoothed_points_xyz, \
+                newly_calculated_bias_map_for_queue, main_screen_coeff_viz_for_queue = \
                     _process_inference_results(predictions, rgb_frame_processed, device,
                                                edge_params_ref, prev_depth_map,
                                                smoothed_mean_depth, smoothed_points_xyz,
@@ -1429,7 +1666,10 @@ def inference_thread_func(data_queue, exit_event,
                                rgb_frame_orig, scaled_depth_map_for_queue, edge_map_viz,
                                smoothing_map_viz, t_capture, sequence_frame_index,
                                video_total_frames, recorded_frame_counter, frame_count,
-                               frame_read_delta_t, depth_process_delta_t, latency_ms) # Pass timing
+                               frame_read_delta_t, depth_process_delta_t, latency_ms,
+                               newly_calculated_bias_map_for_queue, # Pass existing bias map
+                               main_screen_coeff_viz_for_queue)      # Pass new coeff viz numpy
+            print(f"DEBUG: Queuing {num_vertices if vertices_flat is not None else 0} vertices (frame {frame_count}).") 
 
             # Short sleep for live mode to prevent busy loop
             if is_video and input_mode == "Live":
@@ -1564,6 +1804,7 @@ class LiveViewerWindow(pyglet.window.Window):
         self.latest_depth_map_viz = None
         self.latest_edge_map = None
         self.latest_smoothing_map = None
+        self.latest_wavelet_map = None # Initialize latest_wavelet_map
         self.camera_texture = None
         self.depth_texture = None
         self.edge_texture = None
@@ -1720,7 +1961,7 @@ class LiveViewerWindow(pyglet.window.Window):
         print("DEBUG: LiveViewerWindow.__init__ - End") # Added print
 
         # Prepare depth history buffer for Wavelet/FFT
-        self.depth_history = deque(maxlen=self.dmd_time_window)
+        self.depth_history = deque(maxlen=DEFAULT_SETTINGS["dmd_time_window"]) # Use default initially
         self.latest_depth_tensor = None  # Latest raw depth tensor on GPU
 
         # --- Set up a default VAO so ImGui can bind/unbind safely ---
@@ -1734,6 +1975,68 @@ class LiveViewerWindow(pyglet.window.Window):
         self.orthographic_size = None
         # Planar ray generation toggle
         self.planar_projection = None
+
+        # --- Calibration State ---
+        self.depth_bias_map = None # Stores the calculated bias tensor (device tensor)
+        self.apply_depth_bias = False # Toggle for applying the correction
+        self.latest_depth_tensor_for_calib = None # Store the raw tensor used for last calc
+        self.pending_bias_capture_request = None # New: For triggering bias capture in inference thread
+
+        # --- Texture Shader for Full-Screen Quad (Wavelet/FFT Mode) --- (New)
+        self.texture_shader_program = None
+        self.texture_quad_vao = None
+        self.texture_quad_vbo = None
+        try:
+            print("DEBUG: Creating texture quad shaders...")
+            texture_vert_shader = pyglet.graphics.shader.Shader(texture_vertex_source, 'vertex')
+            texture_frag_shader = pyglet.graphics.shader.Shader(texture_fragment_source, 'fragment')
+            self.texture_shader_program = pyglet.graphics.shader.ShaderProgram(texture_vert_shader, texture_frag_shader)
+            print("DEBUG: Texture quad shader program created.")
+
+            # Quad vertices (x, y) and texture coordinates (s, t)
+            quad_vertices = [
+                # pos    # tex
+                -1, -1,  0, 0,
+                 1, -1,  1, 0,
+                -1,  1,  0, 1,
+                 1,  1,  1, 1,
+            ]
+            quad_vertices_gl = (gl.GLfloat * len(quad_vertices))(*quad_vertices)
+
+            self.texture_quad_vbo = gl.GLuint()
+            gl.glGenBuffers(1, self.texture_quad_vbo)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.texture_quad_vbo)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, len(quad_vertices) * 4, quad_vertices_gl, gl.GL_STATIC_DRAW)
+
+            self.texture_quad_vao = gl.GLuint()
+            gl.glGenVertexArrays(1, self.texture_quad_vao)
+            gl.glBindVertexArray(self.texture_quad_vao)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.texture_quad_vbo) # Bind VBO before vertex_attrib_pointer
+
+            # Position attribute
+            pos_attrib = self.texture_shader_program['position'].location
+            gl.glEnableVertexAttribArray(pos_attrib)
+            gl.glVertexAttribPointer(pos_attrib, 2, gl.GL_FLOAT, gl.GL_FALSE, 4 * 4, 0) # Stride is 4 floats, offset 0
+            # Texture coordinate attribute
+            tex_coord_attrib = self.texture_shader_program['texCoord_in'].location
+            gl.glEnableVertexAttribArray(tex_coord_attrib)
+            gl.glVertexAttribPointer(tex_coord_attrib, 2, gl.GL_FLOAT, gl.GL_FALSE, 4 * 4, 2 * 4) # Stride 4 floats, offset 2 floats
+
+            gl.glBindVertexArray(0) # Unbind VAO
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0) # Unbind VBO
+            print("DEBUG: Texture quad VAO/VBO created.")
+
+        except pyglet.graphics.shader.ShaderException as e:
+            print(f"FATAL: Texture quad shader compilation error: {e}")
+            traceback.print_exc()
+            pyglet.app.exit()
+            return
+        except Exception as e_tex_shader:
+            print(f"FATAL: Error during texture quad shader setup: {e_tex_shader}")
+            traceback.print_exc()
+            pyglet.app.exit()
+            return
+        # --- End Texture Shader Setup ---
 
     def create_debug_textures(self):
         """Creates or re-creates textures for debug views."""
@@ -1749,6 +2052,12 @@ class LiveViewerWindow(pyglet.window.Window):
             except: pass
         if hasattr(self, 'smoothing_texture') and self.smoothing_texture:
             try: gl.glDeleteTextures(1, self.smoothing_texture)
+            except: pass
+        if hasattr(self, 'wavelet_texture') and self.wavelet_texture: # Main screen WPT viz texture
+            try: gl.glDeleteTextures(1, self.wavelet_texture)
+            except: pass
+        if hasattr(self, 'imgui_wavelet_debug_texture') and self.imgui_wavelet_debug_texture: # ImGui WPT debug texture
+            try: gl.glDeleteTextures(1, self.imgui_wavelet_debug_texture)
             except: pass
 
         # Create textures (using window size initially, will resize in update)
@@ -1802,6 +2111,18 @@ class LiveViewerWindow(pyglet.window.Window):
         self.wavelet_texture_height = height
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
+        # Create texture for ImGui Wavelet/FFT debug output
+        self.imgui_wavelet_debug_texture = gl.GLuint()
+        gl.glGenTextures(1, self.imgui_wavelet_debug_texture)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.imgui_wavelet_debug_texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, width, height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+        # Storing separate dimensions for this texture might be useful if it can differ from wavelet_texture
+        self.imgui_wavelet_debug_texture_width = width 
+        self.imgui_wavelet_debug_texture_height = height
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
         self.debug_textures_initialized = True
         print("DEBUG: Debug textures created/recreated.")
@@ -1838,17 +2159,17 @@ class LiveViewerWindow(pyglet.window.Window):
         self._exit_event = threading.Event()
 
         # Ensure refs are initialized
-        if not hasattr(self, 'scale_factor_ref') or self.scale_factor_ref is None:
-            self.scale_factor_ref = [self.input_scale_factor]
-        if not hasattr(self, 'edge_params_ref') or not self.edge_params_ref: # Keep ref name for dict itself
-             self._update_edge_params()
-        if not hasattr(self, 'playback_state') or not self.playback_state:
-             self.update_playback_state() # Initialize playback state
-        if not hasattr(self, 'recording_state') or not self.recording_state:
-             self.update_recording_state() # Initialize recording state
+        # self.scale_factor_ref and self.edge_params_ref initialized in load_settings / _update_edge_params
+        self._update_edge_params() # Call this to ensure edge_params_ref is current
+        self.update_playback_state() # Initialize playback state
+        self.update_recording_state() # Initialize recording state
         # Ensure screen capture index attribute exists
         if not hasattr(self, 'screen_capture_monitor_index'):
             self.screen_capture_monitor_index = DEFAULT_SETTINGS['screen_capture_monitor_index']
+        # Ensure scale_factor_ref is initialized if not done by load_settings -> _update_edge_params path
+        if not hasattr(self, 'scale_factor_ref') or self.scale_factor_ref is None:
+            self.scale_factor_ref = [getattr(self, 'input_scale_factor', DEFAULT_SETTINGS['input_scale_factor'])]
+
 
         # Start new thread with current settings, including monitor index
         self.inference_thread = threading.Thread(
@@ -1872,28 +2193,51 @@ class LiveViewerWindow(pyglet.window.Window):
         self.status_message = f"Starting {self.input_mode}..."
 
     def _update_edge_params(self):
-        """Updates the dictionary passed to the inference thread."""
-        self.edge_params_ref["enable_point_smoothing"] = self.enable_point_smoothing
-        self.edge_params_ref["min_alpha_points"] = self.min_alpha_points
-        self.edge_params_ref["max_alpha_points"] = self.max_alpha_points
-        self.edge_params_ref["enable_edge_aware"] = self.enable_edge_aware_smoothing
-        self.edge_params_ref["depth_threshold1"] = int(self.depth_edge_threshold1)
-        self.edge_params_ref["depth_threshold2"] = int(self.depth_edge_threshold2)
-        self.edge_params_ref["rgb_threshold1"] = int(self.rgb_edge_threshold1)
-        self.edge_params_ref["rgb_threshold2"] = int(self.rgb_edge_threshold2)
-        self.edge_params_ref["influence"] = self.edge_smoothing_influence
-        self.edge_params_ref["gradient_influence_scale"] = self.gradient_influence_scale
-        self.edge_params_ref["enable_sharpening"] = self.enable_sharpening
-        self.edge_params_ref["sharpness"] = self.sharpness
-        # Add thickening params
-        self.edge_params_ref["enable_point_thickening"] = self.enable_point_thickening
-        self.edge_params_ref["thickening_duplicates"] = int(self.thickening_duplicates) # Ensure int
-        self.edge_params_ref["thickening_variance"] = self.thickening_variance
-        self.edge_params_ref["thickening_depth_bias"] = self.thickening_depth_bias
-        # Planar vs spherical projection toggle
-        self.edge_params_ref["planar_projection"] = self.planar_projection
-        # Pass input_camera_fov for planar ray calculation
-        self.edge_params_ref["input_camera_fov"] = self.input_camera_fov if self.input_camera_fov is not None else DEFAULT_SETTINGS["input_camera_fov"]
+        """Updates the dictionary passed to the inference thread. Uses getattr for safety during init."""
+        # Use getattr for potentially missing attributes during initialization, defaulting to DEFAULT_SETTINGS values
+        self.edge_params_ref["enable_point_smoothing"] = getattr(self, "enable_point_smoothing", DEFAULT_SETTINGS["enable_point_smoothing"])
+        self.edge_params_ref["min_alpha_points"] = getattr(self, "min_alpha_points", DEFAULT_SETTINGS["min_alpha_points"])
+        self.edge_params_ref["max_alpha_points"] = getattr(self, "max_alpha_points", DEFAULT_SETTINGS["max_alpha_points"])
+        self.edge_params_ref["enable_edge_aware"] = getattr(self, "enable_edge_aware_smoothing", DEFAULT_SETTINGS["enable_edge_aware_smoothing"])
+        # Ensure thresholds are integers after getting the value
+        self.edge_params_ref["depth_threshold1"] = int(getattr(self, "depth_edge_threshold1", DEFAULT_SETTINGS["depth_edge_threshold1"]))
+        self.edge_params_ref["depth_threshold2"] = int(getattr(self, "depth_edge_threshold2", DEFAULT_SETTINGS["depth_edge_threshold2"]))
+        self.edge_params_ref["rgb_threshold1"] = int(getattr(self, "rgb_edge_threshold1", DEFAULT_SETTINGS["rgb_edge_threshold1"]))
+        self.edge_params_ref["rgb_threshold2"] = int(getattr(self, "rgb_edge_threshold2", DEFAULT_SETTINGS["rgb_edge_threshold2"]))
+        
+        self.edge_params_ref["influence"] = getattr(self, "edge_smoothing_influence", DEFAULT_SETTINGS["edge_smoothing_influence"])
+        self.edge_params_ref["gradient_influence_scale"] = getattr(self, "gradient_influence_scale", DEFAULT_SETTINGS["gradient_influence_scale"])
+        self.edge_params_ref["enable_sharpening"] = getattr(self, "enable_sharpening", DEFAULT_SETTINGS["enable_sharpening"])
+        self.edge_params_ref["sharpness"] = getattr(self, "sharpness", DEFAULT_SETTINGS["sharpness"])
+        
+        # Thickening params
+        self.edge_params_ref["enable_point_thickening"] = getattr(self, "enable_point_thickening", DEFAULT_SETTINGS["enable_point_thickening"])
+        self.edge_params_ref["thickening_duplicates"] = int(getattr(self, "thickening_duplicates", DEFAULT_SETTINGS["thickening_duplicates"]))
+        self.edge_params_ref["thickening_variance"] = getattr(self, "thickening_variance", DEFAULT_SETTINGS["thickening_variance"])
+        self.edge_params_ref["thickening_depth_bias"] = getattr(self, "thickening_depth_bias", DEFAULT_SETTINGS["thickening_depth_bias"])
+        
+        # Projection params
+        self.edge_params_ref["planar_projection"] = getattr(self, "planar_projection", DEFAULT_SETTINGS["planar_projection"])
+        self.edge_params_ref["input_camera_fov"] = getattr(self, "input_camera_fov", DEFAULT_SETTINGS["input_camera_fov"])
+
+        # --- Calibration Params (using getattr with appropriate defaults) ---
+        self.edge_params_ref["apply_depth_bias"] = getattr(self, "apply_depth_bias", False) # Default to False if attr missing
+        self.edge_params_ref["depth_bias_map"] = getattr(self, "depth_bias_map", None)     # Default to None if attr missing
+        # --- End Calibration Params ---
+
+        # --- Add Render Mode --- (New)
+        self.edge_params_ref["render_mode"] = getattr(self, "render_mode", DEFAULT_SETTINGS["render_mode"])
+        # --- End Add Render Mode ---
+
+        # --- Bias Capture Trigger ---
+        if hasattr(self, 'pending_bias_capture_request') and self.pending_bias_capture_request:
+            self.edge_params_ref["trigger_bias_capture"] = self.pending_bias_capture_request
+            self.pending_bias_capture_request = None # Consume the request for next update cycle
+            print(f"DEBUG: _update_edge_params - Added trigger_bias_capture: {self.edge_params_ref['trigger_bias_capture']}")
+        else:
+            # Ensure the trigger is not sticky if not actively requested in this cycle
+            self.edge_params_ref.pop("trigger_bias_capture", None)
+        # --- End Bias Capture Trigger ---
 
     def update_playback_state(self):
         """Updates the playback state dictionary passed to the inference thread."""
@@ -1920,7 +2264,11 @@ class LiveViewerWindow(pyglet.window.Window):
             smoothing_map_viz_np, t_capture, \
             current_frame_idx, total_frames, \
             recorded_count, \
-            frame_read_delta_t, depth_process_delta_t, latency_ms = latest_data # Added timing unpack
+            frame_read_delta_t, depth_process_delta_t, latency_ms, \
+            newly_arrived_bias_map, main_screen_coeff_viz_numpy = latest_data # Unpack new coeff viz
+
+            # Store the new main screen coefficient visualization content
+            self.latest_main_screen_coeff_viz_content = main_screen_coeff_viz_numpy
 
             # Update state variables
             self.last_capture_timestamp = t_capture
@@ -1944,12 +2292,48 @@ class LiveViewerWindow(pyglet.window.Window):
             if depth_map_tensor is not None:
                 try:
                     depth_np = depth_map_tensor.cpu().numpy()
-                    depth_normalized = np.clip(depth_np / 10.0, 0.0, 1.0)
-                    depth_vis = (depth_normalized * 255).astype(np.uint8)
-                    depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-                    self.latest_depth_map_viz = np.ascontiguousarray(depth_vis_colored)
+                    
+                    # Normalize to 0-255 range for uint8 conversion
+                    min_val = np.min(depth_np)
+                    max_val = np.max(depth_np)
+
+                    if max_val > min_val: # Avoid division by zero if depth is flat
+                        # Clip outliers for better normalization range (e.g., 1st and 99th percentile)
+                        # This can help if a few extreme pixels skew the main range.
+                        p_low = np.percentile(depth_np, 1)
+                        p_high = np.percentile(depth_np, 99)
+                        # Ensure p_low is not greater than p_high, can happen in very flat maps
+                        if p_low >= p_high: p_low = min_val; p_high = max_val 
+                        
+                        # Use these percentiles for clipping and scaling if they are more robust
+                        # If sticking to min/max, ensure max_val > min_val
+                        # For now, let's try a robust scaling first before full percentile clipping.
+                        # A simpler robust scaling: if max_val - min_val is tiny, treat as flat.
+                        if (max_val - min_val) < 1e-5: # Threshold for being considered flat
+                             depth_scaled = np.full_like(depth_np, 128) # Mid-gray for flat
+                        else:
+                             # Apply clipping before scaling to avoid extreme outliers dominating the range
+                             depth_clipped = np.clip(depth_np, min_val, max_val) # Or use p_low, p_high here
+                             depth_scaled = 255 * (depth_clipped - np.min(depth_clipped)) / (np.max(depth_clipped) - np.min(depth_clipped) + 1e-6) # add epsilon
+                    else: # max_val <= min_val (flat map)
+                        depth_scaled = np.zeros_like(depth_np) # Black for flat
+
+                    depth_u8 = depth_scaled.astype(np.uint8)
+                    
+                    # Apply histogram equalization
+                    if depth_u8.size > 0: # Ensure not empty
+                         # Check if image is not flat gray, equalizeHist works best on images with some contrast
+                         if np.any(depth_u8 != depth_u8[0,0] if depth_u8.ndim > 1 and depth_u8.shape[0]>0 and depth_u8.shape[1]>0 else depth_u8 != depth_u8[0] if depth_u8.ndim > 0 and depth_u8.shape[0]>0 else True):
+                            depth_equalized_gray = cv2.equalizeHist(depth_u8)
+                            self.latest_depth_map_viz = cv2.cvtColor(depth_equalized_gray, cv2.COLOR_GRAY2RGB)
+                         else: # Image is flat, no need to equalize, just convert to RGB
+                            self.latest_depth_map_viz = cv2.cvtColor(depth_u8, cv2.COLOR_GRAY2RGB)
+                    else:
+                         self.latest_depth_map_viz = None
+
                 except Exception as e_depth_viz:
                     print(f"Error processing depth map for viz: {e_depth_viz}")
+                    traceback.print_exc() # Add traceback
                     self.latest_depth_map_viz = None
             else:
                 self.latest_depth_map_viz = None
@@ -1969,23 +2353,56 @@ class LiveViewerWindow(pyglet.window.Window):
                 try:
                     # Stack history [T,1,H,W] and perform spatial wavelet + FFT
                     depth_stack = torch.stack(list(self.depth_history), dim=0).unsqueeze(1)
-                    J = int(math.log2(max(1, self.wavelet_packet_window_size)))
-                    dwt = DWTForward(J=J, wave=self.wavelet_packet_type, mode='zero').to(self.device)
-                    idwt = DWTInverse(wave=self.wavelet_packet_type, mode='zero').to(self.device)
-                    Yl, Yh = dwt(depth_stack)
-                    recon_spatial = idwt((Yl, Yh)).squeeze(1)  # [T,H,W]
-                    freq = torch.fft.fftn(recon_spatial, dim=(0,1,2), norm='ortho')
-                    recon_full = torch.fft.ifftn(freq, dim=(0,1,2), norm='ortho').real
-                    final_depth = recon_full[-1].cpu().numpy()
-                    # Normalize and color map
-                    minv, maxv = final_depth.min(), final_depth.max()
-                    depth_norm = (final_depth - minv) / (maxv - minv + 1e-6)
-                    depth_img = (depth_norm * 255).astype(np.uint8)
-                    depth_color = cv2.applyColorMap(depth_img, cv2.COLORMAP_JET)
-                    self.latest_wavelet_map = np.ascontiguousarray(depth_color)
-                except Exception as e_wavelet:
-                    print(f"Warning: failed to generate wavelet map: {e_wavelet}")
-                    self.latest_wavelet_map = None
+                    wavelet_window_size = getattr(self, 'wavelet_packet_window_size', DEFAULT_SETTINGS['wavelet_packet_window_size'])
+                    wavelet_type = getattr(self, 'wavelet_packet_type', DEFAULT_SETTINGS['wavelet_packet_type'])
+                    
+                    J = int(math.log2(max(1, wavelet_window_size)))
+                    min_dim_hist = min(depth_stack.shape[-2], depth_stack.shape[-1])
+                    max_J_possible_hist = int(math.log2(min_dim_hist)) if min_dim_hist > 0 else 0
+                    if J > max_J_possible_hist:
+                        print(f"Warning: WPT J={J} for history stack too large ({depth_stack.shape}). Clamping to {max_J_possible_hist}.")
+                        J = max_J_possible_hist
+
+                    if J > 0:
+                        dwt_op = DWTForward(J=J, wave=wavelet_type, mode='zero').to(self.device)
+                        idwt_op = DWTInverse(wave=wavelet_type, mode='zero').to(self.device)
+                        Yl, Yh = dwt_op(depth_stack) 
+                        recon_spatial = idwt_op((Yl, Yh)).squeeze(1)  
+
+                        fft_dims_temporal = tuple(range(recon_spatial.ndim))
+                        freq = torch.fft.fftn(recon_spatial, dim=fft_dims_temporal, norm='ortho')
+                        recon_full = torch.fft.ifftn(freq, dim=fft_dims_temporal, norm='ortho').real
+                        
+                        T_hist, H_hist, W_hist = recon_full.shape
+                        latest_depth_frame_np = recon_full[-1].cpu().numpy()
+                        oldest_depth_frame_np = recon_full[0].cpu().numpy() if T_hist >= 3 else latest_depth_frame_np.copy()
+                        middle_depth_frame_np = recon_full[T_hist//2].cpu().numpy() if T_hist >= 3 else latest_depth_frame_np.copy()
+
+                        def normalize_to_uint8_local(frame_np_func):
+                            min_val, max_val = np.min(frame_np_func), np.max(frame_np_func)
+                            norm_frame = (frame_np_func - min_val) / (max_val - min_val + 1e-7) if (max_val - min_val) > 1e-7 else np.zeros_like(frame_np_func)
+                            return (norm_frame * 255).astype(np.uint8)
+
+                        ch_r_uint8 = normalize_to_uint8_local(oldest_depth_frame_np)
+                        ch_g_uint8 = normalize_to_uint8_local(middle_depth_frame_np)
+                        ch_b_uint8 = normalize_to_uint8_local(latest_depth_frame_np)
+                        temporal_composite_bgr = cv2.merge((ch_b_uint8, ch_g_uint8, ch_r_uint8))
+                        laplacian = cv2.Laplacian(latest_depth_frame_np, cv2.CV_32F, ksize=3)
+                        laplacian_abs_norm_uint8 = cv2.normalize(np.abs(laplacian), None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+                        _, laplacian_edge_mask = cv2.threshold(laplacian_abs_norm_uint8, 50, 255, cv2.THRESH_BINARY)
+                        enhanced_viz_bgr = temporal_composite_bgr.copy()
+                        if laplacian_edge_mask.ndim == 2 and enhanced_viz_bgr.ndim == 3:
+                             enhanced_viz_bgr[laplacian_edge_mask == 255] = [255, 255, 255]
+                        self.latest_temporal_laplacian_viz_content = np.ascontiguousarray(enhanced_viz_bgr)
+                    else: # J <= 0 for history stack
+                        print("Warning: WPT levels J <= 0 for history stack. Cannot compute temporal laplacian wavelet map.")
+                        self.latest_temporal_laplacian_viz_content = None # Fallback
+                except Exception as e_wavelet_debug_viz:
+                    print(f"Warning: failed to generate temporal laplacian wavelet map for debug: {e_wavelet_debug_viz}")
+                    traceback.print_exc()
+                    self.latest_temporal_laplacian_viz_content = None
+            else: # No depth tensor for temporal processing
+                 self.latest_temporal_laplacian_viz_content = None
 
             # Return processed data needed for vertex list update
             return vertices_data, colors_data, num_vertices_actual
@@ -2003,140 +2420,141 @@ class LiveViewerWindow(pyglet.window.Window):
 
         try:
             # --- Update Camera Feed Texture --- 
-            # Handle potential BGRA from MSS or BGR from OpenCV
             if self.latest_rgb_frame is not None and self.camera_texture is not None:
                 frame_to_upload = self.latest_rgb_frame
-                # Check dimensions first
                 if frame_to_upload.ndim != 3:
-                    print(f"Warning: latest_rgb_frame has unexpected dimensions {frame_to_upload.shape}. Skipping camera texture update.")
+                    # print(f"Warning: latest_rgb_frame has unexpected dimensions {frame_to_upload.shape}. Skipping camera texture update.")
                     frame_to_upload = None
                 else:
                     h, w, c = frame_to_upload.shape
-                    gl_format = gl.GL_RGB # Default
-
-                    # Explicitly handle Screen mode frame format (likely BGRA from mss)
+                    # gl_format = gl.GL_RGB # Default, not strictly needed as cvtColor handles output format for glTexImage2D
                     if self.input_mode == "Screen":
                         try:
-                            if c == 4: # BGRA
-                                frame_to_upload = cv2.cvtColor(frame_to_upload, cv2.COLOR_BGRA2RGB)
-                            elif c == 3: # Maybe BGR?
-                                print("Warning: Screen capture frame has 3 channels, assuming BGR and converting to RGB.")
-                                frame_to_upload = cv2.cvtColor(frame_to_upload, cv2.COLOR_BGR2RGB)
-                            else:
-                                 print(f"Warning: Screen capture frame has unexpected channel count {c}. Skipping camera texture update.")
-                                 frame_to_upload = None
-                            
-                            if frame_to_upload is not None:
-                                # Ensure contiguous after conversion
-                                frame_to_upload = np.ascontiguousarray(frame_to_upload)
+                            if c == 4: frame_to_upload = cv2.cvtColor(frame_to_upload, cv2.COLOR_BGRA2RGB)
+                            elif c == 3: frame_to_upload = cv2.cvtColor(frame_to_upload, cv2.COLOR_BGR2RGB) # Assume BGR if 3ch from screen
+                            else: frame_to_upload = None
+                            if frame_to_upload is not None: frame_to_upload = np.ascontiguousarray(frame_to_upload)
                         except cv2.error as e_cvt:
-                            print(f"ERROR: Could not convert screen frame to RGB in _update_debug_textures: {e_cvt}. Skipping camera texture update.")
+                            print(f"ERROR: Could not convert screen frame to RGB in _update_debug_textures: {e_cvt}.")
                             traceback.print_exc()
-                            frame_to_upload = None # Skip upload
-                    # Handle non-Screen mode (likely RGB from cvtColor earlier)
-                    elif c == 3:
-                        gl_format = gl.GL_RGB
-                        # Ensure contiguous just in case
+                            frame_to_upload = None 
+                    elif c == 3: # Assume already RGB from UniK3D or previous cvtColor
                         frame_to_upload = np.ascontiguousarray(frame_to_upload)
-                    # Handle unexpected formats in non-screen mode
-                    elif c == 4:
-                         print("Warning: Unexpected 4-channel frame in non-screen mode. Trying RGBA->RGB.")
+                    elif c == 4: # E.g. RGBA image file
                          try:
                              frame_to_upload = cv2.cvtColor(frame_to_upload, cv2.COLOR_RGBA2RGB)
-                             gl_format = gl.GL_RGB
                              frame_to_upload = np.ascontiguousarray(frame_to_upload)
                          except cv2.error:
                              print("Failed to convert RGBA->RGB. Skipping camera texture update.")
                              frame_to_upload = None
-                    else:
-                         print(f"Warning: Unexpected frame channel count ({c}). Skipping camera texture update.")
-                         frame_to_upload = None
+                    else: # Unexpected channel count
+                        frame_to_upload = None
 
-                # Perform the upload if frame is valid
                 if frame_to_upload is not None:
-                    h, w, _ = frame_to_upload.shape 
+                    h_f, w_f, _ = frame_to_upload.shape # Use different var names to avoid conflict 
                     gl.glBindTexture(gl.GL_TEXTURE_2D, self.camera_texture)
-                    # Check if texture size needs reallocation
-                    if w != self.camera_texture_width or h != self.camera_texture_height:
-                        print(f"DEBUG: Reallocating camera_texture from ({self.camera_texture_width}x{self.camera_texture_height}) to ({w}x{h})")
-                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) # Reallocate
-                        self.camera_texture_width = w
-                        self.camera_texture_height = h
-                    # Upload data (use glTexSubImage2D if texture already allocated, but glTexImage2D is simpler if realloc just happened)
-                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, frame_to_upload.ctypes.data)
+                    if w_f != self.camera_texture_width or h_f != self.camera_texture_height:
+                        # print(f"DEBUG UpdateTextures: Reallocating camera_texture from ({self.camera_texture_width}x{self.camera_texture_height}) to ({w_f}x{h_f})")
+                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_f, h_f, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) 
+                        self.camera_texture_width = w_f
+                        self.camera_texture_height = h_f
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_f, h_f, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, frame_to_upload.ctypes.data)
 
             # --- Update Depth Map Texture --- 
-            # (Already handles BGR from applyColorMap)
             if self.latest_depth_map_viz is not None and self.depth_texture is not None:
                 depth_viz_cont = np.ascontiguousarray(self.latest_depth_map_viz)
-                h, w, _ = depth_viz_cont.shape
+                h_d, w_d, _ = depth_viz_cont.shape
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
-                if w != self.depth_texture_width or h != self.depth_texture_height:
-                    print(f"DEBUG: Reallocating depth_texture from ({self.depth_texture_width}x{self.depth_texture_height}) to ({w}x{h})")
-                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, None) # Reallocate (format BGR)
-                    self.depth_texture_width = w
-                    self.depth_texture_height = h
-                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, depth_viz_cont.ctypes.data)
+                if w_d != self.depth_texture_width or h_d != self.depth_texture_height:
+                    # print(f"DEBUG UpdateTextures: Reallocating depth_texture from ({self.depth_texture_width}x{self.depth_texture_height}) to ({w_d}x{h_d})")
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_d, h_d, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, None) 
+                    self.depth_texture_width = w_d
+                    self.depth_texture_height = h_d
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_d, h_d, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, depth_viz_cont.ctypes.data)
 
             # --- Update Edge Map Texture --- 
-            # (Should be RGB)
             if self.latest_edge_map is not None and self.edge_texture is not None:
                  edge_map_cont = np.ascontiguousarray(self.latest_edge_map)
-                 h, w, _ = edge_map_cont.shape
+                 h_e, w_e, _ = edge_map_cont.shape
                  gl.glBindTexture(gl.GL_TEXTURE_2D, self.edge_texture)
-                 if w != self.edge_texture_width or h != self.edge_texture_height:
-                    print(f"DEBUG: Reallocating edge_texture from ({self.edge_texture_width}x{self.edge_texture_height}) to ({w}x{h})")
-                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) # Reallocate (format RGB)
-                    self.edge_texture_width = w
-                    self.edge_texture_height = h
-                 gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, edge_map_cont.ctypes.data)
+                 if w_e != self.edge_texture_width or h_e != self.edge_texture_height:
+                    # print(f"DEBUG UpdateTextures: Reallocating edge_texture from ({self.edge_texture_width}x{self.edge_texture_height}) to ({w_e}x{h_e})")
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_e, h_e, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) 
+                    self.edge_texture_width = w_e
+                    self.edge_texture_height = h_e
+                 gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_e, h_e, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, edge_map_cont.ctypes.data)
 
             # --- Update Smoothing Map Texture --- 
-            # (Should be RGB)
             if self.latest_smoothing_map is not None and self.smoothing_texture is not None:
                  smoothing_map_cont = np.ascontiguousarray(self.latest_smoothing_map)
-                 h, w, _ = smoothing_map_cont.shape
+                 h_s, w_s, _ = smoothing_map_cont.shape
                  gl.glBindTexture(gl.GL_TEXTURE_2D, self.smoothing_texture)
-                 if w != self.smoothing_texture_width or h != self.smoothing_texture_height:
-                    print(f"DEBUG: Reallocating smoothing_texture from ({self.smoothing_texture_width}x{self.smoothing_texture_height}) to ({w}x{h})")
-                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) # Reallocate (format RGB)
-                    self.smoothing_texture_width = w
-                    self.smoothing_texture_height = h
-                 gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, smoothing_map_cont.ctypes.data)
+                 if w_s != self.smoothing_texture_width or h_s != self.smoothing_texture_height:
+                    # print(f"DEBUG UpdateTextures: Reallocating smoothing_texture from ({self.smoothing_texture_width}x{self.smoothing_texture_height}) to ({w_s}x{h_s})")
+                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_s, h_s, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None) 
+                    self.smoothing_texture_width = w_s
+                    self.smoothing_texture_height = h_s
+                 gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_s, h_s, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, smoothing_map_cont.ctypes.data)
 
-            # Update Wavelet/FFT overlay texture (or fallback to depth map)
-            if self.wavelet_texture is not None:
-                bmp = None
-                fmt = gl.GL_RGB
-                # Prefer generated wavelet map
-                if hasattr(self, 'latest_wavelet_map') and self.latest_wavelet_map is not None:
-                    bmp = self.latest_wavelet_map
-                    fmt = gl.GL_RGB
-                # Fallback to depth map visualization if no wavelet yet
-                elif self.latest_depth_map_viz is not None:
-                    bmp = self.latest_depth_map_viz
-                    fmt = gl.GL_BGR
-                if bmp is not None:
-                    data = np.ascontiguousarray(bmp)
-                    h, w, _ = data.shape
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, self.wavelet_texture)
-                    # Reallocate if size changed
-                    if w != self.wavelet_texture_width or h != self.wavelet_texture_height:
-                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, fmt, gl.GL_UNSIGNED_BYTE, None)
-                        self.wavelet_texture_width = w
-                        self.wavelet_texture_height = h
-                    # Upload texture data
-                    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w, h, 0, fmt, gl.GL_UNSIGNED_BYTE, data.ctypes.data)
+            # Update Wavelet/FFT main screen texture (self.wavelet_texture)
+            # This texture is used by _render_wavelet_fft() when render_mode == 3.
+            if self.wavelet_texture is not None: # Check if texture ID exists
+                if hasattr(self, 'latest_main_screen_coeff_viz_content') and self.latest_main_screen_coeff_viz_content is not None:
+                    print(f"NEW_LOG_WVLT_TEX: Data available for self.wavelet_texture. Shape: {self.latest_main_screen_coeff_viz_content.shape}. Attempting upload.")
+                    main_screen_viz_data = np.ascontiguousarray(self.latest_main_screen_coeff_viz_content)
+                    if main_screen_viz_data.ndim == 3 and main_screen_viz_data.shape[2] == 3:
+                        h_main, w_main, _ = main_screen_viz_data.shape
+                        gl.glBindTexture(gl.GL_TEXTURE_2D, self.wavelet_texture)
+                        if w_main != self.wavelet_texture_width or h_main != self.wavelet_texture_height:
+                            # print(f"DEBUG UpdateTextures: Reallocating wavelet_texture from ({self.wavelet_texture_width}x{self.wavelet_texture_height}) to ({w_main}x{h_main})")
+                            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_main, h_main, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, None) 
+                            self.wavelet_texture_width = w_main
+                            self.wavelet_texture_height = h_main
+                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_main, h_main, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, main_screen_viz_data.ctypes.data) 
+                    else:
+                        print(f"NEW_LOG_WVLT_TEX: latest_main_screen_coeff_viz_content has unexpected shape {main_screen_viz_data.shape}. Not uploading to wavelet_texture.")
+                else: 
+                    print("NEW_LOG_WVLT_TEX: self.latest_main_screen_coeff_viz_content is None. Not updating self.wavelet_texture. Current content will persist or be black/purple.")
+                    if self.wavelet_texture_width > 0 and self.wavelet_texture_height > 0: # Check if texture was ever initialized
+                        gl.glBindTexture(gl.GL_TEXTURE_2D, self.wavelet_texture)
+                        black_pixel = np.array([10,0,10], dtype=np.uint8) # Dark purple for visibility of blanking
+                        black_tex_data = np.full((self.wavelet_texture_height, self.wavelet_texture_width, 3), black_pixel, dtype=np.uint8)
+                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, self.wavelet_texture_width, self.wavelet_texture_height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, black_tex_data.ctypes.data)
 
-            gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # Unbind
+            # Update ImGui Wavelet/FFT debug texture (self.imgui_wavelet_debug_texture)
+            if self.imgui_wavelet_debug_texture is not None: # Check if texture ID exists
+                if hasattr(self, 'latest_temporal_laplacian_viz_content') and self.latest_temporal_laplacian_viz_content is not None:
+                    # print(f"DEBUG UpdateTextures: Uploading latest_temporal_laplacian_viz_content (shape: {self.latest_temporal_laplacian_viz_content.shape}) to self.imgui_wavelet_debug_texture")
+                    imgui_debug_viz_data = np.ascontiguousarray(self.latest_temporal_laplacian_viz_content)
+                    if imgui_debug_viz_data.ndim == 3 and imgui_debug_viz_data.shape[2] == 3:
+                        h_dbg, w_dbg, _ = imgui_debug_viz_data.shape
+                        gl.glBindTexture(gl.GL_TEXTURE_2D, self.imgui_wavelet_debug_texture)
+                        if w_dbg != self.imgui_wavelet_debug_texture_width or h_dbg != self.imgui_wavelet_debug_texture_height:
+                            # print(f"DEBUG UpdateTextures: Reallocating imgui_wavelet_debug_texture from ({self.imgui_wavelet_debug_texture_width}x{self.imgui_wavelet_debug_texture_height}) to ({w_dbg}x{h_dbg})")
+                            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_dbg, h_dbg, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, None) 
+                            self.imgui_wavelet_debug_texture_width = w_dbg
+                            self.imgui_wavelet_debug_texture_height = h_dbg
+                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, w_dbg, h_dbg, 0, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, imgui_debug_viz_data.ctypes.data)
+                    # else:
+                        # print(f"DEBUG UpdateTextures: latest_temporal_laplacian_viz_content has unexpected shape {imgui_debug_viz_data.shape}. Not uploading to imgui_wavelet_debug_texture.")
+                else:
+                    # print("DEBUG UpdateTextures: latest_temporal_laplacian_viz_content is None. Not updating ImGui debug texture.")
+                    if self.imgui_wavelet_debug_texture_width > 0 and self.imgui_wavelet_debug_texture_height > 0:
+                        gl.glBindTexture(gl.GL_TEXTURE_2D, self.imgui_wavelet_debug_texture)
+                        blue_pixel = np.array([0,0,20], dtype=np.uint8) # Dark blue for visibility
+                        blue_tex_data = np.full((self.imgui_wavelet_debug_texture_height, self.imgui_wavelet_debug_texture_width, 3), blue_pixel, dtype=np.uint8)
+                        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB8, self.imgui_wavelet_debug_texture_width, self.imgui_wavelet_debug_texture_height, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, blue_tex_data.ctypes.data)
+
+            gl.glBindTexture(gl.GL_TEXTURE_2D, 0) 
 
         except Exception as e_tex:
-            print(f"ERROR in _update_debug_textures: {e_tex}") # Added ERROR prefix
+            print(f"ERROR in _update_debug_textures: {e_tex}") 
             traceback.print_exc()
-            # Optionally disable debug views on error?
 
     def _update_vertex_list(self, vertices_data, colors_data, num_vertices, view_matrix):
         """Updates the main point cloud vertex list, sorting if needed for Gaussian render mode."""
+        # print(f"DEBUG: _update_vertex_list received {num_vertices} vertices.") 
+        print(f"DEBUG: _update_vertex_list received {num_vertices} vertices.") # ADDED DEBUG PRINT
         self.current_point_count = num_vertices # Update point count regardless
 
         # Check if vertices_data and colors_data are None or empty *before* trying processing
@@ -2208,6 +2626,18 @@ class LiveViewerWindow(pyglet.window.Window):
             self.current_point_count = 0
             return # Skip the update
         # --- End NaN/Inf Check ---
+
+        # Store the points that will actually be used for rendering, for debug ray visualization
+        # These points are already in the correct (+X Right, +Y Up, -Z Forward) world space
+        # vertices_for_display is the (potentially sorted) and flattened array
+        if vertices_for_display is not None and num_vertices > 0:
+            try:
+                self.latest_points_for_debug = vertices_for_display.reshape((num_vertices, 3))
+            except ValueError as e_reshape:
+                print(f"Warning: Could not reshape vertices_for_display for debug rays: {e_reshape}")
+                self.latest_points_for_debug = None
+        else:
+            self.latest_points_for_debug = None # Ensure it's None if no valid points
 
         # Delete existing list if it exists
         if self.vertex_list:
@@ -2509,8 +2939,8 @@ class LiveViewerWindow(pyglet.window.Window):
         # Restart the inference thread with the new source and monitor index
         self.start_inference_thread()
 
-    def _draw_ui(self):
-        """Draws the ImGui user interface."""
+    def _define_imgui_windows_and_widgets(self):
+        """Defines all ImGui windows and widgets. Called between imgui.new_frame() and imgui.render()."""
         # --- Apply Custom Style --- 
         style = imgui.get_style()
         # Rounding
@@ -2836,13 +3266,17 @@ class LiveViewerWindow(pyglet.window.Window):
             # --- Rendering Tab ---
             if imgui.begin_tab_item("Rendering")[0]:
                 imgui.text("Point Style")
-                if imgui.radio_button("Square##RenderMode", self.render_mode == 0): self.render_mode = 0
+                changed_rm0 = imgui.radio_button("Square##RenderMode", self.render_mode == 0)
+                if changed_rm0 and self.render_mode != 0: self.render_mode = 0; self._update_edge_params()
                 imgui.same_line()
-                if imgui.radio_button("Circle##RenderMode", self.render_mode == 1): self.render_mode = 1
+                changed_rm1 = imgui.radio_button("Circle##RenderMode", self.render_mode == 1)
+                if changed_rm1 and self.render_mode != 1: self.render_mode = 1; self._update_edge_params()
                 imgui.same_line()
-                if imgui.radio_button("Gaussian##RenderMode", self.render_mode == 2): self.render_mode = 2
+                changed_rm2 = imgui.radio_button("Gaussian##RenderMode", self.render_mode == 2)
+                if changed_rm2 and self.render_mode != 2: self.render_mode = 2; self._update_edge_params()
                 imgui.same_line()
-                if imgui.radio_button("Wavelet/FFT##RenderMode", self.render_mode == 3): self.render_mode = 3
+                changed_rm3 = imgui.radio_button("Wavelet/FFT##RenderMode", self.render_mode == 3)
+                if changed_rm3 and self.render_mode != 3: self.render_mode = 3; self._update_edge_params()
 
                 if self.render_mode == 2: # Gaussian Params
                     imgui.indent()
@@ -2984,6 +3418,32 @@ class LiveViewerWindow(pyglet.window.Window):
                 _, self.debug_show_viewer_frustum = imgui.checkbox("Viewer Frustum##Geom", self.debug_show_viewer_frustum)
                 _, self.debug_show_input_rays = imgui.checkbox("Input Rays (Sampled)##Geom", self.debug_show_input_rays)
 
+                imgui.separator()
+                imgui.text("Depth Bias Calibration (Dev)")
+                if imgui.button("Capture Bias (View Flat Surface)"):
+                    # self._capture_depth_bias() # Old direct call removed
+                    self.pending_bias_capture_request = "mean_plane"
+                    self._update_edge_params() # Signal inference thread
+                    self.status_message = "Bias capture requested (Mean Plane Ref)..."
+                    print("UI: Bias capture requested (Mean Plane Ref).")
+
+                # Use local variable for checkbox to avoid issues if self.apply_depth_bias is None initially
+                current_apply_bias = self.apply_depth_bias if self.apply_depth_bias is not None else False
+                changed_apply_bias, current_apply_bias = imgui.checkbox("Apply Depth Bias Correction", current_apply_bias)
+                if changed_apply_bias:
+                    self.apply_depth_bias = current_apply_bias
+                    self._update_edge_params() # Signal change to inference thread
+                
+                if self.depth_bias_map is not None:
+                    imgui.same_line()
+                    imgui.text_colored("Bias Captured", 0.0, 1.0, 0.0, 1.0) # Green text
+                elif self.latest_depth_tensor_for_calib is not None:
+                     imgui.same_line()
+                     imgui.text_colored("Raw Depth Captured, Bias Calc Failed?", 1.0, 1.0, 0.0, 1.0) # Yellow text
+                else: # If no bias map and no record of capture attempt
+                    imgui.same_line()
+                    imgui.text_colored("Bias not captured", 0.7, 0.7, 0.7, 1.0) # Grey text
+
                 imgui.end_tab_item()
             # --- End Debug Tab ---
 
@@ -3007,24 +3467,23 @@ class LiveViewerWindow(pyglet.window.Window):
         # --- Debug View Windows (Rendered as separate windows now) ---
         if self.show_camera_feed and self.camera_texture and self.latest_rgb_frame is not None:
             imgui.set_next_window_size(320, 240, imgui.ONCE)
-            imgui.set_next_window_position(10, self.height - 250, imgui.ONCE) # Position top-leftish
-            is_open, self.show_camera_feed = imgui.begin("Camera Feed", closable=True)
-            if is_open:
-                # Calculate aspect ratio preserving size
+            imgui.set_next_window_position(10, self.height - 250, imgui.ONCE) 
+            # Corrected: Pass self.show_camera_feed as the p_open argument. closable is implicit.
+            is_open, self.show_camera_feed = imgui.begin("Camera Feed", self.show_camera_feed)
+            if is_open: 
                 available_width = imgui.get_content_region_available()[0]
                 orig_h, orig_w, _ = self.latest_rgb_frame.shape
                 aspect_ratio = float(orig_w) / float(orig_h) if orig_h > 0 else 1.0
                 display_width = available_width
                 display_height = display_width / aspect_ratio
                 imgui.image(self.camera_texture, display_width, display_height)
-            imgui.end()
+            imgui.end() 
 
         if self.show_depth_map and self.depth_texture and self.latest_depth_map_viz is not None:
             imgui.set_next_window_size(320, 240, imgui.ONCE)
-            imgui.set_next_window_position(340, self.height - 250, imgui.ONCE) # Position next to camera feed
-            is_open, self.show_depth_map = imgui.begin("Depth Map", closable=True)
+            imgui.set_next_window_position(340, self.height - 250, imgui.ONCE) 
+            is_open, self.show_depth_map = imgui.begin("Depth Map", self.show_depth_map)
             if is_open:
-                # Calculate aspect ratio preserving size
                 available_width = imgui.get_content_region_available()[0]
                 orig_h, orig_w, _ = self.latest_depth_map_viz.shape
                 aspect_ratio = float(orig_w) / float(orig_h) if orig_h > 0 else 1.0
@@ -3035,10 +3494,9 @@ class LiveViewerWindow(pyglet.window.Window):
 
         if self.show_edge_map and self.edge_texture and self.latest_edge_map is not None:
             imgui.set_next_window_size(320, 240, imgui.ONCE)
-            imgui.set_next_window_position(10, self.height - 500, imgui.ONCE) # Position below camera feed
-            is_open, self.show_edge_map = imgui.begin("Edge Map", closable=True)
+            imgui.set_next_window_position(10, self.height - 500, imgui.ONCE) 
+            is_open, self.show_edge_map = imgui.begin("Edge Map", self.show_edge_map)
             if is_open:
-                # Calculate aspect ratio preserving size
                 available_width = imgui.get_content_region_available()[0]
                 orig_h, orig_w, _ = self.latest_edge_map.shape
                 aspect_ratio = float(orig_w) / float(orig_h) if orig_h > 0 else 1.0
@@ -3049,10 +3507,9 @@ class LiveViewerWindow(pyglet.window.Window):
 
         if self.show_smoothing_map and self.smoothing_texture and self.latest_smoothing_map is not None:
              imgui.set_next_window_size(320, 240, imgui.ONCE)
-             imgui.set_next_window_position(340, self.height - 500, imgui.ONCE) # Position below depth map
-             is_open, self.show_smoothing_map = imgui.begin("Smoothing Alpha Map", closable=True)
+             imgui.set_next_window_position(340, self.height - 500, imgui.ONCE) 
+             is_open, self.show_smoothing_map = imgui.begin("Smoothing Alpha Map", self.show_smoothing_map)
              if is_open:
-                 # Calculate aspect ratio preserving size
                  available_width = imgui.get_content_region_available()[0]
                  orig_h, orig_w, _ = self.latest_smoothing_map.shape
                  aspect_ratio = float(orig_w) / float(orig_h) if orig_h > 0 else 1.0
@@ -3061,25 +3518,21 @@ class LiveViewerWindow(pyglet.window.Window):
                  imgui.image(self.smoothing_texture, display_width, display_height)
              imgui.end()
 
-        if self.show_wavelet_map and hasattr(self, 'wavelet_texture'):
+        # Ensure self.imgui_wavelet_debug_texture is checked for None before use
+        if self.show_wavelet_map and hasattr(self, 'imgui_wavelet_debug_texture') and self.imgui_wavelet_debug_texture is not None and hasattr(self, 'latest_temporal_laplacian_viz_content') and self.latest_temporal_laplacian_viz_content is not None:
             imgui.set_next_window_size(320, 240, imgui.ONCE)
             imgui.set_next_window_position(660, self.height - 250, imgui.ONCE)
-            is_open, self.show_wavelet_map = imgui.begin("Wavelet/FFT Output", closable=True)
+            is_open, self.show_wavelet_map = imgui.begin("Wavelet/FFT Output", self.show_wavelet_map)
             if is_open:
                 available_width = imgui.get_content_region_available()[0]
-                # Choose which texture to display: wavelet or depth fallback
-                if self.latest_wavelet_map is not None:
-                    tex = self.wavelet_texture
-                    w = self.wavelet_texture_width
-                    h = self.wavelet_texture_height
-                else:
-                    tex = self.depth_texture
-                    w = self.depth_texture_width
-                    h = self.depth_texture_height
-                aspect = float(w) / float(h) if h > 0 else 1.0
+                tex_to_display = self.imgui_wavelet_debug_texture 
+                w_to_display = self.imgui_wavelet_debug_texture_width
+                h_to_display = self.imgui_wavelet_debug_texture_height
+                
+                aspect = float(w_to_display) / float(h_to_display) if h_to_display > 0 else 1.0
                 display_width = available_width
                 display_height = display_width / aspect
-                imgui.image(tex, display_width, display_height)
+                imgui.image(tex_to_display, display_width, display_height)
             imgui.end()
         # --- End Debug View Windows ---
 
@@ -3114,109 +3567,108 @@ class LiveViewerWindow(pyglet.window.Window):
             self.show_wavelet_map = True
 
     def _render_scene(self):
-        """Renders the 3D point cloud scene."""
-        # 3D rendering logic will be moved here
-        # --- Draw 3D Splats ---
-        if self.vertex_list:
-            projection, current_view = self.get_camera_matrices()
+        """Renders the 3D point cloud scene (modes 0, 1, 2). Mode 3 is handled by _render_wavelet_fft."""
+
+        print(f"DEBUG RenderScene: Called for mode {self.render_mode}. This should not be mode 3.")
+
+        if self.render_mode == 3:
+            print("ERROR: _render_scene was called with render_mode 3. This should be handled by _render_wavelet_fft in on_draw.")
+            return # Should not happen if on_draw is correct
+
+        if not self.vertex_list:
+            return
+
+        projection, current_view = self.get_camera_matrices()
+        try:
+            self.shader_program.use()
+            self.shader_program['projection'] = projection
+            self.shader_program['view'] = current_view
+            self.shader_program['viewportSize'] = (float(self.width), float(self.height))
+            self.shader_program['inputScaleFactor'] = self.input_scale_factor
+            self.shader_program['pointSizeBoost'] = self.point_size_boost
+            self.shader_program['renderMode'] = self.render_mode
+            self.shader_program['falloffFactor'] = self.falloff_factor
+            self.shader_program['saturation'] = self.saturation
+            self.shader_program['brightness'] = self.brightness
+            self.shader_program['contrast'] = self.contrast
+            self.shader_program['sharpness'] = self.sharpness if self.enable_sharpening else 1.0
+
+            current_input_fov = self.input_camera_fov if self.input_camera_fov is not None else DEFAULT_SETTINGS["input_camera_fov"]
+            fov_rad = math.radians(current_input_fov)
+            input_h = float(self.latest_rgb_frame.shape[0]) if self.latest_rgb_frame is not None else float(self.height)
+            input_focal = (input_h * 0.5) / math.tan(fov_rad * 0.5)
+            self.shader_program['inputFocal'] = input_focal
+
+            self.shader_program['sizeScaleFactor'] = self.size_scale_factor
+            self.shader_program['minPointSize'] = self.min_point_size
+            self.shader_program['enableMaxSizeClamp'] = self.enable_max_size_clamp
+            self.shader_program['maxPointSize'] = self.max_point_size
+            self.shader_program['depthExponent'] = self.depth_exponent
+            
+            # Pass planar_projection state to shader for conditional density compensation
+            self.shader_program['planarProjectionActive'] = self.planar_projection if self.planar_projection is not None else DEFAULT_SETTINGS["planar_projection"]
+
+            self.shader_program['debug_show_input_distance'] = self.debug_show_input_distance
+            self.shader_program['debug_show_raw_diameter'] = self.debug_show_raw_diameter
+            self.shader_program['debug_show_density_factor'] = self.debug_show_density_factor
+            self.shader_program['debug_show_final_size'] = self.debug_show_final_size
+
+            # Set GL state based on render mode
+            if self.render_mode == 0: # Square (Opaque)
+                gl.glEnable(gl.GL_DEPTH_TEST)
+                gl.glDepthMask(gl.GL_TRUE)
+                gl.glDisable(gl.GL_BLEND)
+            elif self.render_mode == 1: # Circle (Opaque)
+                gl.glEnable(gl.GL_DEPTH_TEST)
+                gl.glDepthMask(gl.GL_TRUE)
+                gl.glDisable(gl.GL_BLEND)
+            elif self.render_mode == 2: # Gaussian (Premultiplied Alpha Blend)
+                gl.glEnable(gl.GL_DEPTH_TEST)
+                gl.glDepthMask(gl.GL_FALSE) # Disable depth write for transparency
+                gl.glEnable(gl.GL_BLEND)
+                gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA) # Premultiplied alpha blend func
+            elif self.render_mode == 3: # Wavelet/FFT
+                gl.glEnable(gl.GL_DEPTH_TEST)
+                gl.glDepthMask(gl.GL_FALSE)
+                gl.glEnable(gl.GL_BLEND)
+                gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA)
+            # --- End setup for Draw 3D Splats ---
+
+            # Draw the splats: ensure vertex_list.draw is called for all point modes
+            print(f"DEBUG RenderScene: self.render_mode is {self.render_mode} before check. Drawing points.")
+            if self.vertex_list: # Check vertex_list exists
+                self.vertex_list.draw(gl.GL_POINTS) # Always draw points from vertex_list
+
+        except Exception as e_render:
+             print(f"ERROR during _render_scene (shader use or draw): {e_render}")
+             traceback.print_exc()
+        finally:
             try:
-                self.shader_program.use()
-                self.shader_program['projection'] = projection
-                self.shader_program['view'] = current_view
-                self.shader_program['viewportSize'] = (float(self.width), float(self.height))
-                # Pass control uniforms to shader
-                self.shader_program['inputScaleFactor'] = self.input_scale_factor
-                self.shader_program['pointSizeBoost'] = self.point_size_boost
-                self.shader_program['renderMode'] = self.render_mode
-                self.shader_program['falloffFactor'] = self.falloff_factor
-                self.shader_program['saturation'] = self.saturation
-                self.shader_program['brightness'] = self.brightness
-                self.shader_program['contrast'] = self.contrast
-                # Sharpness is applied in inference thread, but shader still has uniform
-                self.shader_program['sharpness'] = self.sharpness if self.enable_sharpening else 1.0
-
-                # Compute and pass input camera focal length (pixel units) for sizing
-                if self.latest_rgb_frame is not None:
-                    input_h = float(self.latest_rgb_frame.shape[0])
-                else:
-                    input_h = float(self.height) # Fallback if no frame yet
-                
-                current_input_fov = self.input_camera_fov if self.input_camera_fov is not None else DEFAULT_SETTINGS["input_camera_fov"]
-                fov_rad = math.radians(current_input_fov)
-                input_focal = (input_h * 0.5) / math.tan(fov_rad * 0.5)
-                self.shader_program['inputFocal'] = input_focal
-
-                # Pass the global size scale factor for point sizing
-                self.shader_program['sizeScaleFactor'] = self.size_scale_factor
-
-                # Pass new min/max size clamp uniforms
-                self.shader_program['minPointSize'] = self.min_point_size
-                self.shader_program['enableMaxSizeClamp'] = self.enable_max_size_clamp
-                self.shader_program['maxPointSize'] = self.max_point_size
-
-                # Pass depth exponent for sizing
-                self.shader_program['depthExponent'] = self.depth_exponent
-
-                # Pass debug uniforms
-                self.shader_program['debug_show_input_distance'] = self.debug_show_input_distance
-                self.shader_program['debug_show_raw_diameter'] = self.debug_show_raw_diameter
-                self.shader_program['debug_show_density_factor'] = self.debug_show_density_factor
-                self.shader_program['debug_show_final_size'] = self.debug_show_final_size
-
-                # Set GL state based on render mode
-                if self.render_mode == 0: # Square (Opaque)
-                    gl.glEnable(gl.GL_DEPTH_TEST)
-                    gl.glDepthMask(gl.GL_TRUE)
-                    gl.glDisable(gl.GL_BLEND)
-                elif self.render_mode == 1: # Circle (Opaque)
-                    gl.glEnable(gl.GL_DEPTH_TEST)
-                    gl.glDepthMask(gl.GL_TRUE)
-                    gl.glDisable(gl.GL_BLEND)
-                elif self.render_mode == 2: # Gaussian (Premultiplied Alpha Blend)
-                    gl.glEnable(gl.GL_DEPTH_TEST)
-                    gl.glDepthMask(gl.GL_FALSE) # Disable depth write for transparency
-                    gl.glEnable(gl.GL_BLEND)
-                    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA) # Premultiplied alpha blend func
-                elif self.render_mode == 3: # Wavelet/FFT
-                    gl.glEnable(gl.GL_DEPTH_TEST)
-                    gl.glDepthMask(gl.GL_FALSE)
-                    gl.glEnable(gl.GL_BLEND)
-                    gl.glBlendFunc(gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA)
-                # --- End setup for Draw 3D Splats ---
-
-                # Draw the splats: use Wavelet/FFT for mode 3, else default point draw
-                if self.render_mode == 3:
-                    try:
-                        self._render_wavelet_fft()
-                    except Exception as e_wfft:
-                        print(f"Error in Wavelet/FFT rendering: {e_wfft}")
-                else:
-                    self.vertex_list.draw(gl.GL_POINTS)
-
-            except Exception as e_render:
-                 print(f"ERROR during _render_scene: {e_render}")
-                 traceback.print_exc()
-                 # Attempt to stop shader program even if draw failed
-                 try: self.shader_program.stop()
-                 except: pass
-                 # Restore GL state
-                 gl.glDepthMask(gl.GL_TRUE)
-                 gl.glEnable(gl.GL_BLEND)
-                 gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-        # --- End Draw 3D Splats ---
+                self.shader_program.stop()
+            except Exception as e_stop_shader:
+                print(f"Warning: Error stopping shader program in _render_scene: {e_stop_shader}")
 
     def on_draw(self):
         # Clear the main window buffer
-        # gl.glClearColor(0.1, 0.1, 0.1, 1.0) # Old gray background
-        gl.glClearColor(0.0, 0.0, 0.0, 1.0) # New pure black background
+        gl.glClearColor(0.0, 0.0, 0.0, 1.0) 
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
 
-        # Render the 3D scene (wrap in try-except)
-        try:
-            self._render_scene()
-        except Exception as e_on_draw_render:
-            print(f"ERROR in on_draw calling _render_scene: {e_on_draw_render}")
-            traceback.print_exc()
+        if self.render_mode == 3: 
+            # For Wavelet/FFT mode, render the 2D texture full-screen via _render_wavelet_fft()
+            try:
+                print("DEBUG on_draw: render_mode is 3, calling _render_wavelet_fft().")
+                self._render_wavelet_fft() 
+            except Exception as e_on_draw_wfft:
+                print(f"ERROR in on_draw calling _render_wavelet_fft for mode 3: {e_on_draw_wfft}")
+                traceback.print_exc()
+        else: 
+            # For other modes (0, 1, 2), render the 3D point cloud scene via _render_scene()
+            try:
+                print(f"DEBUG on_draw: render_mode is {self.render_mode}, calling _render_scene().")
+                self._render_scene()
+            except Exception as e_on_draw_render:
+                print(f"ERROR in on_draw calling _render_scene: {e_on_draw_render}")
+                traceback.print_exc()
 
         # --- Draw Stats Overlay (Individual Labels) ---
         # Set GL state for drawing text overlay
@@ -3238,20 +3690,46 @@ class LiveViewerWindow(pyglet.window.Window):
 
         # Draw the ImGui UI using the helper method (wrap in try-except)
         try:
-            self._draw_ui()
-        except Exception as e_on_draw_ui:
-             print(f"ERROR in on_draw calling _draw_ui: {e_on_draw_ui}")
-             traceback.print_exc()
-
-        # --- Draw Debug Geometry --- (New Call)
-        try:
-            self._draw_debug_geometry()
-        except Exception as e_on_draw_debug:
-            print(f"ERROR in on_draw calling _draw_debug_geometry: {e_on_draw_debug}")
+            self._define_imgui_windows_and_widgets()
+        except Exception as e_ui_define:
+            print(f"ERROR during ImGui widget definition: {e_ui_define}")
             traceback.print_exc()
+            # Fall through to the finally block to attempt to end the frame
+        finally:
+            # This block ensures ImGui's frame is properly ended and rendered,
+            # critical for preventing assertion errors on the next frame.
 
-        # Final GL state restoration (if needed, though ImGui usually handles its own)
-        # gl.Enable(gl.GL_DEPTH_TEST) # Already enabled after overlay
+            # Set GL state for ImGui rendering
+            gl.glEnable(gl.GL_BLEND)
+            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+            gl.glDisable(gl.GL_DEPTH_TEST)
+            gl.glUseProgram(0)  # Ensure no custom shaders are active for ImGui
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0) # Ensure rendering to default framebuffer
+            # Active texture unit 0 is usually default for ImGui
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            # Unbind any textures from units ImGui might use, though it should manage its own
+            gl.glBindTexture(gl.GL_TEXTURE_2D, 0) # For sampler2D
+            # Pyglet's ImGui renderer might expect a VAO to be bound or might bind its own.
+            # Binding VAO 0 is generally safest.
+            gl.glBindVertexArray(0)
+
+            imgui.render()  # Prepare ImGui draw data
+
+            try:
+                # This call includes ImGui::EndFrame implicitly via the renderer
+                self.imgui_renderer.render(imgui.get_draw_data())
+            except Exception as e_render_imgui:
+                print(f"Warning: self.imgui_renderer.render error: {e_render_imgui}")
+                traceback.print_exc()
+                # If self.imgui_renderer.render fails catastrophically, ImGui's EndFrame might not
+                # have been called. The assertion error on the *next* frame would indicate this.
+                # Calling imgui.end_frame() here directly can be risky if the renderer
+                # is also trying to do it and only partially failed.
+                # For now, we rely on the renderer to call EndFrame.
+
+            # Restore some GL state if necessary for subsequent non-ImGui Pyglet drawing,
+            # though in this app, ImGui is usually the last thing drawn in on_draw.
+            # gl.glEnable(gl.GL_DEPTH_TEST) # Re-enable if other 2D pyglet stuff follows
 
     def _draw_debug_geometry(self):
         """Draws various debug geometries like frustums and axes using shaders."""
@@ -3462,6 +3940,9 @@ class LiveViewerWindow(pyglet.window.Window):
         if hasattr(self, 'wavelet_texture') and self.wavelet_texture:
              try: gl.glDeleteTextures(1, self.wavelet_texture)
              except: pass
+        if hasattr(self, 'imgui_wavelet_debug_texture') and self.imgui_wavelet_debug_texture:
+            try: gl.glDeleteTextures(1, self.imgui_wavelet_debug_texture)
+            except: pass
         # --- ImGui Cleanup ---
         if hasattr(self, 'imgui_renderer') and self.imgui_renderer:
             self.imgui_renderer.shutdown()
@@ -3469,33 +3950,119 @@ class LiveViewerWindow(pyglet.window.Window):
         super().on_close()
 
     def _render_wavelet_fft(self):
-        """Perform spatiotemporal Wavelet Packet + FFT on the depth history (GPU)."""
-        # If no depth history, fallback
-        if not hasattr(self, 'depth_history') or len(self.depth_history) == 0:
-            self.vertex_list.draw(gl.GL_POINTS)
-            return
-        # Stack history into tensor [T,1,H,W]
-        try:
-            depth_stack = torch.stack(list(self.depth_history), dim=0).unsqueeze(1)  # B=frames, C=1
-            # Spatial Wavelet Packet Decomposition and Reconstruction
-            # J = log2(window_size) levels
-            J = int(math.log2(max(1, self.wavelet_packet_window_size)))
-            dwt = DWTForward(J=J, wave=self.wavelet_packet_type, mode='zero').to(self.device)
-            idwt = DWTInverse(wave=self.wavelet_packet_type, mode='zero').to(self.device)
-            Yl, Yh = dwt(depth_stack)                 # Spatial wavelet
-            recon_spatial = idwt((Yl, Yh)).squeeze(1)  # [T,H,W]
+        print("DEBUG RenderWavelet: _render_wavelet_fft called.") # Existing Print
+        """Renders the self.wavelet_texture as a full-screen quad."""
 
-            # Temporal FFT (across frames) and inverse
-            freq = torch.fft.fftn(recon_spatial, dim=(0,1,2), norm='ortho')
-            recon_full = torch.fft.ifftn(freq, dim=(0,1,2), norm='ortho').real  # [T,H,W]
-            final_depth = recon_full[-1]  # Last frame [H,W]
-        except Exception as e_proc:
-            print(f"Error in Wavelet+FFT pipeline: {e_proc}")
-            self.vertex_list.draw(gl.GL_POINTS)
-            return
-        # TODO: integrate `final_depth` back into 3D splat positions/colors
-        # For now, fallback to default rendering
-        self.vertex_list.draw(gl.GL_POINTS)
+        # The WPT/FFT processing to generate the content for self.wavelet_texture
+        # is now handled in _process_queue_data and _update_debug_textures.
+        # This function just draws the prepared texture.
+
+        if self.texture_shader_program and self.texture_quad_vao and hasattr(self, 'wavelet_texture') and self.wavelet_texture:
+            # print("DEBUG RenderWavelet: Resources OK, attempting to draw quad.") # Already have this
+            try:
+                # GL state for 2D texture rendering
+                gl.glDisable(gl.GL_DEPTH_TEST)
+                # gl.glEnable(gl.GL_BLEND) # Temporarily disable blend for testing
+                gl.glDisable(gl.GL_BLEND) # Ensure it's off for opaque quad
+                # gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+
+                self.texture_shader_program.use()
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self.wavelet_texture)
+                self.texture_shader_program['fboTexture'] = 0 # Sampler uniform - Restore this line
+
+                gl.glBindVertexArray(self.texture_quad_vao)
+                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4) # Draw the quad
+                print("DEBUG RenderWavelet: glDrawArrays called for wavelet quad.") # New Print
+
+                # Cleanup
+                gl.glBindVertexArray(0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+                self.texture_shader_program.stop()
+                gl.glEnable(gl.GL_DEPTH_TEST) # Re-enable depth test for other rendering
+                gl.glEnable(gl.GL_BLEND) # Re-enable blend for subsequent ImGui/overlay drawing
+
+            except Exception as e_render_quad:
+                print(f"Error rendering wavelet texture quad: {e_render_quad}")
+                traceback.print_exc()
+        else:
+            # This fallback means something is wrong with texture/shader setup or wavelet_texture isn't ready
+            # For now, just print a warning. Avoid drawing points.
+            print("DEBUG RenderWavelet: Resources MISSING for wavelet quad render.") # New Print
+            # self.vertex_list.draw(gl.GL_POINTS) # Explicitly DO NOT draw points here
+
+    def _capture_depth_bias(self):
+        """Captures the current depth map and calculates an additive bias map
+           relative to a smoothed version of the captured depth."""
+        # THIS METHOD IS NO LONGER CALLED DIRECTLY.
+        # Its logic has been moved to the inference thread triggered by self.pending_bias_capture_request.
+        # Kept as a placeholder or for potential future re-use of the smoothing strategy.
+        print("WARNING: _capture_depth_bias (smoothed reference) was called but is deprecated. Bias capture now happens in inference thread via trigger.")
+        
+        # Original smoothed reference logic (for reference, but not active):
+        # print("Attempting to capture depth bias (Smoothed Reference Method)...")
+        # current_raw_depth = self.latest_depth_tensor 
+        
+        # if current_raw_depth is None:
+        #     print("ERROR: No depth tensor available to capture bias.")
+        #     self.status_message = "Error: No depth tensor for bias capture."
+        #     self.depth_bias_map = None
+        #     self.latest_depth_tensor_for_calib = None
+        #     self._update_edge_params()
+        #     return
+
+        # try:
+        #     D_captured = current_raw_depth.clone().to(self.device).float() 
+        #     self.latest_depth_tensor_for_calib = D_captured
+
+        #     if D_captured.numel() == 0:
+        #          print("ERROR: Captured depth map is empty.")
+        #          self.status_message = "Error: Captured depth map empty."
+        #          self.depth_bias_map = None
+        #          self.latest_depth_tensor_for_calib = None
+        #          self._update_edge_params()
+        #          return
+            
+        #     # --- Calculate Smoothed Version ---
+        #     D_captured_np = D_captured.cpu().numpy()
+        #     smooth_kernel_size = 51 
+        #     if smooth_kernel_size > D_captured_np.shape[0] or smooth_kernel_size > D_captured_np.shape[1]:
+        #         print(f"WARNING: Bias smooth kernel ({smooth_kernel_size}) > image ({D_captured_np.shape}). Clamping kernel size.")
+        #         smooth_kernel_size = min(D_captured_np.shape[0], D_captured_np.shape[1])
+        #         if smooth_kernel_size % 2 == 0: smooth_kernel_size -= 1 
+        #         smooth_kernel_size = max(1, smooth_kernel_size) 
+            
+        #     try:
+        #          D_smoothed_np = cv2.GaussianBlur(D_captured_np, (smooth_kernel_size, smooth_kernel_size), 0)
+        #          D_smoothed = torch.from_numpy(D_smoothed_np).to(self.device).type_as(D_captured)
+        #     except cv2.error as e_blur:
+        #          print(f"ERROR: GaussianBlur failed during bias capture: {e_blur}. Kernel Size: {smooth_kernel_size}. Depth shape: {D_captured_np.shape}")
+        #          self.status_message = "Error: Bias blur failed."
+        #          self.depth_bias_map = None 
+        #          self.latest_depth_tensor_for_calib = None
+        #          self._update_edge_params()
+        #          return
+        #     # --- End Calculate Smoothed Version ---
+
+        #     self.depth_bias_map = D_captured - D_smoothed
+
+        #     print(f"  Captured Depth Range: [{torch.min(D_captured):.4f}, {torch.max(D_captured):.4f}], Mean: {torch.mean(D_captured.float()):.4f}")
+        #     print(f"  Smoothed Depth Range: [{torch.min(D_smoothed):.4f}, {torch.max(D_smoothed):.4f}], Mean: {torch.mean(D_smoothed.float()):.4f}")
+        #     print(f"  Calculated Bias Map Range: [{torch.min(self.depth_bias_map):.4f}, {torch.max(self.depth_bias_map):.4f}], Mean: {torch.mean(self.depth_bias_map.float()):.4f}")
+
+        #     self.apply_depth_bias = True
+        #     self.status_message = "Depth bias captured (Smoothed Ref)."
+        #     print("Depth bias captured and calculated (Smoothed Ref). Apply checkbox enabled.")
+        #     self._update_edge_params()
+
+        # except Exception as e_bias:
+        #     print(f"ERROR calculating depth bias: {e_bias}")
+        #     traceback.print_exc()
+        #     self.status_message = "Error calculating depth bias."
+        #     self.depth_bias_map = None
+        #     self.latest_depth_tensor_for_calib = None
+        #     self._update_edge_params()
+        pass # End of deprecated method
 
 
 if __name__ == '__main__':
